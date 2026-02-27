@@ -51,7 +51,7 @@ ProteoPRM is an automated Python GUI for targeted PRM proteomics analysis. It el
 
 ## System Requirements
 
-| No strict system requirements |
+No strict system requirements
 
 ---
 
