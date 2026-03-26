@@ -72,15 +72,16 @@ No strict system requirements
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/<your-username>/ProteoPRM.git
+git clone https://github.com/jibosky16/ProteoPRM.git
 cd ProteoPRM
 
 # 2. Create and activate a virtual environment (Python 3.11 recommended)
-python -m venv venv311
-venv311\Scripts\activate
+py -3.11 -m venv venv311
+.\venv311\Scripts\Activate.ps1
 
 # 3. Install dependencies
-pip install -r [requirements.txt](http://_vscodecontentref_/0)
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 
 # 4. Launch the application
-python [ProteoPRM.py](http://_vscodecontentref_/1)
+python ProteoPRM.py
