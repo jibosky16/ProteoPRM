@@ -68,6 +68,28 @@ No strict system requirements
 > ensure `msconvert` is discoverable on your system `PATH` (ProteoPRM will also
 > scan common install locations automatically).
 
+#### MS2PIP Models (Required For Spectral Prediction)
+To reduce release size, MS2PIP XGBoost model files are not bundled in the executable package or included.
+
+Create this folder next to ProteoPRM.exe:
+ms2pip_models
+
+Put the required model files in that folder:
+
+model_20190107_CID_train_B.xgboost
+model_20190107_CID_train_Y.xgboost
+model_20210416_HCD2021_B.xgboost
+model_20210416_HCD2021_Y.xgboost
+Expected layout:
+ProteoPRM/
+
+ProteoPRM.exe
+ms2pip_models/
+model_20190107_CID_train_B.xgboost
+model_20190107_CID_train_Y.xgboost
+model_20210416_HCD2021_B.xgboost
+model_20210416_HCD2021_Y.xgboost
+
 ### From Source
 
 ```bash
