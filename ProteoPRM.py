@@ -1,0 +1,20196 @@
+import numpy as np
+from scipy.signal import find_peaks
+from scipy.integrate import trapezoid
+import pandas as pd
+import gc  # For garbage collection in batch processing
+# psutil — lazily imported where needed (system memory detection)
+import os
+import time
+import datetime
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, CancelledError
+import logging
+import tkinter as tk
+import tkinter.ttk as ttk
+from tkinter import scrolledtext, filedialog, messagebox, Menu
+import threading
+# openpyxl — only imported inside functions that write/read Excel (not at startup)
+import sys
+import tempfile
+# sklearn, seaborn, matplotlib, PIL, pyteomics, openpyxl, requests,
+# mokapot, ms2pip, peptdeep — lazily imported in the functions that need
+# them to speed up application startup.
+from scipy import stats
+from scipy.cluster import hierarchy
+import io
+import collections
+import traceback
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import savgol_filter
+import json
+import sv_ttk
+import shutil, subprocess
+import csv
+# requests — lazily imported where needed (update checks)
+import re
+import xml.etree.ElementTree as ET
+import multiprocessing
+import pickle
+from functools import lru_cache
+import importlib.util
+import contextlib
+# ---------------------------------------------------------------------------
+# Deferred availability flags  (importlib.util.find_spec is instant; the
+# actual heavy import is postponed until the library is first *used*).
+# ---------------------------------------------------------------------------
+_PercolatorModel = None   # populated by _ensure_mokapot()
+_MOKAPOT_SPEC = importlib.util.find_spec('mokapot')
+
+# MS2PIP — predicted fragment intensity for spectral similarity & chimeric deconvolution
+_ms2pip_sp = None
+_ms2pip_core = None
+_MS2PIP_BACKEND = None
+HAS_MS2PIP = importlib.util.find_spec('ms2pip') is not None
+
+def _ensure_ms2pip():
+    """Import ms2pip on first use and populate backend globals."""
+    global _ms2pip_sp, _ms2pip_core, _MS2PIP_BACKEND, HAS_MS2PIP
+    if _MS2PIP_BACKEND is not None:
+        return  # already loaded
+    try:
+        from ms2pip import single_prediction as _sp
+        _ms2pip_sp = _sp
+        _MS2PIP_BACKEND = 'legacy'
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+    if _MS2PIP_BACKEND is None:
+        try:
+            from ms2pip import core as _core
+            _ms2pip_core = _core
+            _MS2PIP_BACKEND = 'core'
+        except (ImportError, ModuleNotFoundError):
+            pass
+    HAS_MS2PIP = _MS2PIP_BACKEND is not None
+
+def _ensure_mokapot():
+    """Import mokapot on first use."""
+    global _PercolatorModel
+    if _PercolatorModel is not None or _MOKAPOT_SPEC is None:
+        return
+    try:
+        import mokapot  # noqa: F811
+        from mokapot.model import PercolatorModel as _PM
+        _PercolatorModel = _PM
+    except ImportError:
+        pass
+
+# AlphaPeptDeep — deep-learning predicted fragment intensity & RT prediction
+# Supports HCD/CID (b/y ions) with instrument-specific & NCE-aware models.
+_ALPHAPEPTDEEP_AVAILABLE = importlib.util.find_spec('peptdeep') is not None
+_APD_ModelManager = None  # populated by _ensure_peptdeep()
+
+def _ensure_peptdeep():
+    """Import peptdeep on first use."""
+    global _APD_ModelManager, _ALPHAPEPTDEEP_AVAILABLE
+    if _APD_ModelManager is not None:
+        return
+    try:
+        # Suppress the mask_modloss deprecation warning from peptdeep
+        import warnings as _w
+        _w.filterwarnings(
+            'ignore',
+            message='mask_modloss is deprecated',
+        )
+        # Snapshot root handlers before import; alphabase's set_logger()
+        # injects a StreamHandler(sys.stdout) that causes duplicate output.
+        _pre_handlers = set(logging.getLogger().handlers)
+        import peptdeep  # noqa: F811
+        from peptdeep.pretrained_models import ModelManager as _MM
+        # Remove any StreamHandler that alphabase silently added to root
+        for _h in list(logging.getLogger().handlers):
+            if _h not in _pre_handlers and isinstance(_h, logging.StreamHandler) \
+                    and not isinstance(_h, logging.FileHandler):
+                logging.getLogger().removeHandler(_h)
+        _APD_ModelManager = _MM
+        _ALPHAPEPTDEEP_AVAILABLE = True
+    except (ImportError, ModuleNotFoundError):
+        _ALPHAPEPTDEEP_AVAILABLE = False
+
+# Supported instrument types for AlphaPeptDeep (from model_const.yaml)
+_APD_INSTRUMENTS = ['QE', 'Lumos', 'timsTOF', 'SciexTOF', 'ThermoTOF']
+# Fragmentation mapping: user-facing name → AlphaPeptDeep nce_type / model compatibility
+_APD_SUPPORTED_FRAG_TYPES = frozenset(['HCD', 'CID'])
+# Fragment types predicted by AlphaPeptDeep ms2 model
+_APD_FRAG_TYPES = ['b_z1', 'b_z2', 'y_z1', 'y_z2',
+                   'b_modloss_z1', 'b_modloss_z2',
+                   'y_modloss_z1', 'y_modloss_z2']
+
+
+def _alphapeptdeep_model_dir():
+    """
+    Resolve AlphaPeptDeep pretrained model directory.
+
+    Priority:
+      1. PyInstaller bundle  (_MEIPASS/AlphaPeptDeep pretrained_models_v3/)
+      2. App-local directory  (<exe_dir>/AlphaPeptDeep pretrained_models_v3/)
+      3. Default peptdeep cache  (~/.peptdeep/pretrained_models/)
+    """
+    from pathlib import Path
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        bundled = Path(meipass) / 'AlphaPeptDeep pretrained_models_v3'
+        if bundled.is_dir():
+            return str(bundled)
+    if getattr(sys, 'frozen', False):
+        app_dir = Path(sys.executable).parent / 'AlphaPeptDeep pretrained_models_v3'
+    else:
+        app_dir = Path(__file__).resolve().parent / 'AlphaPeptDeep pretrained_models_v3'
+    if app_dir.is_dir():
+        return str(app_dir)
+    return str(Path.home() / '.peptdeep' / 'pretrained_models')
+
+
+# ── AlphaPeptDeep calibrated-model persistence ──────────────────────────────
+_APD_CALIBRATED_MODELS_DIR = None   # resolved lazily
+
+def _apd_calibrated_models_dir():
+    """Return (and create if needed) the directory for saved calibrated models."""
+    global _APD_CALIBRATED_MODELS_DIR
+    if _APD_CALIBRATED_MODELS_DIR is not None:
+        return _APD_CALIBRATED_MODELS_DIR
+    from pathlib import Path
+    if getattr(sys, 'frozen', False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).resolve().parent
+    d = base / 'calibrated_apd_models'
+    d.mkdir(parents=True, exist_ok=True)
+    _APD_CALIBRATED_MODELS_DIR = str(d)
+    return _APD_CALIBRATED_MODELS_DIR
+
+
+def _apd_manifest_path():
+    """Path to the JSON manifest that lists all saved calibrated models."""
+    return os.path.join(_apd_calibrated_models_dir(), 'manifest.json')
+
+
+def _load_apd_manifest():
+    """Load the calibrated-models manifest (or return empty list)."""
+    mp = _apd_manifest_path()
+    if os.path.exists(mp):
+        try:
+            with open(mp, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def _save_apd_manifest(manifest):
+    """Persist the calibrated-models manifest."""
+    mp = _apd_manifest_path()
+    with open(mp, 'w') as f:
+        json.dump(manifest, f, indent=2)
+
+
+def _list_apd_calibrated_models():
+    """
+    Return a list of dicts describing available calibrated models.
+
+    Each dict has keys:
+        name, folder, instrument, nce, date, mgf_basename, psm_basename
+    """
+    return _load_apd_manifest()
+
+
+def _save_apd_calibrated_model(mgr, name, instrument, nce,
+                               mgf_path=None, psm_path=None):
+    """
+    Save a calibrated ModelManager's MS2 model to disk and register
+    it in the manifest.
+
+    Parameters
+    ----------
+    mgr : ModelManager
+        The model manager whose ms2 model has already been fine-tuned.
+    name : str
+        Human-readable model name (must be filesystem-safe).
+    instrument, nce : str, float
+        Metadata recorded in the manifest.
+    mgf_path, psm_path : str or None
+        Paths to calibration files (for provenance tracking).
+
+    Returns
+    -------
+    str  Folder path where the model was saved.
+    """
+    import datetime
+    safe_name = "".join(c if c.isalnum() or c in ('_', '-', ' ') else '_' for c in name)
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    folder_name = f"{safe_name}_{timestamp}"
+    folder = os.path.join(_apd_calibrated_models_dir(), folder_name)
+    os.makedirs(folder, exist_ok=True)
+
+    mgr.save_models(folder)
+    logging.info(f"AlphaPeptDeep: calibrated model saved to {folder}")
+
+    entry = {
+        'name': name,
+        'folder': folder_name,
+        'instrument': instrument,
+        'nce': float(nce),
+        'date': datetime.datetime.now().isoformat(),
+        'mgf_basename': os.path.basename(mgf_path) if mgf_path else '',
+        'psm_basename': os.path.basename(psm_path) if psm_path else '',
+    }
+    manifest = _load_apd_manifest()
+    manifest.append(entry)
+    _save_apd_manifest(manifest)
+    return folder
+
+
+def _load_apd_calibrated_model(folder_name_or_path):
+    """
+    Load a previously saved calibrated MS2 model into a fresh ModelManager.
+
+    Parameters
+    ----------
+    folder_name_or_path : str
+        Either the folder *name* (as stored in the manifest) or the full path.
+
+    Returns
+    -------
+    ModelManager or None
+    """
+    _ensure_peptdeep()
+    if not _ALPHAPEPTDEEP_AVAILABLE:
+        return None
+
+    if os.path.isabs(folder_name_or_path):
+        folder = folder_name_or_path
+    else:
+        folder = os.path.join(_apd_calibrated_models_dir(), folder_name_or_path)
+
+    ms2_path = os.path.join(folder, 'ms2.pth')
+    if not os.path.exists(ms2_path):
+        logging.warning(f"AlphaPeptDeep: calibrated model not found at {ms2_path}")
+        return None
+
+    try:
+        # Auto-detect device
+        use_gpu = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                use_gpu = True
+        except ImportError:
+            pass
+
+        mgr = _APD_ModelManager(device='gpu' if use_gpu else 'cpu')
+        rt_path = os.path.join(folder, 'rt.pth')
+        ccs_path = os.path.join(folder, 'ccs.pth')
+        chg_path = os.path.join(folder, 'charge.pth')
+
+        mgr.load_external_models(
+            ms2_model_file=ms2_path,
+            rt_model_file=rt_path if os.path.exists(rt_path) else '',
+            ccs_model_file=ccs_path if os.path.exists(ccs_path) else '',
+            charge_model_file=chg_path if os.path.exists(chg_path) else '',
+        )
+        _patch_apd_predict_bug(mgr)
+        logging.info(f"AlphaPeptDeep: loaded calibrated model from {folder}")
+        return mgr
+    except Exception as exc:
+        logging.error(f"AlphaPeptDeep: failed to load calibrated model: {exc}")
+        return None
+
+
+def _patch_apd_predict_bug(mgr):
+    """
+    Monkey-patch a peptdeep ModelManager to fix a bug in
+    ``pDeepModel._set_batch_predict_data`` where
+    ``update_sliced_fragment_dataframe`` writes predicted intensities
+    into a *copy* of the DataFrame's numpy array and never writes back
+    to the actual ``self.predict_df``.
+
+    This causes ``test()`` (which uses ``reference_frag_df`` →
+    ``_predict_in_order=False``) to always return all-zero predictions,
+    giving PCC=0 / COS=0 / SA=0 while SPC (rank-based) is non-zero.
+
+    The patch directly writes to ``self.predict_df.values`` via numpy
+    fancy-indexing, bypassing the broken ``update_sliced_fragment_dataframe``.
+    """
+    import types
+    try:
+        import numpy as _np
+        ms2 = mgr.ms2_model
+
+        def _fixed_set_batch_predict_data(self, batch_df, predicts, **kwargs):
+            apex = predicts.reshape((len(batch_df), -1)).max(axis=1)
+            apex[apex <= 0] = 1
+            predicts /= apex.reshape((-1, 1, 1))
+            predicts[predicts < self.min_inten] = 0.0
+            mask = _np.isin(
+                self.model.supported_charged_frag_types,
+                self.charged_frag_types,
+            )
+            predicts = predicts[:, :, mask]
+            flat = predicts.reshape((-1, len(self.charged_frag_types)))
+
+            if self._predict_in_order:
+                self.predict_df.values[
+                    batch_df.frag_start_idx.values[0]
+                    : batch_df.frag_stop_idx.values[-1],
+                    :,
+                ] = flat
+            else:
+                # ── BUGFIX: write directly instead of via
+                # update_sliced_fragment_dataframe (which writes to a copy) ──
+                se = batch_df[["frag_start_idx", "frag_stop_idx"]].values
+                idx = _np.r_[tuple(slice(int(s), int(e)) for s, e in se)]
+                self.predict_df.values[idx, :] = flat.astype(
+                    self.predict_df.values.dtype
+                )
+
+        ms2._set_batch_predict_data = types.MethodType(
+            _fixed_set_batch_predict_data, ms2
+        )
+        logging.debug("AlphaPeptDeep: applied _set_batch_predict_data bugfix")
+    except Exception as exc:
+        logging.warning(
+            f"AlphaPeptDeep: could not apply predict bugfix: {exc}"
+        )
+
+
+def _delete_apd_calibrated_model(folder_name):
+    """Remove a calibrated model from disk and the manifest."""
+    import shutil
+    folder = os.path.join(_apd_calibrated_models_dir(), folder_name)
+    if os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+    manifest = _load_apd_manifest()
+    manifest = [m for m in manifest if m.get('folder') != folder_name]
+    _save_apd_manifest(manifest)
+    logging.info(f"AlphaPeptDeep: deleted calibrated model '{folder_name}'")
+
+
+def _ms2pip_model_dir():
+    """
+    Resolve MS2PIP XGBoost model directory.
+
+    Priority:
+      1. PyInstaller bundle  (_MEIPASS/ms2pip_models/)  — for EXE distribution
+      2. App-local directory  (<exe_dir>/ms2pip_models/)  — for dev/portable
+      3. Default user cache   (~/.ms2pip/)                — ms2pip default
+    """
+    from pathlib import Path
+    # 1. PyInstaller frozen bundle
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        bundled = Path(meipass) / 'ms2pip_models'
+        if bundled.is_dir():
+            return bundled
+    # 2. Next to the running script / exe
+    if getattr(sys, 'frozen', False):
+        app_dir = Path(sys.executable).parent / 'ms2pip_models'
+    else:
+        app_dir = Path(__file__).resolve().parent / 'ms2pip_models'
+    if app_dir.is_dir():
+        return app_dir
+    # 3. User home (ms2pip default — will trigger download on first use)
+    return Path.home() / '.ms2pip'
+
+
+# CRITICAL: On Windows, multiprocessing/joblib use the 'spawn' method which
+# re-imports __main__. freeze_support() must be called early to handle this.
+multiprocessing.freeze_support()
+
+# Helper to suppress console windows when calling external programs on Windows
+def _subprocess_no_window():
+    """
+    Return kwargs dict for subprocess.run / subprocess.Popen that prevents
+    a visible CMD window from popping up on Windows.  Returns an empty dict
+    on non-Windows platforms so calls stay cross-platform.
+    """
+    if sys.platform == 'win32':
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        return {'startupinfo': si, 'creationflags': subprocess.CREATE_NO_WINDOW}
+    return {}
+
+# ============================================================================
+# GPU ACCELERATION SUPPORT
+# ============================================================================
+# Automatic GPU detection and optional acceleration for compute-intensive tasks
+# Supports NVIDIA GPUs via CuPy, PyTorch, or TensorFlow
+# Automatically detects GPU hardware, driver version, and CUDA version
+# Falls back gracefully to CPU if GPU unavailable
+
+# Global GPU configuration
+GPU_AVAILABLE = False
+GPU_ENABLED = True  # User can disable even if available
+GPU_DEVICE_NAME = "None"
+GPU_MEMORY_GB = 0
+GPU_DRIVER_VERSION = "Unknown"
+GPU_CUDA_VERSION = "Unknown"
+CUPY_AVAILABLE = False
+CUML_AVAILABLE = False
+GPU_DETECTION_INFO = {}  # Detailed detection results
+
+def detect_gpu_hardware():
+    """
+    Detect GPU hardware using nvidia-smi (works even without Python GPU libraries).
+    This is the most reliable first step - detects if GPU exists at all.
+    
+    Returns:
+    --------
+    dict with keys: 'has_nvidia_gpu', 'device_name', 'driver_version', 'memory_gb', 'cuda_version'
+    """
+    hw_info = {
+        'has_nvidia_gpu': False,
+        'device_name': 'None',
+        'driver_version': 'Unknown',
+        'memory_total_gb': 0,
+        'memory_free_gb': 0,
+        'cuda_version': 'Unknown',
+        'gpu_count': 0,
+        'detection_method': 'none'
+    }
+    
+    # Method 1: Try nvidia-smi command (works on Windows, Linux, Mac with NVIDIA)
+    try:
+        import subprocess
+        # Query GPU info using nvidia-smi
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name,driver_version,memory.total,memory.free', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=10, **_subprocess_no_window()
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split('\n')
+            hw_info['gpu_count'] = len(lines)
+            # Parse first GPU (primary)
+            parts = [p.strip() for p in lines[0].split(',')]
+            if len(parts) >= 4:
+                hw_info['has_nvidia_gpu'] = True
+                hw_info['device_name'] = parts[0]
+                hw_info['driver_version'] = parts[1]
+                hw_info['memory_total_gb'] = float(parts[2]) / 1024  # Convert MB to GB
+                hw_info['memory_free_gb'] = float(parts[3]) / 1024
+                hw_info['detection_method'] = 'nvidia-smi'
+        
+        # Get CUDA version from nvidia-smi header
+        result2 = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=10, **_subprocess_no_window())
+        if result2.returncode == 0:
+            output = result2.stdout
+            # Parse CUDA version from output like "CUDA Version: 12.1"
+            import re
+            cuda_match = re.search(r'CUDA Version:\s*(\d+\.\d+)', output)
+            if cuda_match:
+                hw_info['cuda_version'] = cuda_match.group(1)
+                
+    except FileNotFoundError:
+        logging.debug("nvidia-smi not found - NVIDIA drivers may not be installed")
+    except subprocess.TimeoutExpired:
+        logging.debug("nvidia-smi timed out")
+    except Exception as e:
+        logging.debug(f"nvidia-smi detection failed: {e}")
+    
+    # Method 2: Try Windows WMI (Windows-specific fallback)
+    if not hw_info['has_nvidia_gpu'] and sys.platform == 'win32':
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['wmic', 'path', 'win32_VideoController', 'get', 'name,AdapterRAM', '/format:csv'],
+                capture_output=True, text=True, timeout=10, **_subprocess_no_window()
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if 'NVIDIA' in line.upper() or 'GEFORCE' in line.upper() or 'QUADRO' in line.upper() or 'RTX' in line.upper():
+                        parts = line.split(',')
+                        if len(parts) >= 3:
+                            hw_info['has_nvidia_gpu'] = True
+                            hw_info['device_name'] = parts[2] if len(parts) > 2 else 'NVIDIA GPU'
+                            try:
+                                hw_info['memory_total_gb'] = int(parts[1]) / (1024**3) if parts[1].isdigit() else 0
+                            except:
+                                pass
+                            hw_info['detection_method'] = 'wmic'
+                            break
+        except Exception as e:
+            logging.debug(f"WMI GPU detection failed: {e}")
+    
+    # Method 3: Try DirectX diagnostic (Windows fallback)
+    if not hw_info['has_nvidia_gpu'] and sys.platform == 'win32':
+        try:
+            import subprocess
+            result = subprocess.run(['dxdiag', '/t', 'dxdiag_output.txt'], capture_output=True, timeout=30, **_subprocess_no_window())
+            import time
+            time.sleep(2)  # Wait for file to be written
+            if os.path.exists('dxdiag_output.txt'):
+                with open('dxdiag_output.txt', 'r') as f:
+                    content = f.read()
+                    if 'NVIDIA' in content.upper():
+                        hw_info['has_nvidia_gpu'] = True
+                        hw_info['detection_method'] = 'dxdiag'
+                        # Try to parse GPU name
+                        import re
+                        match = re.search(r'Card name:\s*(.+)', content)
+                        if match:
+                            hw_info['device_name'] = match.group(1).strip()
+                os.remove('dxdiag_output.txt')
+        except Exception as e:
+            logging.debug(f"DXDiag GPU detection failed: {e}")
+    
+    return hw_info
+
+def detect_gpu_libraries():
+    """
+    Detect which GPU acceleration libraries are available and working.
+    Tests CuPy, PyTorch, and TensorFlow.
+    
+    Returns:
+    --------
+    dict with library availability and compatibility info
+    """
+    lib_info = {
+        'cupy': {'installed': False, 'working': False, 'version': None, 'error': None},
+        'pytorch': {'installed': False, 'working': False, 'cuda_available': False, 'version': None},
+        'tensorflow': {'installed': False, 'working': False, 'gpu_available': False, 'version': None},
+        'cuml': {'installed': False, 'working': False, 'version': None},
+        'recommended_library': None,
+        'recommended_install': None
+    }
+    
+    # Test CuPy
+    try:
+        import cupy as cp
+        lib_info['cupy']['installed'] = True
+        lib_info['cupy']['version'] = cp.__version__
+        try:
+            # Test if CuPy can actually use the GPU
+            device = cp.cuda.Device(0)
+            _ = device.mem_info
+            lib_info['cupy']['working'] = True
+        except Exception as e:
+            lib_info['cupy']['error'] = str(e)
+            if 'InsufficientDriver' in str(e):
+                lib_info['cupy']['error'] = 'CUDA driver update needed'
+    except ImportError:
+        pass
+    except Exception as e:
+        lib_info['cupy']['error'] = str(e)
+    
+    # Test PyTorch
+    try:
+        import torch
+        lib_info['pytorch']['installed'] = True
+        lib_info['pytorch']['version'] = torch.__version__
+        lib_info['pytorch']['cuda_available'] = torch.cuda.is_available()
+        if torch.cuda.is_available():
+            lib_info['pytorch']['working'] = True
+    except ImportError:
+        pass
+    except Exception as e:
+        pass
+    
+    # Test TensorFlow
+    try:
+        import tensorflow as tf
+        lib_info['tensorflow']['installed'] = True
+        lib_info['tensorflow']['version'] = tf.__version__
+        gpus = tf.config.list_physical_devices('GPU')
+        lib_info['tensorflow']['gpu_available'] = len(gpus) > 0
+        if len(gpus) > 0:
+            lib_info['tensorflow']['working'] = True
+    except ImportError:
+        pass
+    except Exception as e:
+        pass
+    
+    # Test cuML
+    try:
+        import cuml
+        lib_info['cuml']['installed'] = True
+        lib_info['cuml']['version'] = cuml.__version__
+        lib_info['cuml']['working'] = True
+    except ImportError:
+        pass
+    except Exception as e:
+        pass
+    
+    # Determine recommended library
+    if lib_info['cupy']['working']:
+        lib_info['recommended_library'] = 'cupy'
+    elif lib_info['pytorch']['working']:
+        lib_info['recommended_library'] = 'pytorch'
+    elif lib_info['tensorflow']['working']:
+        lib_info['recommended_library'] = 'tensorflow'
+    
+    # Provide installation recommendations
+    if not any([lib_info['cupy']['working'], lib_info['pytorch']['working'], lib_info['tensorflow']['working']]):
+        lib_info['recommended_install'] = "pip install cupy-cuda12x  # For CUDA 12.x\n# OR\npip install cupy-cuda11x  # For CUDA 11.x"
+    
+    return lib_info
+
+def get_cuda_version_recommendation(driver_cuda_version):
+    """
+    Recommend the correct CuPy package based on detected CUDA version.
+    """
+    if not driver_cuda_version or driver_cuda_version == 'Unknown':
+        return "cupy-cuda12x  # Try this first, or cupy-cuda11x"
+    
+    try:
+        major_version = int(float(driver_cuda_version))
+        if major_version >= 12:
+            return f"cupy-cuda12x  # For CUDA {driver_cuda_version}"
+        elif major_version >= 11:
+            return f"cupy-cuda11x  # For CUDA {driver_cuda_version}"
+        elif major_version >= 10:
+            return f"cupy-cuda102  # For CUDA {driver_cuda_version}"
+        else:
+            return f"cupy-cuda{major_version}0  # For CUDA {driver_cuda_version}"
+    except:
+        return "cupy-cuda12x  # Default recommendation"
+
+def get_cupy_package_name(cuda_version):
+    """
+    Get the exact CuPy package name to install based on CUDA version.
+    Returns just the package name without comments.
+    """
+    if not cuda_version or cuda_version == 'Unknown':
+        return "cupy-cuda12x"  # Default to CUDA 12
+    
+    try:
+        major_version = int(float(cuda_version))
+        if major_version >= 12:
+            return "cupy-cuda12x"
+        elif major_version >= 11:
+            return "cupy-cuda11x"
+        elif major_version >= 10:
+            return "cupy-cuda102"
+        else:
+            return f"cupy-cuda{major_version}0"
+    except:
+        return "cupy-cuda12x"
+
+def silent_install_package(package_name, timeout=300):
+    """
+    Silently install a Python package using pip.
+    
+    Args:
+        package_name: Name of the package to install
+        timeout: Maximum time to wait for installation (seconds)
+    
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    import subprocess
+    import sys
+    
+    logging.info(f"Attempting silent installation of {package_name}...")
+    
+    try:
+        # Use the same Python interpreter that's running this script
+        python_exe = sys.executable
+        
+        # Run pip install silently
+        result = subprocess.run(
+            [python_exe, "-m", "pip", "install", package_name, "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **_subprocess_no_window()
+        )
+        
+        if result.returncode == 0:
+            logging.info(f"Successfully installed {package_name}")
+            return True, f"Successfully installed {package_name}"
+        else:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            logging.warning(f"Failed to install {package_name}: {error_msg}")
+            return False, f"Installation failed: {error_msg}"
+            
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Installation of {package_name} timed out after {timeout}s")
+        return False, f"Installation timed out after {timeout} seconds"
+    except Exception as e:
+        logging.warning(f"Error installing {package_name}: {str(e)}")
+        return False, f"Installation error: {str(e)}"
+
+def auto_install_cupy_if_needed(cuda_version, force=False):
+    """
+    Automatically install CuPy if NVIDIA GPU is detected but CuPy is not available.
+    
+    Args:
+        cuda_version: Detected CUDA version string
+        force: If True, reinstall even if already installed
+    
+    Returns:
+        tuple: (installed: bool, message: str)
+    """
+    global CUPY_AVAILABLE, cp
+    
+    # Check if CuPy is already working
+    if not force:
+        try:
+            import cupy as test_cp
+            test_cp.cuda.runtime.getDeviceCount()
+            logging.info("CuPy already installed and working - skipping auto-install")
+            return True, "CuPy already installed and working"
+        except:
+            pass  # Not installed or not working, proceed with installation
+    
+    # Get the correct package name
+    package_name = get_cupy_package_name(cuda_version)
+    
+    logging.info(f"Auto-installing {package_name} for CUDA {cuda_version}...")
+    
+    # Attempt installation
+    success, message = silent_install_package(package_name)
+    
+    if success:
+        # Verify installation works
+        try:
+            # Need to reload the module
+            import importlib
+            if 'cupy' in sys.modules:
+                del sys.modules['cupy']
+            
+            import cupy as new_cp
+            device_count = new_cp.cuda.runtime.getDeviceCount()
+            
+            if device_count > 0:
+                CUPY_AVAILABLE = True
+                cp = new_cp
+                logging.info(f"CuPy auto-installation successful - {device_count} GPU(s) available")
+                return True, f"CuPy installed successfully - {device_count} GPU(s) ready"
+            else:
+                return False, "CuPy installed but no CUDA devices detected"
+                
+        except Exception as e:
+            error_msg = str(e)
+            logging.warning(f"CuPy installed but not working: {error_msg}")
+            
+            # Check if it's a driver version mismatch
+            if "cudaErrorInsufficientDriver" in error_msg:
+                return False, "CuPy installed but CUDA driver needs updating. Please update your NVIDIA drivers."
+            else:
+                return False, f"CuPy installed but error during verification: {error_msg}"
+    else:
+        return False, message
+
+def detect_gpu(auto_install=True):
+    """
+    Comprehensive GPU detection - detects hardware and software capabilities.
+    Returns a dict with complete GPU information.
+    """
+    global GPU_AVAILABLE, GPU_DEVICE_NAME, GPU_MEMORY_GB, GPU_DRIVER_VERSION, GPU_CUDA_VERSION
+    global CUPY_AVAILABLE, CUML_AVAILABLE, GPU_DETECTION_INFO
+    
+    logging.debug("Scanning for GPU hardware and acceleration libraries...")
+    
+    # Step 1: Detect hardware
+    hw_info = detect_gpu_hardware()
+    
+    # Step 2: Detect libraries
+    lib_info = detect_gpu_libraries()
+    
+    # Compile complete GPU info
+    gpu_info = {
+        'hardware': hw_info,
+        'libraries': lib_info,
+        'available': False,
+        'acceleration_ready': False,
+        'device_name': hw_info['device_name'],
+        'memory_gb': hw_info['memory_total_gb'],
+        'driver_version': hw_info['driver_version'],
+        'cuda_version': hw_info['cuda_version'],
+        'recommended_cupy': get_cuda_version_recommendation(hw_info['cuda_version'])
+    }
+    
+    # Determine overall availability
+    if hw_info['has_nvidia_gpu']:
+        gpu_info['available'] = True
+        GPU_AVAILABLE = True
+        GPU_DEVICE_NAME = hw_info['device_name']
+        GPU_MEMORY_GB = hw_info['memory_total_gb']
+        GPU_DRIVER_VERSION = hw_info['driver_version']
+        GPU_CUDA_VERSION = hw_info['cuda_version']
+        
+        if lib_info['cupy']['working']:
+            gpu_info['acceleration_ready'] = True
+            CUPY_AVAILABLE = True
+            logging.info(f"GPU READY: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) - CuPy acceleration enabled")
+        elif lib_info['pytorch']['working']:
+            gpu_info['acceleration_ready'] = True
+            logging.info(f"GPU READY: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) - PyTorch acceleration available")
+        else:
+            logging.info(f"GPU DETECTED: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB)")
+            logging.info(f"  Driver: {GPU_DRIVER_VERSION}, CUDA: {GPU_CUDA_VERSION}")
+            
+            # AUTO-INSTALL: Attempt to install CuPy automatically
+            if auto_install:
+                logging.info("Attempting automatic CuPy installation...")
+                install_success, install_msg = auto_install_cupy_if_needed(GPU_CUDA_VERSION)
+                gpu_info['auto_install_attempted'] = True
+                gpu_info['auto_install_result'] = install_msg
+                
+                if install_success:
+                    gpu_info['acceleration_ready'] = True
+                    logging.info(f"AUTO-INSTALL SUCCESS: {install_msg}")
+                else:
+                    logging.warning(f"AUTO-INSTALL FAILED: {install_msg}")
+                    if lib_info['cupy']['installed'] and not lib_info['cupy']['working']:
+                        logging.warning(f"  CuPy installed but not working: {lib_info['cupy']['error']}")
+                    logging.info(f"  Manual install: pip install {gpu_info['recommended_cupy']}")
+            else:
+                if lib_info['cupy']['installed'] and not lib_info['cupy']['working']:
+                    logging.warning(f"  CuPy installed but not working: {lib_info['cupy']['error']}")
+                    logging.info(f"  Recommended: pip install {gpu_info['recommended_cupy']}")
+                else:
+                    logging.info(f"  To enable GPU acceleration: pip install {gpu_info['recommended_cupy']}")
+    else:
+        logging.debug("No NVIDIA GPU detected - using CPU acceleration")
+        GPU_AVAILABLE = False
+    
+    # Check cuML
+    if lib_info['cuml']['working']:
+        CUML_AVAILABLE = True
+        logging.info("cuML (RAPIDS) available for GPU-accelerated machine learning")
+    
+    GPU_DETECTION_INFO = gpu_info
+    return gpu_info
+
+def get_gpu_status():
+    """Return current GPU status for display in UI."""
+    _ensure_gpu_detected()
+    if not GPU_AVAILABLE:
+        return "No NVIDIA GPU detected - using CPU"
+    elif not GPU_ENABLED:
+        return f"GPU disabled ({GPU_DEVICE_NAME})"
+    elif not CUPY_AVAILABLE:
+        return f"GPU detected: {GPU_DEVICE_NAME} (install CuPy to enable)"
+    else:
+        accel_features = []
+        if CUPY_AVAILABLE:
+            accel_features.append("CuPy")
+        if CUML_AVAILABLE:
+            accel_features.append("cuML")
+        features_str = ", ".join(accel_features) if accel_features else "basic"
+        return f"GPU enabled: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) [{features_str}]"
+
+def get_gpu_detailed_info():
+    """Return detailed GPU information for diagnostics."""
+    _ensure_gpu_detected()
+    info_lines = [
+        "=" * 50,
+        "GPU SYSTEM INFORMATION",
+        "=" * 50,
+        f"GPU Detected: {'Yes' if GPU_AVAILABLE else 'No'}",
+    ]
+    
+    if GPU_AVAILABLE:
+        info_lines.extend([
+            f"Device Name: {GPU_DEVICE_NAME}",
+            f"Memory: {GPU_MEMORY_GB:.1f} GB",
+            f"Driver Version: {GPU_DRIVER_VERSION}",
+            f"CUDA Version: {GPU_CUDA_VERSION}",
+            f"",
+            f"Acceleration Libraries:",
+            f"  CuPy: {'Working' if CUPY_AVAILABLE else 'Not available'}",
+            f"  cuML: {'Working' if CUML_AVAILABLE else 'Not available'}",
+        ])
+        
+        if not CUPY_AVAILABLE and GPU_DETECTION_INFO.get('recommended_cupy'):
+            info_lines.extend([
+                f"",
+                f"To enable GPU acceleration:",
+                f"  pip install {GPU_DETECTION_INFO['recommended_cupy']}",
+            ])
+    else:
+        info_lines.extend([
+            f"",
+            f"No NVIDIA GPU detected.",
+            f"The software will use CPU processing.",
+            f"",
+            f"If you have an NVIDIA GPU, ensure:",
+            f"  1. NVIDIA drivers are installed",
+            f"  2. nvidia-smi command works in terminal",
+        ])
+    
+    info_lines.append("=" * 50)
+    return "\n".join(info_lines)
+
+def set_gpu_enabled(enabled):
+    """Enable or disable GPU acceleration."""
+    _ensure_gpu_detected()
+    global GPU_ENABLED
+    GPU_ENABLED = enabled and GPU_AVAILABLE
+    if GPU_ENABLED:
+        logging.info(f"GPU acceleration enabled ({GPU_DEVICE_NAME})")
+    else:
+        logging.debug(f"GPU acceleration disabled")
+
+# GPU-accelerated array operations (falls back to NumPy if unavailable)
+def get_array_module():
+    """Get the appropriate array module (CuPy for GPU, NumPy for CPU)."""
+    if GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE:
+        return cp
+    return np
+
+def to_gpu(array):
+    """Transfer array to GPU if available, otherwise return as-is."""
+    if GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE:
+        import cupy as cp
+        if isinstance(array, np.ndarray):
+            return cp.asarray(array)
+    return array
+
+def to_cpu(array):
+    """Transfer array from GPU to CPU if needed."""
+    if GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE:
+        import cupy as cp
+        if isinstance(array, cp.ndarray):
+            return cp.asnumpy(array)
+    return array
+
+def gpu_accelerated_mass_matching(observed_mzs, observed_intensities, theoretical_mzs, tolerance, tolerance_unit='ppm'):
+    """
+    GPU-accelerated mass matching between observed and theoretical m/z values.
+    Falls back to CPU if GPU unavailable.
+    
+    This is one of the most compute-intensive operations - matching millions of 
+    observed peaks against theoretical fragment ions.
+    """
+    xp = get_array_module()
+    
+    # Convert to GPU arrays if available
+    obs_mz = to_gpu(np.array(observed_mzs, dtype=np.float64))
+    obs_int = to_gpu(np.array(observed_intensities, dtype=np.float64))
+    theo_mz = to_gpu(np.array(theoretical_mzs, dtype=np.float64))
+    
+    matches = []
+    
+    if len(obs_mz) == 0 or len(theo_mz) == 0:
+        return matches
+    
+    # Vectorized matching on GPU/CPU
+    for i, t_mz in enumerate(to_cpu(theo_mz)):
+        if tolerance_unit == 'ppm':
+            tol = t_mz * tolerance / 1e6
+        else:
+            tol = tolerance
+        
+        # Find matches within tolerance
+        mask = xp.abs(obs_mz - t_mz) <= tol
+        matched_indices = xp.where(mask)[0]
+        
+        if len(matched_indices) > 0:
+            # Get best match (highest intensity)
+            matched_intensities = obs_int[matched_indices]
+            best_idx = matched_indices[xp.argmax(matched_intensities)]
+            
+            matches.append({
+                'theo_idx': i,
+                'obs_idx': int(to_cpu(best_idx)) if hasattr(best_idx, 'get') else int(best_idx),
+                'theo_mz': t_mz,
+                'obs_mz': float(to_cpu(obs_mz[best_idx])),
+                'intensity': float(to_cpu(obs_int[best_idx])),
+                'mass_error': float(to_cpu(obs_mz[best_idx])) - t_mz,
+                'mass_error_ppm': (float(to_cpu(obs_mz[best_idx])) - t_mz) / t_mz * 1e6
+            })
+    
+    return matches
+
+def gpu_accelerated_batch_scoring(features_array, weights=None):
+    """
+    GPU-accelerated batch PSM scoring for large datasets.
+    Uses matrix operations that benefit greatly from GPU parallelism.
+    """
+    xp = get_array_module()
+    
+    features = to_gpu(features_array)
+    
+    if weights is None:
+        # Default weights for 6 scoring components:
+        # mass_accuracy, fragment_count, rt_accuracy, charge_consistency,
+        # continuity, complementarity
+        weights = to_gpu(np.array([0.25, 0.25, 0.10, 0.10, 0.10, 0.20], dtype=np.float64))
+    else:
+        weights = to_gpu(np.array(weights, dtype=np.float64))
+    
+    # Normalize features (GPU-accelerated)
+    feature_min = xp.min(features, axis=0)
+    feature_max = xp.max(features, axis=0)
+    feature_range = feature_max - feature_min
+    feature_range = xp.where(feature_range == 0, 1, feature_range)  # Avoid division by zero
+    
+    normalized = (features - feature_min) / feature_range
+    
+    # Weighted sum scoring (GPU matrix multiplication)
+    scores = xp.dot(normalized, weights[:len(normalized[0])] if len(weights) > normalized.shape[1] else weights)
+    
+    return to_cpu(scores)
+
+# GPU detection is deferred until first use (processing start or GPU prefs)
+_gpu_info = None   # populated lazily by _ensure_gpu_detected()
+
+def _ensure_gpu_detected():
+    """Run GPU detection once, on first access. Avoids slow startup."""
+    global _gpu_info
+    if _gpu_info is not None:
+        return _gpu_info
+    try:
+        _gpu_info = detect_gpu()
+    except Exception as e:
+        logging.warning(f"GPU detection failed: {e}")
+        _gpu_info = {'available': False}
+    return _gpu_info
+
+# ============================================================================
+# END GPU ACCELERATION SUPPORT
+# ============================================================================
+
+# Flag to track if we're running as a PyInstaller executable
+IS_FROZEN = getattr(sys, 'frozen', False)
+
+# Fix for windowed mode: redirect stdout/stderr to devnull if they are None
+# This prevents errors when libraries like tqdm try to write to stdout/stderr
+if IS_FROZEN:
+    import io
+    if sys.stdout is None:
+        sys.stdout = io.StringIO()
+    if sys.stderr is None:
+        sys.stderr = io.StringIO()
+
+def get_resource_path(filename):
+    """
+    Get the correct path to a bundled resource file.
+    When running as a PyInstaller executable, files are extracted to sys._MEIPASS.
+    When running as a script, files are in the script directory.
+    """
+    if IS_FROZEN:
+        # Running as compiled executable - check _MEIPASS first (bundled files)
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            bundled_path = os.path.join(meipass, filename)
+            if os.path.exists(bundled_path):
+                return bundled_path
+        # Also check the executable directory (for user-created files like custom_mod.xlsx)
+        exe_dir = os.path.dirname(sys.executable)
+        exe_path = os.path.join(exe_dir, filename)
+        if os.path.exists(exe_path):
+            return exe_path
+    else:
+        # Running as script - check script directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_path = os.path.join(script_dir, filename)
+        if os.path.exists(script_path):
+            return script_path
+    return None
+
+def get_user_data_path(filename):
+    """
+    Get the path for user-writable data files (like custom_mod.xlsx).
+    These should be saved alongside the executable, not in _MEIPASS.
+    """
+    if IS_FROZEN:
+        return os.path.join(os.path.dirname(sys.executable), filename)
+    else:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+prm_file_valid = True
+# Global variables for modifications
+FIXED_MODIFICATIONS = []
+VARIABLE_MODIFICATIONS = []
+UNIMOD_LOADED = False
+cached_eic_data = None
+
+# In-memory LRU cache for rendered matplotlib figures (avoids re-reading data + re-rendering)
+_PLOT_FIGURE_CACHE_MAX = 200  # max cached figures
+_plot_figure_cache = collections.OrderedDict()  # key -> (fig_bytes, width, height)
+
+
+# In-memory cache for result CSV sheets to avoid repeated reads on every plot display
+_excel_sheet_cache = {}  # key: (output_folder, sheet_name) -> DataFrame
+
+
+def _output_path(output_folder, sheet_name):
+    """Return the CSV file path for a given result sheet inside *output_folder*.
+
+    Each result sheet is stored as a separate CSV:
+      PSM.csv, Peptide_Quantification.csv, Protein_Quantification.csv,
+      Combined.csv, QC_Metrics.csv, EICs.csv
+    """
+    safe_name = sheet_name.replace(' ', '_')
+    return os.path.join(output_folder, f"{safe_name}.csv")
+
+
+def _get_cached_excel_sheet(output_folder, sheet_name):
+    """Return a cached DataFrame for the given result CSV, reading from disk only once."""
+    global _excel_sheet_cache
+    cache_key = (output_folder, sheet_name)
+    if cache_key not in _excel_sheet_cache:
+        file_path = _output_path(output_folder, sheet_name)
+        logging.debug(f"Reading '{sheet_name}' from {os.path.basename(file_path)} (first access, will cache)")
+        _excel_sheet_cache[cache_key] = pd.read_csv(file_path)
+    return _excel_sheet_cache[cache_key]
+
+def _invalidate_excel_cache(output_folder=None):
+    """Clear the result-sheet cache, optionally for a specific output folder only."""
+    global _excel_sheet_cache
+    if output_folder is None:
+        _excel_sheet_cache.clear()
+    else:
+        _excel_sheet_cache = {k: v for k, v in _excel_sheet_cache.items() if k[0] != output_folder}
+
+def _cache_plot_figure(cache_key, fig):
+    """Store a rendered figure as PNG bytes in the LRU cache."""
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    png_bytes = buf.getvalue()
+    buf.close()
+    # Evict oldest if at capacity
+    if len(_plot_figure_cache) >= _PLOT_FIGURE_CACHE_MAX:
+        _plot_figure_cache.popitem(last=False)
+    _plot_figure_cache[cache_key] = png_bytes
+
+def _get_cached_plot_figure(cache_key):
+    """Return cached PNG bytes for this key, or None.  Moves key to end (most-recent)."""
+    if cache_key in _plot_figure_cache:
+        _plot_figure_cache.move_to_end(cache_key)
+        return _plot_figure_cache[cache_key]
+    return None
+
+def _invalidate_plot_figure_cache():
+    """Clear the in-memory plot figure cache (e.g. when a new analysis run starts)."""
+    _plot_figure_cache.clear()
+
+# Add this near the top of the file with other globals
+ALREADY_LOGGED_MODS = set()
+
+@lru_cache(maxsize=10000)
+def parse_modifications_cached(modification_string):
+    """
+    Cached wrapper for parse_modifications with logging.
+    This function logs once per unique modification string.
+    """
+    global ALREADY_LOGGED_MODS
+    
+    result = parse_modifications(modification_string)
+    
+    # Add debugging once per unique modification string
+    logging.debug(f"Processing modification: {modification_string}")
+    
+    # Log each position where a custom modification is applied
+    for pos, mod_list in result['custom_mods'].items():
+        for mod_tuple in mod_list:
+            mod_name, residue = mod_tuple
+            # Create a unique identifier for this specific modification
+            mod_key = f"{mod_name}_{pos}_{residue}"
+            # Only log if we haven't logged this exact modification before
+            if mod_key not in ALREADY_LOGGED_MODS:
+                logging.debug(f"Added custom mod {mod_name} at position {pos} ({residue}{pos+1})")
+                ALREADY_LOGGED_MODS.add(mod_key)
+    
+    # Log oxidation positions
+    for pos in result['oxidation']:
+        logging.debug(f"Added oxidation at position {pos} (M{pos+1})")
+    
+    # Log phosphorylation positions  
+    for pos in result['phospho']:
+        logging.debug(f"Added phospho at position {pos}")
+    
+    # Log N-terminal acetylation
+    if result['acetyl']:
+        logging.debug(f"Added N-terminal acetylation")
+        
+    return result
+
+def make_hashable(item):
+    if isinstance(item, list):
+        return tuple(make_hashable(i) for i in item)
+    elif isinstance(item, dict):
+        return tuple(sorted((k, make_hashable(v)) for k, v in item.items()))
+    return item
+
+def normalize_neutral_losses(selected_neutral_losses):
+    if selected_neutral_losses is None:
+        return None
+    if isinstance(selected_neutral_losses, str):
+        return (selected_neutral_losses,)
+    if isinstance(selected_neutral_losses, tuple):
+        return tuple(sorted(selected_neutral_losses))
+    if isinstance(selected_neutral_losses, (list, set)):
+        return tuple(sorted(selected_neutral_losses))
+    try:
+        return tuple(sorted(selected_neutral_losses))
+    except TypeError:
+        return tuple()
+
+def neutral_losses_cache_key(selected_neutral_losses):
+    normalized = normalize_neutral_losses(selected_neutral_losses)
+    if normalized is None:
+        return "ALL"
+    if len(normalized) == 0:
+        return "NONE"
+    return "|".join(normalized)
+
+@lru_cache(maxsize=10000)
+def generate_theoretical_ions_cached(peptide, modifications, fragmentation_type, selected_neutral_losses=None):
+    # Strip DECOY_ prefix before ion generation — prefix is only a label,
+    # not part of the amino acid sequence. Including it would add ~747 Da
+    # of fictitious mass (D,E,C,O,Y,_ treated as residues).
+    seq = peptide[6:] if peptide.startswith('DECOY_') else peptide
+    # Convert all arguments to hashable types
+    modifications = make_hashable(modifications)
+    selected_neutral_losses = normalize_neutral_losses(selected_neutral_losses)
+    return generate_theoretical_ions(seq, modifications, fragmentation_type, selected_neutral_losses)
+
+def get_scan_window_limits(mzml_file):
+    """
+    Parse the mzML or .raw file and extract scan window lower and upper limits.
+    Returns (lower, upper) as floats, or defaults if not found.
+    """
+    lower, upper = 97.0, 1644.0  # Default values
+    
+    ext = os.path.splitext(mzml_file)[1].lower()
+    if ext == '.raw' and _check_fisher_available():
+        # Extract scan window from first MS2 spectrum via fisher_py
+        try:
+            for spectrum in read_raw_with_fisher(mzml_file):
+                if spectrum.get('ms level', 0) == 2:
+                    sw_list = (spectrum.get('scanList', {}).get('scan', [{}])[0]
+                               .get('scanWindowList', {}).get('scanWindow', []))
+                    if sw_list:
+                        for cv in sw_list[0].get('cvParam', []):
+                            if cv.get('name') == 'scan window lower limit':
+                                lower = float(cv['value'])
+                            elif cv.get('name') == 'scan window upper limit':
+                                upper = float(cv['value'])
+                    break  # Only need the first MS2 scan
+        except Exception as e:
+            logging.warning(f"Could not parse scan window limits from {mzml_file}: {e}")
+        return lower, upper
+    
+    try:
+        context = ET.iterparse(mzml_file, events=("start", "end"))
+        for event, elem in context:
+            if event == "start" and elem.tag.endswith("scanWindowList"):
+                for scan_window in elem.findall(".//{*}scanWindow"):
+                    for cv in scan_window.findall("{*}cvParam"):
+                        name = cv.attrib.get("name", "")
+                        if name == "scan window lower limit":
+                            lower = float(cv.attrib["value"])
+                        elif name == "scan window upper limit":
+                            upper = float(cv.attrib["value"])
+                break  # Only need the first scanWindowList
+    except Exception as e:
+        logging.warning(f"Could not parse scan window limits from {mzml_file}: {e}")
+    return lower, upper
+
+def categorize_unimod_modifications():
+    """
+    Categorize Unimod modifications into fixed and variable modifications
+    and add them to the global FIXED_MODIFICATIONS and VARIABLE_MODIFICATIONS lists
+    """
+    global FIXED_MODIFICATIONS, VARIABLE_MODIFICATIONS, UNIMOD_MODIFICATIONS
+    
+    if not UNIMOD_MODIFICATIONS:
+        return
+        
+    # Lists of keywords to help categorize modifications
+    fixed_keywords = [
+        'carbamidomethyl', 'cys', 'tmt', 'itraq', 'silac', 'stable isotope',
+        'label:', 'heavy', 'cam', 'fixed', 'static', 'alk', 
+        'dimethyl', 'propionyl', 'tandem mass tag'
+    ]
+    
+    variable_keywords = [
+        'oxidation', 'phospho', 'methyl', 'acetyl', 'amidated', 'deamidated', 
+        'hydroxy', 'sulfo', 'variable', 'glyco', 'glycosyl',
+        'carbamyl', 'nitro', 'formyl', 'hydr', 'chlor', 'fluor', 'croton',
+        'ubiquitin', 'sumo', 'pyro', 'glu->pyro-glu'
+    ]
+    
+    # Set to track processed modification names
+    processed_names = {mod['name'] for mod in FIXED_MODIFICATIONS + VARIABLE_MODIFICATIONS}
+    
+    # Process each Unimod modification
+    for name, mod_info in UNIMOD_MODIFICATIONS.items():
+        # Skip if already processed
+        if name in processed_names:
+            continue
+            
+        # Determine residues and position
+        residues = []
+        position = 'anywhere'
+        
+        for spec in mod_info['specificity']:
+            res = spec['site']
+            if res not in residues:
+                residues.append(res)
+                
+            if spec['position'] != 'any' and position == 'anywhere':
+                position = spec['position']
+        
+        residue_str = ','.join(residues) if residues else 'any'
+        
+        # Determine if fixed or variable
+        name_lower = name.lower()
+        is_fixed = False
+        
+        # Check fixed keywords first
+        for keyword in fixed_keywords:
+            if keyword.lower() in name_lower:
+                is_fixed = True
+                break
+                
+        # If not categorized as fixed, go with variable
+        if is_fixed:
+            FIXED_MODIFICATIONS.append({
+                'name': name,
+                'mass_shift': mod_info['delta_mono'],
+                'residues': residue_str,
+                'position': position
+            })
+        else:
+            VARIABLE_MODIFICATIONS.append({
+                'name': name,
+                'mass_shift': mod_info['delta_mono'],
+                'residues': residue_str,
+                'position': position
+            })
+            
+    logging.info(f"Categorized {len(FIXED_MODIFICATIONS)} fixed and {len(VARIABLE_MODIFICATIONS)} variable modifications")
+
+def open_modifications_manager(root):
+    """Open a window to manage chemical modifications"""
+    global FIXED_MODIFICATIONS, VARIABLE_MODIFICATIONS, UNIMOD_LOADED
+    
+    mod_window = tk.Toplevel(root)
+    mod_window.title("Chemical Modifications Manager")
+    mod_window.geometry("800x600")
+    
+    ttk.Label(mod_window, text="Manage chemical modifications for peptide analysis").pack(pady=10)
+    
+    # Create a notebook with tabs for Fixed and Variable modifications
+    notebook = ttk.Notebook(mod_window)
+    notebook.pack(fill='both', expand=True, padx=10, pady=5)
+    
+    # Create frames for each type of modification
+    fixed_frame = ttk.Frame(notebook)
+    variable_frame = ttk.Frame(notebook)
+    
+    notebook.add(fixed_frame, text="Fixed Modifications")
+    notebook.add(variable_frame, text="Variable Modifications")
+    
+    # Keep track of sort settings for each column
+    sort_settings = {}
+    
+    # Function to handle column sorting
+    def sort_column(tree, col, descending=False):
+        """Sort tree contents when a column header is clicked"""
+        # Get all the data from the treeview
+        data = [(tree.set(item, col), item) for item in tree.get_children('')]
+        
+        # Convert numeric values properly for sorting
+        try:
+            # If the column contains numbers
+            data = [(float(value), item) for value, item in data]
+        except ValueError:
+            # If it's text, leave as is
+            pass
+            
+        # Sort the data
+        data.sort(reverse=descending)
+        
+        # Rearrange items in sorted order
+        for idx, (val, item) in enumerate(data):
+            tree.move(item, '', idx)
+            
+        # Update the sort settings for this tree and column
+        tree_id = str(tree)
+        if tree_id not in sort_settings:
+            sort_settings[tree_id] = {}
+        sort_settings[tree_id][col] = descending
+        
+    # Function to handle column header click
+    def on_header_click(event, tree):
+        region = tree.identify("region", event.x, event.y)
+        if region == "heading":
+            col = tree.identify_column(event.x)
+            # Convert the col from #N format to actual column name
+            col_name = tree.column(col, "id")
+            
+            # Get current sort direction for this column (default to False if not set)
+            tree_id = str(tree)
+            current_descending = False
+            if tree_id in sort_settings and col_name in sort_settings[tree_id]:
+                current_descending = sort_settings[tree_id][col_name]
+            
+            # Sort with the opposite direction
+            sort_column(tree, col_name, not current_descending)
+            
+            # Update column heading to show sort direction
+            # Always remove both arrows first, then add the appropriate one
+            current_text = tree.heading(col_name, "text")
+            clean_text = current_text.replace(" ↑", "").replace(" ↓", "")
+            
+            if not current_descending:  # Will sort descending next time
+                tree.heading(col_name, text=clean_text + " ↑")
+            else:  # Will sort ascending next time
+                tree.heading(col_name, text=clean_text + " ↓")
+
+    # Create treeviews for Fixed modifications
+    fixed_columns = ('name', 'mass_shift', 'residues', 'position')
+    fixed_tree = ttk.Treeview(fixed_frame, columns=fixed_columns, show='headings')
+    
+    # Define column headings for fixed mods
+    fixed_tree.heading('name', text='Modification Name')
+    fixed_tree.heading('mass_shift', text='Mass Shift (Da)')
+    fixed_tree.heading('residues', text='Applicable Residues')
+    fixed_tree.heading('position', text='Position')
+    
+    # Bind the header click event
+    fixed_tree.bind("<ButtonRelease-1>", lambda event: on_header_click(event, fixed_tree))
+    
+    # Define column widths
+    fixed_tree.column('name', width=150)
+    fixed_tree.column('mass_shift', width=100)
+    fixed_tree.column('residues', width=150)
+    fixed_tree.column('position', width=100)
+    
+    # Create a scrollbar for the Fixed treeview
+    fixed_scrollbar = ttk.Scrollbar(fixed_frame, orient="vertical", command=fixed_tree.yview)
+    fixed_tree.configure(yscrollcommand=fixed_scrollbar.set)
+    
+    fixed_scrollbar.pack(side='right', fill='y')
+    fixed_tree.pack(side='left', fill='both', expand=True)
+    
+    # Create buttons for Fixed modifications
+    fixed_button_frame = ttk.Frame(fixed_frame)
+    fixed_button_frame.pack(fill='x', pady=5)
+    
+    def add_fixed_mod():
+        add_modification(fixed_tree, True)
+        
+    def edit_fixed_mod():
+        edit_modification(fixed_tree)
+        
+    ttk.Button(fixed_button_frame, text="Add", command=add_fixed_mod).pack(side='top')
+    ttk.Button(fixed_button_frame, text="Edit", command=edit_fixed_mod).pack(side='top', pady=5)
+    ttk.Button(fixed_button_frame, text="Delete", command=lambda: delete_modification(fixed_tree)).pack(side='top', pady=5)
+    
+    # Create treeviews for Variable modifications
+    variable_columns = ('name', 'mass_shift', 'residues', 'position')
+    variable_tree = ttk.Treeview(variable_frame, columns=variable_columns, show='headings')
+    
+    # Define column headings for variable mods WITHOUT direct sorting commands
+    variable_tree.heading('name', text='Modification Name')
+    variable_tree.heading('mass_shift', text='Mass Shift (Da)')
+    variable_tree.heading('residues', text='Applicable Residues')
+    variable_tree.heading('position', text='Position')
+    
+    # Bind the header click event (this is the only sorting mechanism we want to use)
+    variable_tree.bind("<ButtonRelease-1>", lambda event: on_header_click(event, variable_tree))
+    
+    # Define column widths
+    variable_tree.column('name', width=150)
+    variable_tree.column('mass_shift', width=100)
+    variable_tree.column('residues', width=150)
+    variable_tree.column('position', width=100)
+        
+    # Create a scrollbar for the Variable treeview
+    variable_scrollbar = ttk.Scrollbar(variable_frame, orient="vertical", command=variable_tree.yview)
+    variable_tree.configure(yscrollcommand=variable_scrollbar.set)
+    
+    variable_scrollbar.pack(side='right', fill='y')
+    variable_tree.pack(side='left', fill='both', expand=True)
+    
+    # Create buttons for Variable modifications
+    variable_button_frame = ttk.Frame(variable_frame)
+    variable_button_frame.pack(fill='x', pady=5)
+    
+    def add_variable_mod():
+        add_modification(variable_tree, False)
+        
+    def edit_variable_mod():
+        edit_modification(variable_tree)
+        
+    ttk.Button(variable_button_frame, text="Add", command=add_variable_mod).pack(side='top')
+    ttk.Button(variable_button_frame, text="Edit", command=edit_variable_mod).pack(side='top', pady=5)
+    ttk.Button(variable_button_frame, text="Delete", command=lambda: delete_modification(variable_tree)).pack(side='top', pady=5)
+    
+    # Add a frame for global buttons
+    global_button_frame = ttk.Frame(mod_window)
+    global_button_frame.pack(fill='x', pady=10, padx=10)
+    
+    def reload_unimod_mods():
+        """Reload Unimod modifications from the CSV file ignoring custom modifications"""
+        global FIXED_MODIFICATIONS, VARIABLE_MODIFICATIONS
+        
+        # Reset the modifications lists
+        FIXED_MODIFICATIONS = []
+        VARIABLE_MODIFICATIONS = []
+        
+        # Use the helper function to find unimod.csv
+        csv_path = get_resource_path("unimod.csv")
+                
+        if csv_path:
+            try:
+                logging.info(f"Reloading Unimod modifications from CSV: {csv_path}")
+                unimod_mods = load_unimod_from_csv_file(csv_path)
+                if unimod_mods:
+                    UNIMOD_LOADED = True
+                    UNIMOD_MODIFICATIONS.update(unimod_mods)
+
+                    # Categorize the loaded modifications
+                    categorize_unimod_modifications()
+
+                    logging.info(f"Successfully reloaded {len(unimod_mods)} modifications from Unimod CSV")
+                else:
+                    logging.warning("Unimod CSV file was found but no modifications were loaded")
+            except Exception as e:
+                logging.error(f"Error loading Unimod CSV file: {str(e)}")
+        else:
+            logging.warning("Unimod CSV file not found in any expected locations.")
+        
+        # Load the modifications to the trees
+        load_modifications_to_trees(fixed_tree, variable_tree)
+        
+        # Update the status label with the current modification counts
+        fixed_count = len(FIXED_MODIFICATIONS)
+        variable_count = len(VARIABLE_MODIFICATIONS)
+        status_text = f"Loaded {fixed_count} fixed and {variable_count} variable modifications"
+        status_label.config(text=status_text)
+        
+        messagebox.showinfo("Success", "Unimod modifications reloaded")
+
+    def save_all_mods():
+        """Save modifications to memory and Excel file"""
+        # Save to global variables
+        save_modifications(fixed_tree, variable_tree)
+        
+        # Save to Excel file
+        excel_path = save_modifications_to_excel(fixed_tree, variable_tree)
+        
+        messagebox.showinfo("Success", f"Modifications saved to {excel_path}")
+            
+    def close_and_save():
+        """Save modifications when closing and save to Excel file"""
+        # Save to global variables
+        save_modifications(fixed_tree, variable_tree)
+        
+        # Save to Excel file
+        save_modifications_to_excel(fixed_tree, variable_tree)
+        
+        mod_window.destroy()
+
+    ttk.Button(global_button_frame, text="Reload Unimod", command=reload_unimod_mods).pack(side='left', padx=5)
+    ttk.Button(global_button_frame, text="Save All", command=save_all_mods).pack(side='left', padx=5)
+    ttk.Button(global_button_frame, text="Close", command=close_and_save).pack(side='right', padx=5)
+    
+    # Display status text about loaded modifications
+    fixed_count = len(FIXED_MODIFICATIONS)
+    variable_count = len(VARIABLE_MODIFICATIONS)
+    status_text = f"Loaded {fixed_count} fixed and {variable_count} variable modifications"
+    
+    status_label = ttk.Label(mod_window, text=status_text)
+    status_label.pack(pady=5)
+    
+    # Load modifications to trees from memory
+    load_modifications_to_trees(fixed_tree, variable_tree)
+
+def add_modification(tree, is_fixed):
+    """Add a new modification to the selected tree"""
+    add_window = tk.Toplevel()
+    add_window.title(f"Add {'Fixed' if is_fixed else 'Variable'} Modification")
+    add_window.geometry("400x250")
+    
+    # Create form fields
+    ttk.Label(add_window, text="Modification Name:").grid(row=0, column=0, sticky='w', padx=5, pady=5)
+    name_var = tk.StringVar()
+    ttk.Entry(add_window, textvariable=name_var, width=30).grid(row=0, column=1, padx=5, pady=5)
+    
+    ttk.Label(add_window, text="Mass Shift (Da):").grid(row=1, column=0, sticky='w', padx=5, pady=5)
+    mass_var = tk.StringVar()
+    ttk.Entry(add_window, textvariable=mass_var, width=30).grid(row=1, column=1, padx=5, pady=5)
+    
+    ttk.Label(add_window, text="Applicable Residues:").grid(row=2, column=0, sticky='w', padx=5, pady=5)
+    residues_var = tk.StringVar()
+    ttk.Entry(add_window, textvariable=residues_var, width=30).grid(row=2, column=1, padx=5, pady=5)
+    ttk.Label(add_window, text="(e.g., M or S,T,Y or N-term)").grid(row=2, column=2, sticky='w', padx=5, pady=5)
+    
+    ttk.Label(add_window, text="Position:").grid(row=3, column=0, sticky='w', padx=5, pady=5)
+    position_var = tk.StringVar(value="anywhere")
+    position_combo = ttk.Combobox(add_window, textvariable=position_var, 
+                                values=['anywhere', 'N-term', 'C-term', 'protein N-term', 'protein C-term'], 
+                                width=20, state='readonly')
+    position_combo.grid(row=3, column=1, sticky='w', padx=5, pady=5)
+    
+    # Button to save the modification
+    def save_new_mod():
+        try:
+            name = name_var.get().strip()
+            mass_str = mass_var.get().strip()
+            residues = residues_var.get().strip()
+            position = position_var.get()
+            
+            if not name:
+                messagebox.showerror("Error", "Modification name cannot be empty.")
+                return
+                
+            if not mass_str:
+                messagebox.showerror("Error", "Mass shift cannot be empty.")
+                return
+                
+            try:
+                mass = float(mass_str)
+            except ValueError:
+                messagebox.showerror("Error", "Mass shift must be a valid number.")
+                return
+                
+            if not residues:
+                messagebox.showerror("Error", "Please specify applicable residues.")
+                return
+            
+            # Insert the new modification into the tree
+            tree.insert('', 'end', values=(name, mass, residues, position))
+            add_window.destroy()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add modification: {str(e)}")
+    
+    button_frame = ttk.Frame(add_window)
+    button_frame.grid(row=4, column=0, columnspan=3, pady=10)
+    ttk.Button(button_frame, text="Save", command=save_new_mod).pack(side='right', padx=5)
+    ttk.Button(button_frame, text="Cancel", command=add_window.destroy).pack(side='right', padx=5)
+
+def edit_modification(tree):
+    """Edit the selected modification"""
+    selected_item = tree.selection()
+    
+    if not selected_item:
+        messagebox.showwarning("No Selection", "Please select a modification to edit.")
+        return
+        
+    # Get the current values
+    current_values = tree.item(selected_item[0], 'values')
+    
+    edit_window = tk.Toplevel()
+    edit_window.title("Edit Modification")
+    edit_window.geometry("400x250")
+    
+    # Create form fields with current values
+    ttk.Label(edit_window, text="Modification Name:").grid(row=0, column=0, sticky='w', padx=5, pady=5)
+    name_var = tk.StringVar(value=current_values[0])
+    ttk.Entry(edit_window, textvariable=name_var, width=30).grid(row=0, column=1, padx=5, pady=5)
+    
+    ttk.Label(edit_window, text="Mass Shift (Da):").grid(row=1, column=0, sticky='w', padx=5, pady=5)
+    mass_var = tk.StringVar(value=current_values[1])
+    ttk.Entry(edit_window, textvariable=mass_var, width=30).grid(row=1, column=1, padx=5, pady=5)
+    
+    ttk.Label(edit_window, text="Applicable Residues:").grid(row=2, column=0, sticky='w', padx=5, pady=5)
+    residues_var = tk.StringVar(value=current_values[2])
+    ttk.Entry(edit_window, textvariable=residues_var, width=30).grid(row=2, column=1, padx=5, pady=5)
+    ttk.Label(edit_window, text="(e.g., M or S,T,Y or N-term)").grid(row=2, column=2, sticky='w', padx=5, pady=5)
+    
+    ttk.Label(edit_window, text="Position:").grid(row=3, column=0, sticky='w', padx=5, pady=5)
+    position_var = tk.StringVar(value=current_values[3])
+    position_combo = ttk.Combobox(edit_window, textvariable=position_var, 
+                                values=['anywhere', 'N-term', 'C-term', 'protein N-term', 'protein C-term'], 
+                                width=20, state='readonly')
+    position_combo.grid(row=3, column=1, sticky='w', padx=5, pady=5)
+    
+    # Button to save the edited modification
+    def save_mod_changes():
+        try:
+            name = name_var.get().strip()
+            mass_str = mass_var.get().strip()
+            residues = residues_var.get().strip()
+            position = position_var.get()
+            
+            if not name:
+                messagebox.showerror("Error", "Modification name cannot be empty.")
+                return
+                
+            try:
+                mass = float(mass_str)
+            except ValueError:
+                messagebox.showerror("Error", "Mass shift must be a valid number.")
+                return
+                
+            if not residues:
+                messagebox.showerror("Error", "Please specify applicable residues.")
+                return
+            
+            # Update the tree item
+            tree.item(selected_item[0], values=(name, mass, residues, position))
+            edit_window.destroy()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to edit modification: {str(e)}")
+    
+    button_frame = ttk.Frame(edit_window)
+    button_frame.grid(row=4, column=0, columnspan=3, pady=10)
+    ttk.Button(button_frame, text="Save Changes", command=save_mod_changes).pack(side='right', padx=5)
+    ttk.Button(button_frame, text="Cancel", command=edit_window.destroy).pack(side='right', padx=5)
+
+def delete_modification(tree):
+    """Delete the selected modification"""
+    selected_item = tree.selection()
+    
+    if not selected_item:
+        messagebox.showwarning("No Selection", "Please select a modification to delete.")
+        return
+        
+    # Get the name of the modification for confirmation
+    mod_name = tree.item(selected_item[0], 'values')[0]
+    
+    # Ask for confirmation
+    if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete the modification '{mod_name}'?"):
+        tree.delete(selected_item[0])
+
+def load_default_modifications(fixed_tree, variable_tree):
+    """Load hardcoded default modifications"""
+    # Clear existing items
+    fixed_tree.delete(*fixed_tree.get_children())
+    variable_tree.delete(*variable_tree.get_children())
+    
+    # Default Fixed modifications
+    fixed_mods = {
+        'Carbamidomethyl': {'residues': 'C', 'position': 'anywhere', 'mass_shift': 57.021464},
+        'TMT6plex': {'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 229.162932},
+        'TMT10plex': {'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 229.162932},
+        'iTRAQ4plex': {'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 144.102063}
+    }
+    
+    # Default Variable modifications
+    variable_mods = {
+        'Oxidation': {'residues': 'M', 'position': 'anywhere', 'mass_shift': 15.994915},
+        'Acetyl': {'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 42.010565},
+        'Phospho': {'residues': 'S,T,Y', 'position': 'anywhere', 'mass_shift': 79.966331},
+        'Deamidated': {'residues': 'N,Q', 'position': 'anywhere', 'mass_shift': 0.984016}
+    }
+    
+    # Add fixed modifications to the tree
+    for name, details in fixed_mods.items():
+        fixed_tree.insert('', 'end', values=(
+            name,
+            details['mass_shift'],
+            details['residues'],
+            details['position']
+        ))
+    
+    # Add variable modifications to the tree
+    for name, details in variable_mods.items():
+        variable_tree.insert('', 'end', values=(
+            name,
+            details['mass_shift'],
+            details['residues'],
+            details['position']
+        ))
+        
+    # Save these default modifications to the global variables
+    save_modifications(fixed_tree, variable_tree)
+
+def load_unimod_from_csv_file(csv_path="/mnt/data/unimod.csv"):
+    """Load modifications from a local Unimod CSV file."""
+    global UNIMOD_MODIFICATIONS, UNIMOD_LAST_FETCH
+    try:
+        df = pd.read_csv(csv_path)
+        modifications = {}
+
+        for _, row in df.iterrows():
+            title = row['Title']
+            delta_mono = row['Monoisotopic Mass']
+            delta_avg = row['Average Mass']
+            specificities = str(row['Specificities']).split(';') if pd.notna(row['Specificities']) else []
+
+            spec_list = []
+            for spec in specificities:
+                match = re.match(r"(\w+)\@(.+?) \((.+?)\)", spec.strip())
+                if match:
+                    site, position, _ = match.groups()
+                    spec_list.append({'site': site, 'position': position.lower()})
+                else:
+                    spec_list.append({'site': 'any', 'position': 'any'})
+
+            modifications[title] = {
+                'id': row['Unimod ID'],
+                'delta_mono': float(delta_mono),
+                'delta_avg': float(delta_avg),
+                'specificity': spec_list
+            }
+
+        UNIMOD_MODIFICATIONS = modifications
+        UNIMOD_LAST_FETCH = datetime.datetime.now()
+        return modifications
+
+    except Exception as e:
+        logging.error(f"Failed to load Unimod modifications from CSV: {e}")
+        return {}
+
+def save_modifications(fixed_tree, variable_tree):
+    """Save modifications from trees to global variables"""
+    global FIXED_MODIFICATIONS, VARIABLE_MODIFICATIONS
+    
+    # Get fixed modifications
+    FIXED_MODIFICATIONS = []
+    for item_id in fixed_tree.get_children():
+        values = fixed_tree.item(item_id, 'values')
+        FIXED_MODIFICATIONS.append({
+            'name': values[0],
+            'mass_shift': float(values[1]),
+            'residues': values[2],
+            'position': values[3]
+        })
+    
+    # Get variable modifications
+    VARIABLE_MODIFICATIONS = []
+    for item_id in variable_tree.get_children():
+        values = variable_tree.item(item_id, 'values')
+        VARIABLE_MODIFICATIONS.append({
+            'name': values[0],
+            'mass_shift': float(values[1]),
+            'residues': values[2],
+            'position': values[3]
+        })
+
+def save_modifications_to_excel(fixed_tree, variable_tree):
+    """Save modifications from trees to a custom Excel file"""
+    # Use the helper function to get the user data path
+    excel_path = get_user_data_path("custom_mod.xlsx")
+    
+    # Get fixed modifications from tree
+    fixed_mods = []
+    for item_id in fixed_tree.get_children():
+        values = fixed_tree.item(item_id, 'values')
+        fixed_mods.append({
+            'name': values[0],
+            'mass_shift': float(values[1]),
+            'residues': values[2],
+            'position': values[3],
+            'type': 'fixed'
+        })
+    
+    # Get variable modifications from tree
+    variable_mods = []
+    for item_id in variable_tree.get_children():
+        values = variable_tree.item(item_id, 'values')
+        variable_mods.append({
+            'name': values[0],
+            'mass_shift': float(values[1]),
+            'residues': values[2],
+            'position': values[3],
+            'type': 'variable'
+        })
+    
+    # Combine into a single list
+    all_mods = fixed_mods + variable_mods
+    
+    # Create DataFrame
+    df = pd.DataFrame(all_mods)
+    
+    # Save to Excel file
+    df.to_excel(excel_path, index=False)
+    
+    return excel_path
+
+def load_modifications_to_trees(fixed_tree, variable_tree):
+    """Load modifications from global variables to trees"""
+    global FIXED_MODIFICATIONS, VARIABLE_MODIFICATIONS
+    
+    # Clear existing items
+    fixed_tree.delete(*fixed_tree.get_children())
+    variable_tree.delete(*variable_tree.get_children())
+    
+    # Load fixed modifications
+    for mod in FIXED_MODIFICATIONS:
+        fixed_tree.insert('', 'end', values=(
+            mod['name'],
+            mod['mass_shift'],
+            mod['residues'],
+            mod['position']
+        ))
+    
+    # Load variable modifications
+    for mod in VARIABLE_MODIFICATIONS:
+        variable_tree.insert('', 'end', values=(
+            mod['name'],
+            mod['mass_shift'],
+            mod['residues'],
+            mod['position']
+        ))
+
+def initialize_modifications():
+    """Initialize the modification system at application startup"""
+    global FIXED_MODIFICATIONS, VARIABLE_MODIFICATIONS, UNIMOD_LOADED
+
+    # Try to find custom_mod.xlsx using the helper function
+    # Check user data path first (alongside executable), then bundled resources
+    custom_mod_path = get_user_data_path("custom_mod.xlsx")
+    if not os.path.exists(custom_mod_path):
+        custom_mod_path = get_resource_path("custom_mod.xlsx")
+            
+    # Check for custom modifications file first
+    if custom_mod_path and os.path.exists(custom_mod_path):
+        try:
+            # Load modifications from custom Excel file
+            logging.info(f"Loading custom modifications from {custom_mod_path}")
+            df = pd.read_excel(custom_mod_path)
+            
+            # Initialize empty lists
+            FIXED_MODIFICATIONS = []
+            VARIABLE_MODIFICATIONS = []
+            
+            # Process each row
+            for row_dict in df.to_dict('records'):
+                mod = {
+                    'name': row_dict['name'],
+                    'mass_shift': float(row_dict['mass_shift']),
+                    'residues': row_dict['residues'],
+                    'position': row_dict['position']
+                }
+                
+                if row_dict['type'] == 'fixed':
+                    FIXED_MODIFICATIONS.append(mod)
+                else:
+                    VARIABLE_MODIFICATIONS.append(mod)
+            
+            logging.info(f"Loaded {len(FIXED_MODIFICATIONS)} fixed and {len(VARIABLE_MODIFICATIONS)} variable modifications from custom_mod.xlsx")
+            # No return here! Continue with normal initialization if needed
+        except Exception as e:
+            logging.error(f"Error loading custom modifications: {str(e)}")
+            # Fall back to default behavior if failed to load custom modifications
+    else:
+        logging.info("No custom_mod.xlsx file found, loading default modifications")
+    
+    # Set up default modifications if none exist or failed to load custom ones
+    if not FIXED_MODIFICATIONS:
+        FIXED_MODIFICATIONS = [
+            {'name': 'Carbamidomethyl', 'residues': 'C', 'position': 'anywhere', 'mass_shift': 57.021464},
+            {'name': 'TMT6plex', 'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 229.162932},
+            {'name': 'TMT10plex', 'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 229.162932},
+            {'name': 'iTRAQ4plex', 'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 144.102063}
+        ]
+
+    if not VARIABLE_MODIFICATIONS:
+        VARIABLE_MODIFICATIONS = [
+            {'name': 'Oxidation', 'residues': 'M', 'position': 'anywhere', 'mass_shift': 15.994915},
+            {'name': 'Acetyl', 'residues': 'K,N-term', 'position': 'anywhere', 'mass_shift': 42.010565},
+            {'name': 'Phospho', 'residues': 'S,T,Y', 'position': 'anywhere', 'mass_shift': 79.966331},
+            {'name': 'Deamidated', 'residues': 'N,Q', 'position': 'anywhere', 'mass_shift': 0.984016}
+        ]
+
+    # Try to load Unimod modifications using the helper function
+    csv_path = get_resource_path("unimod.csv")
+
+    if csv_path:
+        try:
+            logging.info(f"Loading Unimod modifications from CSV: {csv_path}")
+            unimod_mods = load_unimod_from_csv_file(csv_path)
+            if unimod_mods:
+                UNIMOD_LOADED = True
+                UNIMOD_MODIFICATIONS.update(unimod_mods)
+
+                # Categorize the loaded modifications
+                categorize_unimod_modifications()
+
+                logging.info(f"Successfully loaded {len(unimod_mods)} modifications from Unimod CSV")
+            else:
+                logging.warning("Unimod CSV file was found but no modifications were loaded")
+        except Exception as e:
+            logging.error(f"Error loading Unimod CSV file: {str(e)}")
+    else:
+        logging.warning("Unimod CSV file not found in any expected locations.")
+        
+def validate_prm_modifications(mod_names):
+    """Ensure user-specified PRM mods exist in loaded Unimod data (case-insensitive)"""
+    existing_mods = set(name.lower() for name in UNIMOD_MODIFICATIONS)
+    for mod in mod_names:
+        if mod.lower() not in existing_mods:
+            raise ValueError(f"Modification '{mod}' not found in Unimod modifications list.")
+
+def reorder_columns(df, filter_intensity_columns=True,
+                    frag_usage=None, mass_drift_on=None, rt_drift_on=None):
+    """
+    Reorder DataFrame columns with a single, consolidated approach:
+    1. Define key columns that should appear in a specific sequence
+    2. Optionally filter out max_intensity and eic_area columns
+    3. Conditionally hide columns based on analysis config
+    4. Keep other columns in their original relative positions
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        Input DataFrame to reorder
+    filter_intensity_columns : bool
+        Whether to filter out max_intensity and eic_area columns
+    frag_usage : str or None
+        Fragment usage mode ('all', 'quant_only', 'both', 'probabilistic').
+        When not 'probabilistic', hides spectral_angle, predicted_fragment_intensities,
+        shared_ion_count, and deconv_confidence columns.
+    mass_drift_on : bool or None
+        Whether mass drift correction was applied. When False, hides
+        mass_accuracy_signed, mass_drift_correction_ppm, mass_accuracy_corrected.
+    rt_drift_on : bool or None
+        Whether RT drift correction was applied. When False, hides
+        known_rt_corrected, rt_drift_correction, and run_order.
+    
+    Returns:
+    --------
+    DataFrame
+        DataFrame with reordered and optionally filtered columns
+    """
+    if df.empty:
+        return df
+    
+    # Work on a copy so display/export formatting does not mutate upstream data.
+    df = df.copy()
+    
+    # Harmonize confidence columns for output: expose qvalue/PEP regardless of backend.
+    if 'qvalue' not in df.columns and 'mokapot_qvalue' in df.columns:
+        df['qvalue'] = df['mokapot_qvalue']
+    if 'PEP' not in df.columns and 'mokapot_PEP' in df.columns:
+        df['PEP'] = df['mokapot_PEP']
+    
+    # Normalize scan_number for output: keep only the numeric value after "scan=" when present.
+    if 'scan_number' in df.columns:
+        scan_extracted = df['scan_number'].astype(str).str.extract(r'scan=(\d+)', expand=False)
+        df['scan_number'] = scan_extracted.fillna(df['scan_number'])
+        
+    # Get all columns
+    all_cols = list(df.columns)
+    
+    # Show deconvolution confidence only when probabilistic deconvolution is applicable.
+    deconv_applicable = False
+    if 'deconv_confidence' in all_cols:
+        if 'shared_ion_count' in all_cols:
+            try:
+                deconv_applicable = pd.to_numeric(df['shared_ion_count'], errors='coerce').fillna(0).gt(0).any()
+            except Exception:
+                deconv_applicable = False
+        if not deconv_applicable:
+            deconv_series = pd.to_numeric(df['deconv_confidence'], errors='coerce')
+            deconv_applicable = deconv_series.notna().any() and not deconv_series.dropna().eq(1.0).all()
+    
+    # Define specific columns that should appear in a fixed sequence
+    ordered_key_cols = [
+        # ── Identification ──
+        'file',
+        'run_order',
+        'scan_number',
+        'peptide',
+        'modification',
+        'm_z',
+        'charge',
+        # ── Retention time ──
+        'rt',
+        'known_rt',
+        'known_rt_corrected',
+        'rt_drift_correction',
+        'start_rt',
+        'stop_rt',
+        # ── Fragment matching ──
+        'matched_fragments',
+        'fragment_mzs',
+        'fragment_charges',
+        'predicted_fragment_intensities',
+        # ── Quality scores ──
+        'norm_fragment_count',
+        'mass_accuracy',
+        'mass_accuracy_signed',
+        'norm_mass_accuracy',
+        'mass_drift_correction_ppm',
+        'mass_accuracy_corrected',
+        'rt_accuracy',
+        'norm_rt_accuracy',
+        'charge_consistency',
+        'continuity_score',
+        'complementarity_score',
+        # ── Probabilistic deconvolution ──
+        'spectral_angle',
+        'matched_predicted_peaks',
+        'predicted_base_peak_matched',
+        'predicted_top3_matched',
+        'shared_ion_count',
+        'deconv_confidence',
+        # ── Statistical ──
+        'psm_score',
+        'svm_score',
+        'qvalue',
+        'PEP',
+        'delta_cn',
+        'PSM ambiguity',
+        'Decoy',
+    ]
+    
+    # Expose Mokapot SVM discriminant score as 'svm_score' for clarity.
+    if 'mokapot_score' in df.columns:
+        df.rename(columns={'mokapot_score': 'svm_score'}, inplace=True)
+    # Harmonize q-value / PEP (already done above); drop raw mokapot columns.
+    for _mk_dup in ('mokapot_qvalue', 'mokapot_PEP'):
+        if _mk_dup in df.columns:
+            df.drop(columns=[_mk_dup], inplace=True, errors='ignore')
+    all_cols = list(df.columns)  # refresh after rename/drop
+    
+    # Remove deprecated / duplicate / unwanted export columns
+    if 'score' in all_cols:
+        all_cols.remove('score')
+    if 'total_intensity' in all_cols:
+        all_cols.remove('total_intensity')
+    # Hide auxiliary naive-FDR trace columns from exported PSM sheet.
+    # Keep only the canonical qvalue column used for filtering/export.
+    for aux_col in ('q_value', 'fdr', 'cum_decoy', 'cum_target', 'cum_decoys', 'cum_targets'):
+        if aux_col in all_cols:
+            all_cols.remove(aux_col)
+    if not deconv_applicable and 'deconv_confidence' in all_cols:
+        all_cols.remove('deconv_confidence')
+    
+    # ── Config-aware column exclusions ────────────────────────────────
+    # When probabilistic deconvolution is not selected, hide its columns.
+    if frag_usage is not None and frag_usage != "probabilistic":
+        for _hide in ('spectral_angle', 'predicted_fragment_intensities',
+                      'shared_ion_count', 'deconv_confidence'):
+            if _hide in all_cols:
+                all_cols.remove(_hide)
+
+    # When mass drift correction is not applied, hide related columns.
+    if mass_drift_on is not None and not mass_drift_on:
+        for _hide in ('mass_accuracy_signed', 'mass_drift_correction_ppm',
+                      'mass_accuracy_corrected'):
+            if _hide in all_cols:
+                all_cols.remove(_hide)
+
+    # When RT drift correction is not applied, hide related columns.
+    if rt_drift_on is not None and not rt_drift_on:
+        for _hide in ('known_rt_corrected', 'rt_drift_correction', 'run_order'):
+            if _hide in all_cols:
+                all_cols.remove(_hide)
+
+    # Only filter intensity columns if requested
+    if filter_intensity_columns:
+        filtered_cols = [col for col in all_cols if not (
+            col.endswith('_max_intensity') or col.endswith('_eic_area') or col in ('max_intensity', 'eic_area')
+        )]
+    else:
+        filtered_cols = all_cols
+    
+    # Create a list for the final order
+    final_cols = []
+    
+    # Add each ordered key column if it exists in the DataFrame
+    for col in ordered_key_cols:
+        if col in filtered_cols:
+            final_cols.append(col)
+            filtered_cols.remove(col)
+    
+    # Add any remaining columns that weren't specifically ordered (excluding filtered ones)
+    remaining_cols = filtered_cols
+    final_cols.extend(remaining_cols)
+    
+    # Return the reordered DataFrame with only the selected columns
+    return df[final_cols]
+
+# Supported vendor file extensions for automatic conversion
+SUPPORTED_VENDOR_EXTS = ['.raw', '.wiff', '.d']  # Extend as needed for other formats
+
+# ============================================================================
+# FISHER.PY — DIRECT THERMO .RAW FILE READING (OPTIONAL)
+# ============================================================================
+# fisher_py (pip install fisher-py) provides direct access to Thermo .raw files
+# via ThermoFisher.CommonCore, eliminating the msconvert dependency for .raw files.
+# Benefits: 2-10× faster I/O, no intermediate mzML, random scan access.
+# Falls back to msconvert for non-Thermo formats (.wiff, .d) or if not installed.
+
+_FISHER_AVAILABLE = None  # Lazy-checked on first use
+
+
+def _check_fisher_available():
+    """Check (once) whether fisher_py is importable."""
+    global _FISHER_AVAILABLE
+    if _FISHER_AVAILABLE is None:
+        try:
+            from fisher_py import RawFile
+            _FISHER_AVAILABLE = True
+            logging.debug("fisher_py detected — will use direct .raw file reading.")
+        except ImportError:
+            _FISHER_AVAILABLE = False
+            logging.debug("fisher_py not installed — will use msconvert for .raw files.")
+        except Exception as exc:
+            _FISHER_AVAILABLE = False
+            logging.exception(
+                "fisher_py import failed (assembly/CLR issue or other error). Falling back to msconvert for .raw files."
+            )
+    return _FISHER_AVAILABLE
+
+
+def _parse_scan_filter(filter_string):
+    """Parse a Thermo scan filter string to extract MS level, precursor m/z, and scan window.
+    
+    Example filters:
+      'FTMS + p NSI Full ms [350.0000-1800.0000]'
+      'FTMS + p NSI d Full ms2 500.2468@hcd30.00 [120.0000-1500.0000]'
+      'FTMS + p NSI SIM ms [400.0000-410.0000]'
+    """
+    import re
+    info = {'ms_level': 1, 'precursor_mz': None, 'scan_window': None}
+    
+    # MS level
+    ms_match = re.search(r'\bms(\d*)\b', filter_string, re.IGNORECASE)
+    if ms_match:
+        level = ms_match.group(1)
+        info['ms_level'] = int(level) if level else 1
+    
+    # Precursor m/z (before @)
+    prec_match = re.search(r'(\d+\.?\d*)\s*@', filter_string)
+    if prec_match:
+        info['precursor_mz'] = float(prec_match.group(1))
+    
+    # Scan window [lower-upper]
+    window_match = re.search(r'\[(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\]', filter_string)
+    if window_match:
+        info['scan_window'] = (float(window_match.group(1)), float(window_match.group(2)))
+    
+    return info
+
+
+def read_single_scan_fisher(raw_path, target_scan_number):
+    """Read a single MS2 spectrum by scan number directly from a .raw file.
+
+    Uses fisher_py random-access (O(1)) instead of iterating through every
+    scan, which is the main reason MS2 plots were slow for .raw files.
+
+    Returns a pyteomics-compatible spectrum dict, or None on failure.
+    """
+    from fisher_py import RawFile
+
+    try:
+        scan_num = int(target_scan_number)
+    except (ValueError, TypeError):
+        # target_scan_number might be a full native ID string – extract numeric part
+        m = re.search(r'(\d+)', str(target_scan_number))
+        if not m:
+            return None
+        scan_num = int(m.group(1))
+
+    try:
+        raw_file = RawFile(raw_path)
+        masses, intensities, charges, _filt = raw_file.get_scan_from_scan_number(scan_num)
+        rt = raw_file.get_retention_time_from_scan_number(scan_num)
+        filter_str = raw_file.get_scan_event_str_from_scan_number(scan_num)
+        filter_info = _parse_scan_filter(filter_str)
+
+        mz_array = np.asarray(masses, dtype=np.float64)
+        int_array = np.asarray(intensities, dtype=np.float64)
+
+        if mz_array.size == 0:
+            return None
+
+        spectrum = {
+            'id': f'controllerType=0 controllerNumber=1 scan={scan_num}',
+            'ms level': filter_info['ms_level'],
+            'm/z array': mz_array,
+            'intensity array': int_array,
+            'scanList': {
+                'scan': [{'scan start time': rt}]
+            },
+        }
+
+        if filter_info['ms_level'] >= 2 and filter_info['precursor_mz'] is not None:
+            chg_array = np.asarray(charges, dtype=np.float64)
+            nonzero_charges = chg_array[chg_array > 0]
+            charge_state = 0
+            if nonzero_charges.size > 0:
+                unique, counts = np.unique(nonzero_charges.astype(int), return_counts=True)
+                charge_state = int(unique[np.argmax(counts)])
+
+            selected_ion = {'selected ion m/z': filter_info['precursor_mz']}
+            if charge_state > 0:
+                selected_ion['charge state'] = charge_state
+
+            spectrum['precursorList'] = {
+                'precursor': [{
+                    'selectedIonList': {
+                        'selectedIon': [selected_ion]
+                    }
+                }]
+            }
+
+        return spectrum
+    except Exception as e:
+        logging.debug(f"fisher_py direct scan access failed for scan {target_scan_number}: {e}")
+        return None
+
+
+def read_raw_with_fisher(raw_path):
+    """Read a Thermo .raw file directly using fisher_py.
+    
+    Yields spectrum dicts in the same format as pyteomics.mzml.read(),
+    enabling drop-in replacement without changing downstream code.
+    
+    Parameters
+    ----------
+    raw_path : str
+        Path to the .raw file.
+    
+    Yields
+    ------
+    dict
+        Spectrum dict compatible with pyteomics mzml format:
+        - 'm/z array', 'intensity array' (numpy arrays)
+        - 'ms level'
+        - 'id' (scan identifier)
+        - 'scanList' → 'scan' → [{'scan start time': rt}]
+        - 'precursorList' → 'precursor' → [...] (for MS2+)
+    """
+    from fisher_py import RawFile
+    
+    raw_file = RawFile(raw_path)
+    
+    for scan_number in range(raw_file.first_scan, raw_file.last_scan + 1):
+        try:
+            # Pre-filter by MS level using the cheap filter-string lookup
+            # to avoid decoding full peak arrays for MS1 scans.
+            filter_str = raw_file.get_scan_event_str_from_scan_number(scan_number)
+            filter_info = _parse_scan_filter(filter_str)
+            if filter_info['ms_level'] < 2:
+                continue  # Skip MS1 — only MS2+ are used downstream
+            
+            # Get spectrum data: (masses, intensities, charges, filter_string)
+            masses, intensities, charges, _filt = raw_file.get_scan_from_scan_number(scan_number)
+            
+            # Get retention time
+            rt = raw_file.get_retention_time_from_scan_number(scan_number)
+            
+            # Ensure numpy arrays
+            mz_array = np.asarray(masses, dtype=np.float64)
+            int_array = np.asarray(intensities, dtype=np.float64)
+            
+            if mz_array.size == 0:
+                continue
+            
+            # Build pyteomics-compatible spectrum dict
+            spectrum = {
+                'id': f'controllerType=0 controllerNumber=1 scan={scan_number}',
+                'ms level': filter_info['ms_level'],
+                'm/z array': mz_array,
+                'intensity array': int_array,
+                'scanList': {
+                    'scan': [{
+                        'scan start time': rt,
+                    }]
+                },
+            }
+            
+            # Add scan window if available from the filter string
+            if filter_info.get('scan_window'):
+                sw_lower, sw_upper = filter_info['scan_window']
+                spectrum['scanList']['scan'][0]['scanWindowList'] = {
+                    'scanWindow': [{
+                        'cvParam': [
+                            {'name': 'scan window lower limit', 'value': str(sw_lower)},
+                            {'name': 'scan window upper limit', 'value': str(sw_upper)},
+                        ]
+                    }]
+                }
+            
+            # Add precursor info for MS2+ scans
+            if filter_info['ms_level'] >= 2 and filter_info['precursor_mz'] is not None:
+                # Try to infer charge state from the charges array returned by fisher_py
+                charge_state = 0
+                chg_array = np.asarray(charges, dtype=np.float64)
+                nonzero_charges = chg_array[chg_array > 0]
+                if nonzero_charges.size > 0:
+                    # Use the most common non-zero charge
+                    unique, counts = np.unique(nonzero_charges.astype(int), return_counts=True)
+                    charge_state = int(unique[np.argmax(counts)])
+                
+                selected_ion = {'selected ion m/z': filter_info['precursor_mz']}
+                if charge_state > 0:
+                    selected_ion['charge state'] = charge_state
+                
+                spectrum['precursorList'] = {
+                    'precursor': [{
+                        'selectedIonList': {
+                            'selectedIon': [selected_ion]
+                        }
+                    }]
+                }
+            
+            yield spectrum
+            
+        except Exception as e:
+            logging.debug(f"fisher_py: skipping scan {scan_number}: {e}")
+            continue
+
+
+def read_spectra(file_path, use_preindexed=False):
+    """Unified spectrum reader: uses fisher_py for .raw files when available,
+    otherwise falls back to pyteomics mzml reader.
+    
+    Returns a context manager that yields an iterable of spectrum dicts.
+    Usage: with read_spectra(path) as reader: for spec in reader: ...
+    
+    Parameters
+    ----------
+    file_path : str
+        Path to .raw or .mzML file.
+    use_preindexed : bool
+        Use PreIndexedMzML for faster random access (mzML only).
+    
+    Returns
+    -------
+    context manager
+        Iterable of spectrum dicts.
+    """
+    from contextlib import contextmanager
+    
+    ext = os.path.splitext(file_path)[1].lower()
+    
+    if ext == '.raw' and _check_fisher_available():       
+        @contextmanager
+        def _fisher_ctx():
+            yield read_raw_with_fisher(file_path)
+        return _fisher_ctx()
+    
+    # Default: mzML reader
+    if use_preindexed:
+        from pyteomics.mzml import PreIndexedMzML
+        return PreIndexedMzML(file_path)
+    else:
+        from pyteomics import mzml
+        return mzml.read(file_path)
+
+
+# ============================================================================
+# MSCONVERT AUTO-DETECTION AND MANAGEMENT
+# ============================================================================
+# MSConvert (ProteoWizard) cannot be bundled due to vendor DLL licensing.
+# Instead, we auto-detect it from common install paths, registry, and PATH.
+
+_MSCONVERT_PATH_CACHE = None  # Cache to avoid repeated searches
+
+def find_msconvert(force_refresh=False):
+    """
+    Locate msconvert.exe by searching common ProteoWizard install locations,
+    the Windows registry, and the system PATH.
+    
+    Returns the full path to msconvert.exe, or None if not found.
+    Results are cached after the first successful lookup.
+    """
+    global _MSCONVERT_PATH_CACHE
+    
+    if _MSCONVERT_PATH_CACHE and not force_refresh:
+        if os.path.isfile(_MSCONVERT_PATH_CACHE):
+            return _MSCONVERT_PATH_CACHE
+    
+    logging.debug("Searching for msconvert.exe...")
+    
+    # --- Method 1: Check system PATH first (fastest) ---
+    path_result = shutil.which("msconvert")
+    if path_result and os.path.isfile(path_result):
+        logging.debug(f"Found msconvert in PATH: {path_result}")
+        _MSCONVERT_PATH_CACHE = path_result
+        return path_result
+    
+    # --- Method 2: Scan common ProteoWizard install directories ---
+    candidate_dirs = []
+    
+    # Standard install locations
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    
+    for pf in [program_files, program_files_x86]:
+        if os.path.isdir(pf):
+            # Check for exact "ProteoWizard" folder and versioned variants
+            for entry in os.listdir(pf):
+                if "proteowizard" in entry.lower():
+                    candidate_dirs.append(os.path.join(pf, entry))
+    
+    # Docker / custom locations
+    candidate_dirs.extend([
+        r"C:\ProteoWizard",
+        os.path.join(localappdata, "ProteoWizard") if localappdata else "",
+    ])
+    
+    # Check alongside our own executable
+    if IS_FROZEN:
+        exe_dir = os.path.dirname(sys.executable)
+        candidate_dirs.append(os.path.join(exe_dir, "ProteoWizard"))
+        candidate_dirs.append(exe_dir)
+    
+    for d in candidate_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        msconvert_path = os.path.join(d, "msconvert.exe")
+        if os.path.isfile(msconvert_path):
+            logging.debug(f"Found msconvert at: {msconvert_path}")
+            _MSCONVERT_PATH_CACHE = msconvert_path
+            return msconvert_path
+        # Also check subdirectories (versioned installs like "ProteoWizard 3.0.24089")
+        try:
+            for sub in os.listdir(d):
+                sub_path = os.path.join(d, sub, "msconvert.exe")
+                if os.path.isfile(sub_path):
+                    logging.debug(f"Found msconvert at: {sub_path}")
+                    _MSCONVERT_PATH_CACHE = sub_path
+                    return sub_path
+        except PermissionError:
+            continue
+    
+    # --- Method 3: Windows Registry (ProteoWizard registers itself) ---
+    if sys.platform == 'win32':
+        try:
+            import winreg
+            registry_paths = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ProteoWizard"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\ProteoWizard"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\ProteoWizard"),
+            ]
+            for hive, key_path in registry_paths:
+                try:
+                    with winreg.OpenKey(hive, key_path) as key:
+                        install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
+                        if install_dir:
+                            msconvert_path = os.path.join(install_dir, "msconvert.exe")
+                            if os.path.isfile(msconvert_path):
+                                logging.debug(f"Found msconvert via registry: {msconvert_path}")
+                                _MSCONVERT_PATH_CACHE = msconvert_path
+                                return msconvert_path
+                except (FileNotFoundError, OSError):
+                    continue
+        except ImportError:
+            pass
+    
+    # --- Method 4: Windows 'where' command (searches PATH + App Paths) ---
+    if sys.platform == 'win32':
+        try:
+            result = subprocess.run(
+                ['where', '/R', r'C:\Program Files', 'msconvert.exe'],
+                capture_output=True, text=True, timeout=30, **_subprocess_no_window()
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                found_path = result.stdout.strip().splitlines()[0]
+                if os.path.isfile(found_path):
+                    logging.debug(f"Found msconvert via 'where' command: {found_path}")
+                    _MSCONVERT_PATH_CACHE = found_path
+                    return found_path
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+    
+    logging.warning("msconvert.exe not found in any searched location.")
+    return None
+
+
+def deep_scan_for_msconvert(drives=None, callback=None):
+    """
+    Comprehensive recursive search across all drives for msconvert.exe.
+    This is a last-resort method when standard detection fails.
+    
+    Parameters
+    ----------
+    drives : list of str, optional
+        Drive roots to scan (e.g. ['C:\\', 'D:\\']).
+        If None, auto-detects all fixed/removable drives on Windows.
+    callback : callable, optional
+        Called with (current_directory_str) periodically so the UI can
+        show progress.  Return False from callback to abort the scan.
+    
+    Returns
+    -------
+    str or None
+        Full path to msconvert.exe, or None if not found.
+    """
+    global _MSCONVERT_PATH_CACHE
+    
+    # Directories that are never worth scanning
+    SKIP_DIRS = {
+        '$recycle.bin', '$windows.~bt', '$windows.~ws',
+        'windows', 'system volume information',
+        'appdata', 'temp', 'tmp', 'cache', 'caches',
+        '__pycache__', '.git', '.hg', '.svn',
+        'node_modules', 'site-packages', 'dist-packages',
+        'recovery', 'boot', 'drivers', 'winsxs',
+        'assembly', 'microsoft.net', 'windows defender',
+        'windows mail', 'windows media player',
+        'windows multimedia platform', 'windows photo viewer',
+        'windows portable devices', 'windows security',
+        'windowsapps', 'windowspowershell',
+    }
+    
+    # Auto-detect drives on Windows
+    if drives is None:
+        if sys.platform == 'win32':
+            drives = []
+            # Check all letter drives A-Z
+            for letter in 'CDEFGHIJKLMNOPQRSTUVWXYZAB':
+                drive = f"{letter}:\\"
+                if os.path.isdir(drive):
+                    drives.append(drive)
+        else:
+            drives = ['/']
+    
+    logging.info(f"Deep scanning drives {drives} for msconvert.exe...")
+    
+    for drive in drives:
+        try:
+            for dirpath, dirnames, filenames in os.walk(drive, topdown=True):
+                # Report progress
+                if callback is not None:
+                    result = callback(dirpath)
+                    if result is False:
+                        logging.info("Deep scan aborted by user.")
+                        return None
+                
+                # Skip irrelevant directories (modifying dirnames in-place prunes os.walk)
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d.lower() not in SKIP_DIRS
+                    and not d.startswith('.')
+                ]
+                
+                # Check for msconvert.exe in current directory
+                for fname in filenames:
+                    if fname.lower() == 'msconvert.exe':
+                        full_path = os.path.join(dirpath, fname)
+                        logging.info(f"Deep scan found msconvert at: {full_path}")
+                        _MSCONVERT_PATH_CACHE = full_path
+                        return full_path
+                        
+        except PermissionError:
+            continue
+        except Exception as e:
+            logging.debug(f"Deep scan error in {drive}: {e}")
+            continue
+    
+    logging.warning("Deep scan completed - msconvert.exe not found on any drive.")
+    return None
+
+def get_msconvert_version(msconvert_path=None):
+    """Get the version string of the detected msconvert installation."""
+    if msconvert_path is None:
+        msconvert_path = find_msconvert()
+    if not msconvert_path:
+        return None
+    try:
+        result = subprocess.run(
+            [msconvert_path, '--version'],
+            capture_output=True, text=True, timeout=10, **_subprocess_no_window()
+        )
+        if result.returncode == 0:
+            # ProteoWizard prints version in first line
+            for line in (result.stdout + result.stderr).splitlines():
+                if 'proteowizard' in line.lower() or 'msconvert' in line.lower():
+                    return line.strip()
+            return result.stdout.strip().splitlines()[0] if result.stdout.strip() else "Unknown"
+    except Exception:
+        pass
+    return None
+
+def download_and_install_proteowizard():
+    """
+    Open the ProteoWizard download page in the user's browser.
+    Direct silent installation is not possible because ProteoWizard requires
+    accepting vendor license agreements during setup.
+    
+    Returns True if the user was directed to the download page.
+    """
+    import webbrowser
+    download_url = "https://proteowizard.sourceforge.io/download.html"
+    
+    msg = (
+        "MSConvert (part of ProteoWizard) is required to convert vendor raw files to mzML.\n\n"
+        "It cannot be bundled with this software due to vendor DLL licensing restrictions.\n\n"
+        "Click OK to open the ProteoWizard download page in your browser.\n\n"
+        "After installation, restart ProteoPRM and it will automatically detect MSConvert."
+    )
+    
+    if messagebox.askokcancel("Install ProteoWizard", msg):
+        webbrowser.open(download_url)
+        logging.info(f"Opened ProteoWizard download page: {download_url}")
+        return True
+    return False
+
+# ============================================================================
+# END MSCONVERT AUTO-DETECTION
+# ============================================================================
+
+# IS_FROZEN is defined at the top of the file
+try:
+    import mokapot
+    from scipy.stats import zscore
+    HAS_MOKAPOT = True
+except ImportError:
+    HAS_MOKAPOT = False
+    # Don't log here - logging not yet configured
+
+# Create a temporary log file
+temp_log_file = os.path.join(tempfile.gettempdir(), 'prm_quantification.log')
+
+# Set up logging configuration with proper NullHandler instead of devnull file
+# Using NullHandler avoids issues with file handles in frozen executables
+class NullHandler(logging.Handler):
+    """A handler that does nothing - used as a placeholder"""
+    def emit(self, record):
+        pass
+
+logging.basicConfig(
+    level=logging.INFO,  # Keep this at INFO
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(temp_log_file),
+        NullHandler()  # Use NullHandler instead of StreamHandler with devnull
+    ]
+)
+
+
+class _StdStreamToLogger:
+    """File-like stream that mirrors stdout/stderr lines into logging."""
+
+    # Regex to strip redundant root-logger prefixes embedded in captured
+    # text, e.g. "INFO:root:AlphaPeptDeep: ..." → "AlphaPeptDeep: ..."
+    _ROOT_PREFIX_RE = re.compile(
+        r'^(?:DEBUG|INFO|WARNING|ERROR|CRITICAL):root:\s*', re.IGNORECASE)
+
+    # Regex to detect tqdm-style progress bars (contain '|' with '#' or
+    # percentage + 'it/s' / 's/it').  These are suppressed from the log.
+    _TQDM_RE = re.compile(r'\|.*#|it/s|s/it\]')
+
+    def __init__(self, logger, level=logging.INFO, original_stream=None):
+        self.logger = logger
+        self.level = level
+        self.original_stream = original_stream
+        self._buffer = ""
+        self._reentrant = False
+
+    @staticmethod
+    def _is_tqdm_bar(line):
+        """Return True if *line* looks like a tqdm progress update."""
+        return bool(_StdStreamToLogger._TQDM_RE.search(line))
+
+    def _clean_and_log(self, line):
+        """Strip root-logger prefix, skip tqdm bars, then log."""
+        line = line.strip()
+        if not line:
+            return
+        # Suppress tqdm progress-bar lines
+        if self._is_tqdm_bar(line):
+            return
+        # Strip embedded root-logger prefix so it isn't doubled
+        line = self._ROOT_PREFIX_RE.sub('', line)
+        if line:
+            self.logger.log(self.level, line)
+
+    def write(self, data):
+        if not data:
+            return 0
+        text = str(data)
+
+        # Guard against re-entrant logging (prevents infinite recursion
+        # and duplicate output when a logging handler's stream points
+        # back to this object, e.g. alphabase's StreamHandler on root)
+        if self._reentrant:
+            return len(data)
+        self._reentrant = True
+        try:
+            if self.original_stream is not None:
+                try:
+                    self.original_stream.write(text)
+                except Exception:
+                    pass
+
+            # Normalize carriage-return progress updates (e.g., tqdm)
+            text = text.replace('\r', '\n')
+            self._buffer += text
+
+            while '\n' in self._buffer:
+                line, self._buffer = self._buffer.split('\n', 1)
+                self._clean_and_log(line)
+        finally:
+            self._reentrant = False
+        return len(data)
+
+    def flush(self):
+        if self._reentrant:
+            return
+        self._reentrant = True
+        try:
+            if self.original_stream is not None:
+                try:
+                    self.original_stream.flush()
+                except Exception:
+                    pass
+            pending = self._buffer.strip()
+            if pending:
+                self._clean_and_log(pending)
+            self._buffer = ""
+        finally:
+            self._reentrant = False
+
+    def isatty(self):
+        return False
+
+
+@contextlib.contextmanager
+def _redirect_stdio_to_logger(level=logging.INFO):
+    """Mirror stdout/stderr writes to logging while preserving terminal output."""
+    mirror_logger = logging.getLogger("ProteoPRM.ConsoleMirror")
+
+    # Prevent mirror_logger messages from propagating to root where a
+    # library-injected StreamHandler (e.g. alphabase) would echo them
+    # back to stdout creating duplicate console & widget entries.
+    old_propagate = mirror_logger.propagate
+    mirror_logger.propagate = False
+
+    # Copy non-StreamHandler handlers from root so that captured print()
+    # statements still reach the UI widget and the log file.
+    added_handlers = []
+    for h in logging.getLogger().handlers:
+        # FileHandler is a StreamHandler subclass but writes to a file, so keep it
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            continue
+        if h not in mirror_logger.handlers:
+            mirror_logger.addHandler(h)
+            added_handlers.append(h)
+
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    out_stream = _StdStreamToLogger(mirror_logger, level=level, original_stream=old_stdout)
+    err_stream = _StdStreamToLogger(mirror_logger, level=logging.WARNING, original_stream=old_stderr)
+    sys.stdout = out_stream
+    sys.stderr = err_stream
+    try:
+        yield
+    finally:
+        try:
+            out_stream.flush()
+            err_stream.flush()
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            mirror_logger.propagate = old_propagate
+            for h in added_handlers:
+                mirror_logger.removeHandler(h)
+
+# Now we can log the mokapot warning
+if not HAS_MOKAPOT:
+    logging.warning("mokapot module not available. Running with limited functionality.")
+
+# Constants for modifications
+CARBAMIDOMETHYL_MASS = 57.021464  # Fixed modification for Cysteine
+OXIDATION_MASS = 15.994915  # Variable modification for Methionine
+ACETYL_MASS = 42.010565  # Monoisotopic mass of C2H2O
+PROTON_MASS = 1.00727646677  # Proton mass for m/z calculations
+
+# Neutral loss masses and residues
+NEUTRAL_LOSS = {
+    'H2O': 18.01056468403,
+    'NH3': 17.026549,
+    'H3PO4': 97.976896,
+    'CH3SOH': 63.9983,           # Monoisotopic CH4OS
+    'CH3SOH-H2O': 45.9877,        # CH3SOH - H2O (monoisotopic)
+    '2CH3SOH': 127.9966,           # 2 * CH3SOH (monoisotopic)
+    '2CH3SOH-H2O': 109.9860,      # 2*CH3SOH - H2O (monoisotopic)
+    '3CH3SOH': 191.9949,           # 3 * CH3SOH (monoisotopic)
+    '3CH3SOH-H2O': 173.9843,      # 3*CH3SOH - H2O (monoisotopic)
+    '2H2O': 36.02113,
+    '2NH3': 34.053098,
+    'H2O+NH3': 35.037114,          # Combined H2O + NH3 loss
+    'NH2-CO-CH2SH': 91.0092,      # Monoisotopic C2H5NOS
+    '2NH2-CO-CH2SH': 182.0184,    # 2 * 91.0092
+    '3NH2-CO-CH2SH': 273.0276,    # 3 * 91.0092
+    '4NH2-CO-CH2SH': 364.0368,    # 4 * 91.0092
+    '5NH2-CO-CH2SH': 455.0460,    # 5 * 91.0092
+    '6NH2-CO-CH2SH': 546.0552,    # 6 * 91.0092
+    '7NH2-CO-CH2SH': 637.0644,    # 7 * 91.0092
+}
+NEUTRAL_LOSS_RESIDUES = {
+    'H2O': ['S', 'T', 'E', 'D'],
+    'NH3': ['R', 'K', 'Q', 'N'],
+    'H3PO4': ['S', 'T', 'Y'],
+    'CH3SOH': ['M'],
+    'CH3SOH-H2O': ['M'],
+    '2CH3SOH': ['M'],
+    '2CH3SOH-H2O': ['M'],
+    '3CH3SOH': ['M'],
+    '3CH3SOH-H2O': ['M'],
+    '2H2O': ['S', 'T', 'E', 'D'],
+    '2NH3': ['R', 'K', 'Q', 'N'],
+    'H2O+NH3': ['S', 'T', 'E', 'D', 'R', 'K', 'Q', 'N'],
+    'NH2-CO-CH2SH': ['C'],
+    '2NH2-CO-CH2SH': ['C'],
+    '3NH2-CO-CH2SH': ['C'],
+    '4NH2-CO-CH2SH': ['C'],
+    '5NH2-CO-CH2SH': ['C'],
+    '6NH2-CO-CH2SH': ['C'],
+    '7NH2-CO-CH2SH': ['C'],
+}
+
+# Global variable to store Unimod modifications
+UNIMOD_MODIFICATIONS = {}
+UNIMOD_LAST_FETCH = None
+
+def load_unimod_from_xml_file(xml_file_path=None):
+    """
+    Load modifications from a local Unimod XML file.
+    
+    Parameters:
+    -----------
+    xml_file_path : str, optional
+        Path to the Unimod XML file. If None, will look in default locations.
+        
+    Returns:
+    --------
+    dict
+        Dictionary of modification data in the same format as fetch_unimod_modifications()
+    """
+    global UNIMOD_MODIFICATIONS, UNIMOD_LAST_FETCH
+    
+    # Default locations to check if no path provided
+    default_locations = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "unimod.xml"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "unimod.xml"),
+        os.path.join(os.getcwd(), "unimod.xml"),
+        os.path.join(os.path.expanduser("~"), "unimod.xml"),
+    ]
+    
+    # If running as frozen app, add the application directory
+    if IS_FROZEN:
+        app_dir = os.path.dirname(sys.executable)
+        default_locations.insert(0, os.path.join(app_dir, "unimod.xml"))
+        default_locations.insert(1, os.path.join(app_dir, "data", "unimod.xml"))
+    
+    # Find the XML file
+    xml_path = None
+    if xml_file_path and os.path.exists(xml_file_path):
+        xml_path = xml_file_path
+    else:
+        for path in default_locations:
+            if os.path.exists(path):
+                xml_path = path
+                break
+    
+    if not xml_path:
+        logging.warning("No Unimod XML file found in default locations")
+        return None
+        
+    try:
+        logging.info(f"Loading modifications from local Unimod XML: {xml_path}")
+        
+        # Parse XML file
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        
+        # Dictionary to store modification data
+        modifications = {}
+        
+        # Extract modifications from the XML
+        for mod in root.findall(".//mod"):
+            mod_title = mod.attrib.get('title', '')
+            mod_id = mod.attrib.get('record_id', '')
+            
+            delta_element = mod.find('./delta')
+            if delta_element is not None:
+                delta_mono = float(delta_element.attrib.get('mono_mass', '0'))
+                delta_avg = float(delta_element.attrib.get('avge_mass', '0'))
+                
+                # Get specificity information
+                specificity = []
+                for spec in mod.findall('./specificity'):
+                    spec_info = {
+                        'site': spec.attrib.get('site', ''),
+                        'position': spec.attrib.get('position', 'any')
+                    }
+                    specificity.append(spec_info)
+                
+                # Store all the information for this modification
+                modifications[mod_title] = {
+                    'id': mod_id,
+                    'delta_mono': delta_mono,
+                    'delta_avg': delta_avg,
+                    'specificity': specificity
+                }
+        
+        # Update the global variables
+        UNIMOD_MODIFICATIONS = modifications
+        UNIMOD_LAST_FETCH = datetime.now()
+        
+        logging.info(f"Successfully loaded {len(modifications)} modifications from local Unimod XML")
+        return modifications
+        
+    except ET.ParseError as e:
+        logging.error(f"XML parsing error with local Unimod file: {str(e)}")
+        return None
+    except Exception as e:
+        logging.error(f"Error loading modifications from local Unimod XML: {str(e)}")
+        return None
+
+def fetch_unimod_modifications():
+    """
+    Fetch modifications data from local XML file or from Unimod.org and parse it into a usable format.
+    Returns a dictionary where keys are modification names and values are modification details.
+    """
+    global UNIMOD_MODIFICATIONS, UNIMOD_LAST_FETCH
+    
+    # Check if we have already fetched the modifications recently (cache for 24 hours)
+    if UNIMOD_MODIFICATIONS and UNIMOD_LAST_FETCH:
+        time_since_fetch = datetime.now() - UNIMOD_LAST_FETCH
+        if time_since_fetch.total_seconds() < 86400:
+            logging.debug("Using cached Unimod modifications")
+            return UNIMOD_MODIFICATIONS
+    
+    # First try to load from local XML file
+    local_mods = load_unimod_from_xml_file()
+    if local_mods:
+        return local_mods
+    
+    # If local file not found or invalid, fetch from web
+    logging.info("Fetching modifications from Unimod.org")
+    try:
+        import requests
+        # URL for Unimod XML data
+        url = "http://www.unimod.org/xml/unimod.xml"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code != 200:
+            logging.error(f"Failed to fetch data from Unimod.org: HTTP status {response.status_code}")
+            # If we have cached data, use it despite being outdated
+            if UNIMOD_MODIFICATIONS:
+                logging.warning("Using cached Unimod modifications despite failed update")
+                return UNIMOD_MODIFICATIONS
+            return {}
+            
+        # Save the downloaded XML to a file for future use
+        try:
+            save_dir = os.path.dirname(os.path.abspath(__file__))
+            if not os.path.exists(save_dir):
+                save_dir = os.getcwd()
+                
+            xml_path = os.path.join(save_dir, "unimod.xml")
+            with open(xml_path, 'wb') as f:
+                f.write(response.content)
+            logging.info(f"Saved Unimod XML to {xml_path}")
+        except Exception as e:
+            logging.warning(f"Could not save Unimod XML locally: {str(e)}")
+            
+        # Parse XML response
+        root = ET.fromstring(response.content)
+        
+        # Dictionary to store modification data
+        modifications = {}
+        
+        # Extract modifications from the XML
+        for mod in root.findall(".//mod"):
+            mod_title = mod.attrib.get('title', '')
+            mod_id = mod.attrib.get('record_id', '')
+            
+            delta_element = mod.find('./delta')
+            if delta_element is not None:
+                delta_mono = float(delta_element.attrib.get('mono_mass', '0'))
+                delta_avg = float(delta_element.attrib.get('avge_mass', '0'))
+                
+                # Get specificity information
+                specificity = []
+                for spec in mod.findall('./specificity'):
+                    spec_info = {
+                        'site': spec.attrib.get('site', ''),
+                        'position': spec.attrib.get('position', 'any')
+                    }
+                    specificity.append(spec_info)
+                
+                # Store all the information for this modification
+                modifications[mod_title] = {
+                    'id': mod_id,
+                    'delta_mono': delta_mono,
+                    'delta_avg': delta_avg,
+                    'specificity': specificity
+                }
+        
+        # Update the global variables
+        UNIMOD_MODIFICATIONS = modifications
+        UNIMOD_LAST_FETCH = datetime.now()
+        
+        logging.info(f"Successfully fetched {len(modifications)} modifications from Unimod.org")
+        return modifications
+        
+    except requests.exceptions.ConnectTimeout:
+        logging.error("Connection timeout when connecting to Unimod.org")
+        if UNIMOD_MODIFICATIONS:
+            logging.warning("Using cached Unimod modifications due to connection timeout")
+            return UNIMOD_MODIFICATIONS
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error when connecting to Unimod.org: {str(e)}")
+        if UNIMOD_MODIFICATIONS:
+            logging.warning("Using cached Unimod modifications due to network error")
+            return UNIMOD_MODIFICATIONS
+        return {}
+    except ET.ParseError as e:
+        logging.error(f"XML parsing error with Unimod data: {str(e)}")
+        if UNIMOD_MODIFICATIONS:
+            logging.warning("Using cached Unimod modifications due to XML parsing error")
+            return UNIMOD_MODIFICATIONS
+        return {}
+    except Exception as e:
+        logging.error(f"Error fetching modifications from Unimod.org: {str(e)}")
+        if UNIMOD_MODIFICATIONS:
+            logging.warning("Using cached Unimod modifications due to unexpected error")
+            return UNIMOD_MODIFICATIONS
+        return {}
+
+def parse_universal_modification_format(modification_string):
+    """
+    Parse modification string in universal format and return a dictionary with modification details.
+    Supported formats:
+    1. "ModName [AminoAcid position]" - e.g., "Oxidation [M7]"
+    2. "ModName (AminoAcid position)" - e.g., "Oxidation (M7)"
+    3. "AminoAcid(position)-ModName" - e.g., "M(7)-Oxidation"
+    4. "ModName@position" - e.g., "Oxidation@7" or "Oxidation@M7"
+    5. "Unimod:ModID" - e.g., "Unimod:35" for Oxidation
+    """
+    if pd.isna(modification_string) or modification_string.strip() == "":
+        return {}
+    
+    modifications = {}
+    parts = modification_string.split(';')
+    
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+            
+        # Check for format 1 or 2: "ModName [AminoAcid position]" or "ModName (AminoAcid position)"
+        brackets_match = re.search(r'([A-Za-z0-9_\-\.]+)\s*[\[\(]([A-Z])(\d+|N-Term|C-Term)[\]\)]', part)
+        if brackets_match:
+            mod_name, residue, position = brackets_match.groups()
+            position = position if position in ["N-Term", "C-Term"] else int(position) - 1  # Convert to 0-based index
+            
+            if mod_name not in modifications:
+                modifications[mod_name] = []
+            modifications[mod_name].append((residue, position))
+            continue
+            
+        # Check for format 3: "AminoAcid(position)-ModName"
+        residue_pos_match = re.search(r'([A-Z])\((\d+)\)-([A-Za-z0-9_\-\.]+)', part)
+        if residue_pos_match:
+            residue, pos_str, mod_name = residue_pos_match.groups()
+            position = int(pos_str) - 1  # Convert to 0-based index
+            
+            if mod_name not in modifications:
+                modifications[mod_name] = []
+            modifications[mod_name].append((residue, position))
+            continue
+            
+        # Check for format 4: "ModName@position"
+        at_sign_match = re.search(r'([A-Za-z0-9_\-\.]+)@([A-Z]?)(\d+|N-Term|C-Term)', part)
+        if at_sign_match:
+            mod_name, residue_opt, position = at_sign_match.groups()
+            position = position if position in ["N-Term", "C-Term"] else int(position) - 1  # Convert to 0-based index
+            
+            if mod_name not in modifications:
+                modifications[mod_name] = []
+            
+            if residue_opt:
+                modifications[mod_name].append((residue_opt, position))
+            else:
+                # If no residue specified, will need to be determined by the peptide sequence
+                modifications[mod_name].append((None, position))
+            continue
+            
+        # Check for format 5: "Unimod:ModID"
+        unimod_match = re.search(r'Unimod:(\d+)', part)
+        if unimod_match:
+            mod_id = unimod_match.group(1)
+            # Get mod details from Unimod by ID
+            unimod_mods = fetch_unimod_modifications()
+            mod_name = None
+            for name, details in unimod_mods.items():
+                if details['id'] == mod_id:
+                    mod_name = name
+                    break
+            
+            if mod_name:
+                if mod_name not in modifications:
+                    modifications[mod_name] = []
+                # Note: position will need to be specified separately for Unimod:ID format
+                modifications[mod_name].append((None, None))
+            continue
+            
+    return modifications
+
+def create_universal_modification_string(mod_name, residue, position):
+    """
+    Create a standardized modification string for the universal format.
+    
+    Parameters:
+    -----------
+    mod_name : str
+        Name of the modification
+    residue : str
+        Single letter amino acid code
+    position : int or str
+        0-based position in the peptide, or "N-Term"/"C-Term"
+        
+    Returns:
+    --------
+    str
+        Formatted modification string
+    """
+    # Handle terminal modifications
+    if position == "N-Term" or position == "C-Term":
+        return f"{mod_name} [{position}]"
+    
+    # Convert 0-based position to 1-based for display
+    position_display = position + 1
+    
+    # Format: "ModName [Residue position]"
+    return f"{mod_name} [{residue}{position_display}]"
+
+def get_modification_mass(mod_name, monoisotopic=True):
+    """
+    Get the mass shift for a named modification from Unimod.
+    
+    Parameters:
+    -----------
+    mod_name : str
+        Name of the modification
+    monoisotopic : bool
+        Whether to return monoisotopic mass (True) or average mass (False)
+        
+    Returns:
+    --------
+    float
+        Mass shift value
+    """
+    # Check if we need to fetch Unimod modifications
+    if not UNIMOD_MODIFICATIONS:
+        fetch_unimod_modifications()
+    
+    # Handle common modifications directly
+    common_mods = {
+        'Oxidation': 15.994915,
+        'Carbamidomethyl': 57.021464,
+        'Acetyl': 42.010565,
+        'Phospho': 79.966331,
+        'Deamidated': 0.984016,
+        'Methyl': 14.015650
+    }
+    
+    if mod_name in common_mods:
+        return common_mods[mod_name]
+    
+    # Look up in Unimod
+    if mod_name in UNIMOD_MODIFICATIONS:
+        if monoisotopic:
+            return UNIMOD_MODIFICATIONS[mod_name]['delta_mono']
+        else:
+            return UNIMOD_MODIFICATIONS[mod_name]['delta_avg']
+    
+    # If not found, log an error and return 0
+    logging.error(f"Modification '{mod_name}' not found in Unimod database")
+    return 0.0
+
+def get_unimod_modification_browser():
+    """
+    Create a GUI window to browse and select Unimod modifications.
+    Returns the selected modification as a tuple (name, mass)
+    """
+    # Fetch modifications if not already done
+    if not UNIMOD_MODIFICATIONS:
+        fetch_unimod_modifications()
+    
+    browser_window = tk.Toplevel()
+    browser_window.title("Unimod Modification Browser")
+    browser_window.geometry("800x600")
+    
+    # Create a frame for the search box
+    search_frame = ttk.Frame(browser_window, padding="10")
+    search_frame.pack(fill='x')
+    
+    ttk.Label(search_frame, text="Search:").pack(side='left', padx=(0, 5))
+    search_var = tk.StringVar()
+    search_entry = ttk.Entry(search_frame, textvariable=search_var, width=40)
+    search_entry.pack(side='left', fill='x', expand=True, padx=(0, 5))
+    
+    # Create a frame for the table
+    table_frame = ttk.Frame(browser_window, padding="10")
+    table_frame.pack(fill='both', expand=True)
+    
+    # Create a treeview widget for the modifications
+    columns = ("Name", "ID", "Mono Mass", "Average Mass", "Specificity")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+    
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=100)
+    
+    tree.column("Name", width=150)
+    tree.column("Specificity", width=200)
+    
+    tree.pack(side='left', fill='both', expand=True)
+    
+    # Add a scrollbar
+    scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=tree.yview)
+    scrollbar.pack(side='right', fill='y')
+    tree.configure(yscrollcommand=scrollbar.set)
+    
+    # Populate the treeview
+    for mod_name, mod_info in sorted(UNIMOD_MODIFICATIONS.items()):
+        specificity = ", ".join([f"{spec['site']} ({spec['position']})" for spec in mod_info['specificity']])
+        tree.insert("", "end", values=(
+            mod_name,
+            mod_info['id'],
+            f"{mod_info['delta_mono']:.5f}",
+            f"{mod_info['delta_avg']:.5f}",
+            specificity
+        ))
+    
+    # Function to handle search
+    def search_modifications(*args):
+        search_text = search_var.get().lower()
+        for item in tree.get_children():
+            tree.delete(item)
+        
+        for mod_name, mod_info in sorted(UNIMOD_MODIFICATIONS.items()):
+            if search_text in mod_name.lower():
+                specificity = ", ".join([f"{spec['site']} ({spec['position']})" for spec in mod_info['specificity']])
+                tree.insert("", "end", values=(
+                    mod_name,
+                    mod_info['id'],
+                    f"{mod_info['delta_mono']:.5f}",
+                    f"{mod_info['delta_avg']:.5f}",
+                    specificity
+                ))
+    
+    # Bind search function to entry changes
+    search_var.trace("w", search_modifications)
+    
+    # Variable to store selected modification
+    selected_mod = [None]
+    
+    # Function to handle selection
+    def on_select(event):
+        selected_item = tree.selection()[0]
+        selected_values = tree.item(selected_item, "values")
+        selected_mod[0] = (selected_values[0], float(selected_values[2]))
+        browser_window.destroy()
+    
+    # Bind double-click event
+    tree.bind("<Double-1>", on_select)
+    
+    # OK and Cancel buttons
+    button_frame = ttk.Frame(browser_window, padding="10")
+    button_frame.pack(fill='x')
+    
+    def on_ok():
+        if tree.selection():
+            selected_item = tree.selection()[0]
+            selected_values = tree.item(selected_item, "values")
+            selected_mod[0] = (selected_values[0], float(selected_values[2]))
+        browser_window.destroy()
+    
+    def on_cancel():
+        selected_mod[0] = None
+        browser_window.destroy()
+    
+    ttk.Button(button_frame, text="OK", command=on_ok).pack(side='right', padx=5)
+    ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side='right', padx=5)
+    
+    # Make the window modal
+    browser_window.transient(root)
+    browser_window.grab_set()
+    root.wait_window(browser_window)
+    
+    return selected_mod[0]
+
+class TqdmToTk(tqdm):
+    def __init__(self, *args, **kwargs):
+        self.progress_bar = kwargs.pop('progress_bar', None)
+        self.root = kwargs.pop('root', None)
+        self._start_pct = kwargs.pop('start_pct', 0)  # lower bound %
+        self._end_pct   = kwargs.pop('end_pct', 95)    # upper bound %
+        super().__init__(*args, **kwargs)
+
+    def _update_bar(self, value):
+        """Update progress bar on the main thread."""
+        try:
+            if self.progress_bar:
+                self.progress_bar['value'] = value
+                try:
+                    update_progress_percent_label()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def update(self, n=1):
+        super().update(n)
+        if self.progress_bar and self.root:
+            # Map file progress into [start_pct .. end_pct] range
+            frac = self.n / self.total if self.total else 1
+            value = self._start_pct + frac * (self._end_pct - self._start_pct)
+            value = min(value, self._end_pct)
+            self.root.after(0, lambda v=value: self._update_bar(v))
+
+def find_precursor_ions(mzml_file, precursor_mz, tolerance_ppm=10):
+    logging.info(f"Finding precursor ions in {mzml_file} for m/z {precursor_mz}")
+    with read_spectra(mzml_file) as reader:
+        for spectrum in reader:
+            if spectrum['ms level'] == 1:
+                for mz, intensity in zip(spectrum['m/z array'], spectrum['intensity array']):
+                    tolerance = precursor_mz * tolerance_ppm / 1e6
+                    if abs(mz - precursor_mz) <= tolerance:
+                        return spectrum
+    return None
+
+def find_ms2_spectra(mzml_file, precursor_mz, start_rt, stop_rt, tolerance_ppm=10):
+    """Find MS2 spectra within RT window."""
+    logging.info(f"Finding MS2 spectra in {mzml_file} for m/z {precursor_mz} within RT window {start_rt}-{stop_rt}")
+    ms2_spectra = []
+    
+    try:
+        with read_spectra(mzml_file) as reader:
+            for spectrum in reader:
+                if spectrum['ms level'] == 2:
+                    rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
+                    
+                    # Skip if outside RT window
+                    if rt < start_rt or rt > stop_rt:
+                        continue
+                        
+                    isolation_mz = spectrum.get('precursorList', {}).get('precursor', [{}])[0].get('selectedIonList', {}).get('selectedIon', [{}])[0].get('selected ion m/z', 0)
+                    if isolation_mz:
+                        tolerance = precursor_mz * tolerance_ppm / 1e6
+                        if abs(isolation_mz - precursor_mz) <= tolerance:
+                            ms2_spectra.append(spectrum)
+                            
+    except Exception as e:
+        logging.error(f"Error reading mzML file: {e}")
+        return []
+        
+    logging.debug(f"Found {len(ms2_spectra)} MS2 spectra")
+    return ms2_spectra
+
+# GPU-accelerated version of calculate_fragment_intensity below
+def calculate_fragment_intensity(
+    theoretical_ions, experimental_spectrum, tolerance, unit='ppm',
+    scan_window_lower=None, scan_window_upper=None,
+    fragment_mz_lower=None, fragment_mz_upper=None,
+    min_intensity_threshold=2.0
+):
+    """
+    Match theoretical fragment ions to experimental spectrum, summing intensities,
+    and only considering fragments within the scan window limits for this scan.
+    
+    GPU ACCELERATED: Automatically uses GPU if available and enabled,
+    otherwise falls back to CPU with identical results.
+    
+    Parameters:
+    -----------
+    min_intensity_threshold : float
+        Minimum fragment intensity as percentage of base peak (0-100).
+        Fragments below this threshold will be excluded. Default: 2.0%
+    """
+    matched_ions = []
+    total_intensity = 0
+    
+    # Check if GPU acceleration is available and enabled
+    use_gpu = GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE
+    
+    if use_gpu:
+        try:
+            import cupy as cp
+            xp = cp
+        except:
+            xp = np
+            use_gpu = False
+    else:
+        xp = np
+
+    # Convert experimental data to arrays (GPU or CPU)
+    exp_mz_np = np.array(experimental_spectrum['m/z array'])
+    exp_intensity_np = np.array(experimental_spectrum['intensity array'])
+    
+    if exp_mz_np.size == 0:
+        return matched_ions, total_intensity
+    
+    # Transfer to GPU if available
+    if use_gpu:
+        exp_mz = cp.asarray(exp_mz_np)
+        exp_intensity = cp.asarray(exp_intensity_np)
+    else:
+        exp_mz = exp_mz_np
+        exp_intensity = exp_intensity_np
+    
+    # Calculate base peak intensity for threshold filtering
+    base_peak_intensity = float(xp.max(exp_intensity)) if exp_intensity.size > 0 else 0
+    intensity_threshold = (min_intensity_threshold / 100.0) * base_peak_intensity
+
+    # --- Extract scan window for this scan (CPU operation - metadata parsing) ---
+    sw_lower, sw_upper = None, None
+    try:
+        scan_window_list = experimental_spectrum.get('scanList', {}).get('scan', [{}])[0].get('scanWindowList', {}).get('scanWindow', [])
+        if scan_window_list:
+            for sw in scan_window_list:
+                for cv in sw.get('cvParam', []):
+                    if cv.get('name') == 'scan window lower limit':
+                        sw_lower = float(cv['value'])
+                    elif cv.get('name') == 'scan window upper limit':
+                        sw_upper = float(cv['value'])
+    except Exception:
+        pass
+    # Fallback to global if not found
+    if sw_lower is None:
+        sw_lower = scan_window_lower if scan_window_lower is not None else -np.inf
+    if sw_upper is None:
+        sw_upper = scan_window_upper if scan_window_upper is not None else np.inf
+
+    # Flatten theoretical ions for vectorized GPU processing
+    theo_mz_list = []
+    theo_metadata = []  # Store (ion_type, charge, index, ion_count) for each
+    
+    for ion_type in theoretical_ions.keys():
+        for charge in range(1, 4):
+            if charge in theoretical_ions[ion_type]:
+                ion_count = len(theoretical_ions[ion_type][charge])
+                for i, mz in enumerate(theoretical_ions[ion_type][charge]):
+                    if mz is None:  # NL placeholder — skip
+                        continue
+                    # Apply pre-filters (CPU - simple comparisons)
+                    if fragment_mz_lower is not None and mz < fragment_mz_lower:
+                        continue
+                    if fragment_mz_upper is not None and mz > fragment_mz_upper:
+                        continue
+                    if not (sw_lower <= mz <= sw_upper):
+                        continue
+                    theo_mz_list.append(mz)
+                    theo_metadata.append((ion_type, charge, i, ion_count))
+    
+    if not theo_mz_list:
+        return matched_ions, total_intensity
+    
+    matched_fragments = set()
+    
+    # GPU-ACCELERATED VECTORIZED MATCHING
+    if use_gpu and len(theo_mz_list) > 10:  # Only use GPU for sufficient workload
+        theo_mz = cp.asarray(theo_mz_list, dtype=cp.float64)
+        
+        # Calculate tolerances for each theoretical m/z
+        if unit == 'ppm':
+            tolerances = theo_mz * tolerance / 1e6
+        else:
+            tolerances = cp.full(len(theo_mz), tolerance, dtype=cp.float64)
+        
+        # VECTORIZED DISTANCE CALCULATION (GPU parallelism)
+        # Shape: (n_theoretical, n_experimental)
+        # This is the key GPU acceleration - computing all distances in parallel
+        distances = cp.abs(theo_mz[:, cp.newaxis] - exp_mz[cp.newaxis, :])
+        
+        # Find matches within tolerance (boolean mask)
+        within_tolerance = distances <= tolerances[:, cp.newaxis]
+        
+        # Process matches
+        for idx in range(len(theo_mz_list)):
+            mask = within_tolerance[idx]
+            if not cp.any(mask):
+                continue
+            
+            # Get indices of matches and find best (highest intensity)
+            match_indices = cp.where(mask)[0]
+            matched_intensities = exp_intensity[match_indices]
+            best_local_idx = cp.argmax(matched_intensities)
+            best_idx = match_indices[best_local_idx]
+            
+            # Transfer results back to CPU for metadata processing
+            matched_intensity = float(cp.asnumpy(exp_intensity[best_idx]))
+            matched_mz = float(cp.asnumpy(exp_mz[best_idx]))
+            
+            # Apply minimum intensity threshold filter
+            if matched_intensity < intensity_threshold:
+                continue
+            
+            # Get metadata for this theoretical ion
+            ion_type, charge, i, ion_count = theo_metadata[idx]
+            theoretical_mz = theo_mz_list[idx]
+            
+            mass_accuracy_ppm = (matched_mz - theoretical_mz) / theoretical_mz * 1e6
+            nl_type = None
+            base_ion_type = ion_type
+            if '-' in ion_type:
+                base_ion_type, nl_type = ion_type.split('-', 1)
+            fragment_position = i + 1
+            
+            unique_id = f"{base_ion_type}{fragment_position}_{charge}_{nl_type or 'none'}"
+            if unique_id in matched_fragments:
+                continue
+            matched_fragments.add(unique_id)
+            
+            fragment_info = (
+                base_ion_type, theoretical_mz, charge, matched_intensity,
+                mass_accuracy_ppm, nl_type, fragment_position
+            )
+            matched_ions.append(fragment_info)
+            total_intensity += matched_intensity
+    
+    else:
+        # CPU VECTORIZED MATCHING using searchsorted — O(T * log(E)) instead of O(T * E)
+        # Sort experimental spectrum by m/z for binary search
+        sort_idx = np.argsort(exp_mz_np)
+        exp_mz_sorted = exp_mz_np[sort_idx]
+        exp_int_sorted = exp_intensity_np[sort_idx]
+        
+        theo_mz_arr = np.array(theo_mz_list, dtype=np.float64)
+        
+        # Compute per-ion tolerances
+        if unit == 'ppm':
+            tol_arr = theo_mz_arr * tolerance / 1e6
+        else:
+            tol_arr = np.full(len(theo_mz_arr), tolerance, dtype=np.float64)
+        
+        # Vectorized searchsorted for all theoretical ions at once
+        lo_indices = np.searchsorted(exp_mz_sorted, theo_mz_arr - tol_arr, side='left')
+        hi_indices = np.searchsorted(exp_mz_sorted, theo_mz_arr + tol_arr, side='right')
+        
+        for idx in range(len(theo_mz_list)):
+            lo = lo_indices[idx]
+            hi = hi_indices[idx]
+            if lo >= hi:
+                continue
+            
+            theoretical_mz = theo_mz_list[idx]
+            ion_type, charge, i, ion_count = theo_metadata[idx]
+            
+            # Find the match with highest intensity in the window
+            window_intensities = exp_int_sorted[lo:hi]
+            best_local = np.argmax(window_intensities)
+            matched_intensity = window_intensities[best_local]
+            
+            # Apply minimum intensity threshold filter
+            if matched_intensity < intensity_threshold:
+                continue
+            
+            matched_mz = exp_mz_sorted[lo + best_local]
+            mass_accuracy_ppm = (matched_mz - theoretical_mz) / theoretical_mz * 1e6
+            nl_type = None
+            base_ion_type = ion_type
+            if '-' in ion_type:
+                base_ion_type, nl_type = ion_type.split('-', 1)
+            fragment_position = i + 1
+            unique_id = f"{base_ion_type}{fragment_position}_{charge}_{nl_type or 'none'}"
+            if unique_id in matched_fragments:
+                continue
+            matched_fragments.add(unique_id)
+            fragment_info = (
+                base_ion_type, theoretical_mz, charge, matched_intensity,
+                mass_accuracy_ppm, nl_type, fragment_position
+            )
+            matched_ions.append(fragment_info)
+            total_intensity += matched_intensity
+    
+    return matched_ions, total_intensity
+
+def calculate_fragment_eic_areas(
+    ms2_spectra, theoretical_ions, tolerance, unit='ppm',
+    scan_window_lower=None, scan_window_upper=None,
+    min_intensity_threshold=2.0
+):
+    """
+    Calculate the area under EIC curve for each fragment across multiple scans,
+    grouping by ion type and position (e.g., b3, y5, b3-H2O), not by m/z.
+    Only consider fragments within the scan window of each scan.
+    
+    GPU ACCELERATED: Uses GPU for batch spectrum processing when available.
+    
+    Parameters:
+    -----------
+    min_intensity_threshold : float
+        Minimum fragment intensity as percentage of base peak (0-100).
+        Data points below this threshold will be excluded. Default: 2.0%
+    """
+    # Check if GPU acceleration is available
+    use_gpu = GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE
+    
+    if use_gpu:
+        try:
+            import cupy as cp
+        except:
+            use_gpu = False
+    
+    fragment_intensities = {}
+    
+    # Pre-flatten theoretical ions for vectorized matching
+    theo_mz_list = []
+    theo_metadata = []  # (fragment_label, charge)
+    
+    for ion_type in theoretical_ions.keys():
+        for charge in range(1, 4):
+            if charge in theoretical_ions[ion_type]:
+                ion_count = len(theoretical_ions[ion_type][charge])
+                for i, mz in enumerate(theoretical_ions[ion_type][charge]):
+                    if mz is None:  # NL placeholder — skip
+                        continue
+                    if '-' in ion_type:
+                        base_ion_type, nl_type = ion_type.split('-', 1)
+                        fragment_position = i + 1
+                        fragment_label = f"{base_ion_type}{fragment_position}-{nl_type}"
+                    else:
+                        base_ion_type = ion_type
+                        fragment_position = i + 1
+                        fragment_label = f"{base_ion_type}{fragment_position}"
+                    
+                    theo_mz_list.append(mz)
+                    theo_metadata.append((fragment_label, charge, mz))
+    
+    if not theo_mz_list:
+        return {}, 0
+    
+    theo_mz_array = np.array(theo_mz_list, dtype=np.float64)
+    
+    # Pre-transfer theoretical m/z to GPU once (not per spectrum)
+    theo_mz_gpu = None
+    gpu_tolerances = None
+    if use_gpu and len(theo_mz_list) > 20:
+        try:
+            theo_mz_gpu = cp.asarray(theo_mz_array)
+            if unit == 'ppm':
+                gpu_tolerances = theo_mz_gpu * tolerance / 1e6
+            else:
+                gpu_tolerances = cp.full(len(theo_mz_gpu), tolerance, dtype=cp.float64)
+        except Exception:
+            theo_mz_gpu = None
+            gpu_tolerances = None
+    
+    for spectrum in ms2_spectra:
+        rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
+        exp_mz = np.array(spectrum['m/z array'])
+        exp_intensity = np.array(spectrum['intensity array'])
+        
+        if exp_mz.size == 0:
+            continue
+        
+        # Calculate base peak intensity for this spectrum
+        base_peak_intensity = np.max(exp_intensity) if exp_intensity.size > 0 else 0
+        intensity_threshold = (min_intensity_threshold / 100.0) * base_peak_intensity
+
+        # --- Extract scan window for this scan ---
+        sw_lower, sw_upper = None, None
+        try:
+            scan_window_list = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scanWindowList', {}).get('scanWindow', [])
+            if scan_window_list:
+                for sw in scan_window_list:
+                    for cv in sw.get('cvParam', []):
+                        if cv.get('name') == 'scan window lower limit':
+                            sw_lower = float(cv['value'])
+                        elif cv.get('name') == 'scan window upper limit':
+                            sw_upper = float(cv['value'])
+        except Exception:
+            pass
+        if sw_lower is None:
+            sw_lower = scan_window_lower if scan_window_lower is not None else -np.inf
+        if sw_upper is None:
+            sw_upper = scan_window_upper if scan_window_upper is not None else np.inf
+
+        # GPU-accelerated matching for this spectrum
+        if use_gpu and theo_mz_gpu is not None:
+            exp_mz_gpu = cp.asarray(exp_mz)
+            exp_intensity_gpu = cp.asarray(exp_intensity)
+            
+            # Vectorized distance calculation (theo_mz_gpu and gpu_tolerances pre-computed)
+            distances = cp.abs(theo_mz_gpu[:, cp.newaxis] - exp_mz_gpu[cp.newaxis, :])
+            within_tolerance = distances <= gpu_tolerances[:, cp.newaxis]
+            
+            # Process each theoretical ion
+            for idx in range(len(theo_mz_list)):
+                fragment_label, charge, theoretical_mz = theo_metadata[idx]
+                
+                # Check scan window
+                if not (sw_lower <= theoretical_mz <= sw_upper):
+                    continue
+                
+                mask = within_tolerance[idx]
+                if not cp.any(mask):
+                    continue
+                
+                match_indices = cp.where(mask)[0]
+                max_intensity = float(cp.asnumpy(cp.max(exp_intensity_gpu[match_indices])))
+                
+                if max_intensity >= intensity_threshold:
+                    fragment_key = (fragment_label, charge)
+                    if fragment_key not in fragment_intensities:
+                        fragment_intensities[fragment_key] = {}
+                    fragment_intensities[fragment_key][rt] = max_intensity
+        else:
+            # CPU vectorized matching using searchsorted — O(T * log(E)) per spectrum
+            sort_idx = np.argsort(exp_mz)
+            exp_mz_sorted = exp_mz[sort_idx]
+            exp_int_sorted = exp_intensity[sort_idx]
+            
+            # Compute per-ion tolerances
+            if unit == 'ppm':
+                tol_arr = theo_mz_array * tolerance / 1e6
+            else:
+                tol_arr = np.full(len(theo_mz_array), tolerance, dtype=np.float64)
+            
+            # Vectorized searchsorted for all theoretical ions
+            lo_indices = np.searchsorted(exp_mz_sorted, theo_mz_array - tol_arr, side='left')
+            hi_indices = np.searchsorted(exp_mz_sorted, theo_mz_array + tol_arr, side='right')
+            
+            for idx in range(len(theo_mz_list)):
+                fragment_label, charge, theoretical_mz = theo_metadata[idx]
+                
+                # Check scan window
+                if not (sw_lower <= theoretical_mz <= sw_upper):
+                    continue
+                
+                lo = lo_indices[idx]
+                hi = hi_indices[idx]
+                
+                fragment_key = (fragment_label, charge)
+                if fragment_key not in fragment_intensities:
+                    fragment_intensities[fragment_key] = {}
+                    
+                if lo < hi:
+                    max_intensity = np.max(exp_int_sorted[lo:hi])
+                    if max_intensity >= intensity_threshold:
+                        fragment_intensities[fragment_key][rt] = max_intensity
+
+    # Integrate each fragment's EIC
+    fragment_eic_areas = {}
+    total_eic_area = 0
+
+    for fragment_key, intensities in fragment_intensities.items():
+        # Require minimum of 3 scans for EIC integration
+        if len(intensities) < 3:
+            fragment_eic_areas[fragment_key] = 0
+            continue
+
+        sorted_rts = sorted(intensities.keys())
+        intensity_values = [intensities[rt] for rt in sorted_rts]
+        
+        # Use trapezoidal rule for integration (standard for EIC, handles irregular spacing,
+        # guaranteed non-negative for non-negative data)
+        area = trapezoid(intensity_values, sorted_rts)
+
+        if area < 0:
+            area = 0
+
+        fragment_eic_areas[fragment_key] = area
+        total_eic_area += area
+
+    return fragment_eic_areas, total_eic_area
+
+def calculate_rt_accuracy(experimental_rt, known_rt):
+    """Calculate retention time accuracy."""
+    return abs(experimental_rt - known_rt)
+
+
+def _get_file_acquisition_time(file_name, mzml_folder=None):
+    """Try to extract the acquisition timestamp of a data file.
+
+    Strategy (in order):
+    1. File modification time (os.path.getmtime) — reliable proxy for
+       acquisition time when files haven't been copied/moved.
+    2. Falls back to alphabetical/original order when the folder is unknown.
+    """
+    if mzml_folder:
+        for ext in ('', '.mzML', '.raw'):
+            candidate = os.path.join(mzml_folder, file_name if ext == '' else
+                                     os.path.splitext(file_name)[0] + ext)
+            if os.path.isfile(candidate):
+                return os.path.getmtime(candidate)
+    return 0.0  # unknown — preserve original order
+
+
+def apply_rt_drift_correction(results_df, reference_peptides,
+                              model_type='direct_offset',
+                              fragment_tolerance=20.0, mzml_folder=None):
+    """
+    Apply **inter-file** retention-time drift correction.
+
+    For each data file, compute the per-file RT offset of every reference
+    peptide (observed_RT − expected_RT), then take the mean across
+    reference peptides to get a single offset per file.  Two correction
+    modes are available:
+
+    * **Direct Offset** (default): Each file gets its own measured mean
+      offset applied as a uniform shift to all peptides' expected RT.
+    * **Trend Model**: Fit a linear regression of per-file offset vs.
+      acquisition-order index (run_order).  The smoothed prediction is
+      used as the correction — useful for noisy measurements or for
+      files where the reference peptide was not detected.
+
+    Requirements
+    ------------
+    * ≥1 reference peptide sequence.
+    * ≥3 data files.
+    * Each reference peptide must be detected in ≥70 % of files **or**
+      ≥3 files, whichever threshold is larger.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Complete PSM results table.
+    reference_peptides : list[str]
+        Peptide sequences designated as RT reference standards.
+    model_type : str
+        'direct_offset' or 'trend_model'.
+    fragment_tolerance : float
+        Fragment tolerance used (needed for psm_score recalculation).
+    mzml_folder : str or None
+        Folder with data files (for timestamp-based run ordering).
+
+    Returns
+    -------
+    results_df : pd.DataFrame
+        Updated DataFrame with corrected RT values and recalculated scores.
+        New columns: 'rt_drift_correction', 'known_rt_corrected', 'run_order'.
+    """
+    if not reference_peptides or results_df.empty:
+        return results_df
+
+    # Normalize reference peptide sequences for matching
+    ref_set = set(p.strip().upper() for p in reference_peptides if p.strip())
+    if not ref_set:
+        return results_df
+
+    results_df = results_df.copy()
+
+    # ------------------------------------------------------------------
+    # Sort files by acquisition timestamp (run order in the sequence queue)
+    # ------------------------------------------------------------------
+    files_unsorted = results_df['file'].unique()
+    if len(files_unsorted) < 3:
+        logging.warning("RT Drift Correction: Need at least 3 data files for "
+                        f"inter-file correction. Found {len(files_unsorted)}. Skipping.")
+        return results_df
+
+    file_times = {f: _get_file_acquisition_time(f, mzml_folder) for f in files_unsorted}
+    files = sorted(files_unsorted, key=lambda f: file_times[f])
+    file_order_map = {f: idx + 1 for idx, f in enumerate(files)}
+    results_df['run_order'] = results_df['file'].map(file_order_map)
+
+    logging.info(f"RT Drift Correction ({model_type}): "
+                 f"{len(files)} file(s) in acquisition order, "
+                 f"{len(ref_set)} reference peptide(s)")
+
+    # ------------------------------------------------------------------
+    # For each file, compute the mean RT offset from reference peptides
+    # ------------------------------------------------------------------
+    # offset = observed_RT − expected_RT  (positive = eluted later)
+    file_offsets = {}          # file -> mean_offset
+    file_ref_details = {}     # file -> list of (peptide, drift)
+    detection_counts = {p: 0 for p in ref_set}  # count per ref peptide
+
+    for file_name in files:
+        file_mask = results_df['file'] == file_name
+        file_df = results_df.loc[file_mask]
+
+        ref_mask = (
+            file_df['peptide'].str.upper().isin(ref_set) &
+            (~file_df['peptide'].str.startswith('DECOY_'))
+        )
+        ref_psms = file_df.loc[ref_mask]
+        if ref_psms.empty:
+            continue
+
+        # Best PSM per reference peptide (highest psm_score)
+        best_ref = ref_psms.loc[ref_psms.groupby('peptide')['psm_score'].idxmax()]
+        known_rt = pd.to_numeric(best_ref['known_rt'], errors='coerce')
+        obs_rt = pd.to_numeric(best_ref['rt'], errors='coerce')
+        valid = known_rt.notna() & obs_rt.notna()
+        if valid.sum() == 0:
+            continue
+
+        drifts = (obs_rt[valid] - known_rt[valid]).values
+        peps = best_ref.loc[valid, 'peptide'].str.upper().values
+        for p in peps:
+            if p in detection_counts:
+                detection_counts[p] += 1
+
+        file_offsets[file_name] = float(np.mean(drifts))
+        file_ref_details[file_name] = list(zip(peps, drifts))
+
+    # ------------------------------------------------------------------
+    # Check detection-rate requirement for each reference peptide
+    # ------------------------------------------------------------------
+    n_files = len(files)
+    min_detections = max(3, int(np.ceil(0.70 * n_files)))
+    qualified_refs = [p for p, cnt in detection_counts.items() if cnt >= min_detections]
+
+    if not qualified_refs:
+        det_summary = ", ".join(f"{p}: {detection_counts[p]}/{n_files}" for p in ref_set)
+        logging.warning(f"RT Drift Correction: No reference peptide meets the detection "
+                        f"threshold (≥{min_detections} of {n_files} files). "
+                        f"Detections: {det_summary}. Skipping.")
+        return results_df
+
+    dropped = ref_set - set(qualified_refs)
+    if dropped:
+        logging.info(f"  Reference peptide(s) dropped (detected in too few files): "
+                     f"{', '.join(dropped)}")
+        # Recalculate offsets using only qualified references
+        _q_set = set(qualified_refs)
+        file_offsets_filtered = {}
+        for fname, details in file_ref_details.items():
+            q_drifts = [d for p, d in details if p in _q_set]
+            if q_drifts:
+                file_offsets_filtered[fname] = float(np.mean(q_drifts))
+        file_offsets = file_offsets_filtered
+
+    files_with_offset = [f for f in files if f in file_offsets]
+    if len(files_with_offset) < 3:
+        logging.warning(f"RT Drift Correction: Only {len(files_with_offset)} files have "
+                        f"valid reference detections. Need at least 3. Skipping.")
+        return results_df
+
+    logging.info(f"  {len(qualified_refs)} qualified reference peptide(s), "
+                 f"{len(files_with_offset)}/{n_files} files with measured offsets")
+    for fn in files_with_offset:
+        logging.info(f"    run {file_order_map[fn]:>2d}: {fn}  offset = "
+                     f"{file_offsets[fn]:+.3f} min")
+
+    # ------------------------------------------------------------------
+    # Compute correction per file
+    # ------------------------------------------------------------------
+    results_df['rt_drift_correction'] = 0.0
+    results_df['known_rt_corrected'] = results_df['known_rt']
+
+    if model_type == 'trend_model':
+        # Linear regression: offset = slope * run_order + intercept
+        x = np.array([file_order_map[f] for f in files_with_offset], dtype=float)
+        y = np.array([file_offsets[f] for f in files_with_offset], dtype=float)
+        try:
+            slope, intercept = np.polyfit(x, y, 1)
+        except Exception:
+            slope, intercept = 0.0, float(np.mean(y))
+        logging.info(f"  Trend model: slope = {slope:.5f} min/run, "
+                     f"intercept = {intercept:.5f} min")
+        # Apply trend-predicted correction to ALL files (including those
+        # where the reference was not detected — extrapolated from model)
+        for file_name in files:
+            fm = results_df['file'] == file_name
+            predicted_offset = slope * file_order_map[file_name] + intercept
+            _apply_file_offset(results_df, fm, predicted_offset)
+    else:
+        # Direct offset mode
+        for file_name in files:
+            fm = results_df['file'] == file_name
+            if file_name in file_offsets:
+                _apply_file_offset(results_df, fm, file_offsets[file_name])
+            # else: no correction for this file (reference not detected)
+
+    # ------------------------------------------------------------------
+    # Leave-one-out (LOO) correction for reference peptides
+    # ------------------------------------------------------------------
+    _loo_q_set = set(qualified_refs)
+    _loo_count = 0
+    for file_name in files_with_offset:
+        details = file_ref_details.get(file_name, [])
+        q_details = [(p, d) for p, d in details if p in _loo_q_set]
+        if len(q_details) < 2:
+            # Only 1 reference peptide — LOO offset undefined; keep the
+            # global offset (the best we can do).
+            continue
+
+        for ref_pep, _ref_drift in q_details:
+            # LOO offset = mean drift of all OTHER reference peptides
+            loo_drifts = [d for p, d in q_details if p != ref_pep]
+            if model_type == 'trend_model':
+                loo_offset = float(np.mean(loo_drifts))
+            else:
+                loo_offset = float(np.mean(loo_drifts))
+
+            # Apply LOO offset to ALL PSMs of this reference peptide
+            # in this file (not just the best one used for calibration).
+            ref_mask = (
+                (results_df['file'] == file_name) &
+                (results_df['peptide'].str.upper() == ref_pep) &
+                (~results_df['peptide'].str.startswith('DECOY_'))
+            )
+            if ref_mask.sum() == 0:
+                continue
+
+            known_rt = pd.to_numeric(
+                results_df.loc[ref_mask, 'known_rt'], errors='coerce'
+            )
+            corrected = known_rt + loo_offset
+            results_df.loc[ref_mask, 'known_rt_corrected'] = corrected
+            results_df.loc[ref_mask, 'rt_drift_correction'] = loo_offset
+            obs_rt = pd.to_numeric(
+                results_df.loc[ref_mask, 'rt'], errors='coerce'
+            ).fillna(0)
+            new_acc = np.abs(obs_rt - corrected.fillna(0))
+            new_acc = np.where(corrected.isna(), 0.0, new_acc)
+            results_df.loc[ref_mask, 'rt_accuracy'] = new_acc
+            _loo_count += ref_mask.sum()
+
+    if _loo_count > 0:
+        logging.info(f"  LOO correction applied to {_loo_count} reference-peptide PSMs "
+                     f"to avoid calibration overfitting.")
+
+    # ------------------------------------------------------------------
+    # Recalculate scores for corrected files
+    # ------------------------------------------------------------------
+    corrected_mask = results_df['rt_drift_correction'] != 0.0
+    n_corrected_files = results_df.loc[corrected_mask, 'file'].nunique()
+    if n_corrected_files > 0:
+        logging.info(f"RT Drift Correction applied to {n_corrected_files}/{n_files} file(s). "
+                     f"Recalculating scores...")
+
+        # Recompute norm_rt_accuracy
+        rt_acc = results_df['rt_accuracy'].values.astype(float)
+        if 'start_rt' in results_df.columns and 'stop_rt' in results_df.columns:
+            start_rt = pd.to_numeric(results_df['start_rt'], errors='coerce')
+            stop_rt = pd.to_numeric(results_df['stop_rt'], errors='coerce')
+            rt_window = (stop_rt - start_rt).values
+        else:
+            rt_window = np.full(len(results_df), np.nan)
+
+        sigma_rt = np.where(
+            (rt_window > 0) & np.isfinite(rt_window),
+            rt_window / 4.0,
+            np.nan
+        )
+        norm_rt = np.where(
+            np.isfinite(sigma_rt) & (sigma_rt > 0),
+            np.exp(-0.5 * (rt_acc / sigma_rt) ** 2),
+            np.where(np.isfinite(rt_acc), 1.0 / (1.0 + rt_acc), 0.5)
+        )
+        results_df['norm_rt_accuracy'] = norm_rt
+
+        # Recalculate psm_score
+        w_mass = 0.25
+        w_frag = 0.25
+        w_rt = 0.10
+        w_charge = 0.10
+        w_cont = 0.10
+        w_comp = 0.20
+        results_df['psm_score'] = (
+            w_mass * results_df['norm_mass_accuracy'].fillna(0).values +
+            w_frag * results_df['norm_fragment_count'].fillna(0).values +
+            w_rt * results_df['norm_rt_accuracy'].fillna(0.5).values +
+            w_charge * results_df['charge_consistency'].fillna(0).values +
+            w_cont * results_df['continuity_score'].fillna(0).values +
+            w_comp * results_df['complementarity_score'].fillna(0).values
+        )
+
+        # Store correction summary
+        results_df.attrs['rt_drift_corrections'] = [
+            {'run_order': file_order_map[f], 'file': f,
+             'offset_min': file_offsets.get(f, np.nan),
+             'model_type': model_type}
+            for f in files_with_offset
+        ]
+    else:
+        logging.warning("RT Drift Correction: No corrections were applied.")
+
+    return results_df
+
+
+def _apply_file_offset(results_df, file_mask, offset):
+    """Apply a uniform RT offset correction to all PSMs matching *file_mask*."""
+    results_df.loc[file_mask, 'rt_drift_correction'] = offset
+    known_rt = pd.to_numeric(results_df.loc[file_mask, 'known_rt'], errors='coerce')
+    corrected = known_rt + offset
+    results_df.loc[file_mask, 'known_rt_corrected'] = corrected
+    # Recalculate rt_accuracy with corrected expected RT
+    obs_rt = pd.to_numeric(results_df.loc[file_mask, 'rt'], errors='coerce').fillna(0)
+    new_acc = np.abs(obs_rt - corrected.fillna(0))
+    new_acc = np.where(corrected.isna(), 0.0, new_acc)
+    results_df.loc[file_mask, 'rt_accuracy'] = new_acc
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Inter-file mass accuracy drift correction
+# ═══════════════════════════════════════════════════════════════════════
+
+def apply_mass_drift_correction(results_df, reference_peptides,
+                                model_type='direct_offset',
+                                fragment_tolerance=20.0, mzml_folder=None):
+    """
+    Apply **inter-file** mass-accuracy drift correction.
+
+    For each data file, compute the mean **signed** fragment mass error
+    (ppm) across all PSMs of the reference peptides.  This reveals the
+    systematic instrumental mass bias in that file.  The correction
+    subtracts the per-file bias from every PSM's signed ppm error, then
+    recalculates ``mass_accuracy`` and ``norm_mass_accuracy``.
+
+    Two correction modes are available:
+
+    * **Direct Offset** (default): Each file gets its own measured mean
+      signed-ppm offset applied as a uniform shift.
+    * **Trend Model**: Fit a linear regression of per-file offset vs.
+      acquisition-order index (run_order).  The smoothed prediction is
+      used as the correction — useful for gradual calibration drift.
+
+    Requirements
+    ------------
+    * ≥1 reference peptide sequence.
+    * ≥3 data files.
+    * Each reference peptide must be detected in ≥70 % of files **or**
+      ≥3 files, whichever threshold is larger.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Complete PSM results table.  Must contain ``mass_accuracy_signed``,
+        ``mass_accuracy``, ``norm_mass_accuracy``, ``file``, ``peptide``,
+        ``psm_score``.
+    reference_peptides : list[str]
+        Peptide sequences designated as mass-accuracy reference standards.
+    model_type : str
+        'direct_offset' or 'trend_model'.
+    fragment_tolerance : float
+        Fragment tolerance used (needed for norm_mass_accuracy recalculation).
+    mzml_folder : str or None
+        Folder with data files (for timestamp-based run ordering).
+
+    Returns
+    -------
+    results_df : pd.DataFrame
+        Updated DataFrame with corrected mass accuracy values.
+        New columns: ``mass_drift_correction_ppm``, ``mass_accuracy_corrected``.
+    """
+    if not reference_peptides or results_df.empty:
+        return results_df
+
+    ref_set = set(p.strip().upper() for p in reference_peptides if p.strip())
+    if not ref_set:
+        return results_df
+
+    results_df = results_df.copy()
+
+    # Ensure mass_accuracy_signed exists (older results may lack it)
+    if 'mass_accuracy_signed' not in results_df.columns:
+        logging.warning("Mass Drift Correction: 'mass_accuracy_signed' column missing. "
+                        "Cannot determine drift direction. Skipping.")
+        return results_df
+
+    # ------------------------------------------------------------------
+    # Sort files by acquisition timestamp (run order)
+    # ------------------------------------------------------------------
+    files_unsorted = results_df['file'].unique()
+    if len(files_unsorted) < 3:
+        logging.warning("Mass Drift Correction: Need at least 3 data files for "
+                        f"inter-file correction. Found {len(files_unsorted)}. Skipping.")
+        return results_df
+
+    file_times = {f: _get_file_acquisition_time(f, mzml_folder) for f in files_unsorted}
+    files = sorted(files_unsorted, key=lambda f: file_times[f])
+
+    # Reuse run_order if already set by RT drift correction, else create
+    if 'run_order' not in results_df.columns:
+        file_order_map = {f: idx + 1 for idx, f in enumerate(files)}
+        results_df['run_order'] = results_df['file'].map(file_order_map)
+    else:
+        file_order_map = dict(
+            results_df.drop_duplicates('file')[['file', 'run_order']].values
+        )
+        file_order_map = {f: int(o) for f, o in file_order_map.items()}
+
+    logging.info(f"Mass Drift Correction ({model_type}): "
+                 f"{len(files)} file(s), {len(ref_set)} reference peptide(s)")
+
+    # ------------------------------------------------------------------
+    # For each file, compute the mean SIGNED ppm offset from reference peptides
+    # ------------------------------------------------------------------
+    file_offsets = {}           # file -> mean signed ppm offset
+    file_ref_details = {}      # file -> list of (peptide, signed_ppm)
+    detection_counts = {p: 0 for p in ref_set}
+
+    for file_name in files:
+        file_mask = results_df['file'] == file_name
+        file_df = results_df.loc[file_mask]
+
+        ref_mask = (
+            file_df['peptide'].str.upper().isin(ref_set) &
+            (~file_df['peptide'].str.startswith('DECOY_')) &
+            (file_df['matched_fragments'] > 0)
+        )
+        ref_psms = file_df.loc[ref_mask]
+        if ref_psms.empty:
+            continue
+
+        # Best PSM per reference peptide (highest psm_score)
+        best_ref = ref_psms.loc[ref_psms.groupby('peptide')['psm_score'].idxmax()]
+        signed = pd.to_numeric(best_ref['mass_accuracy_signed'], errors='coerce')
+        valid = signed.notna()
+        if valid.sum() == 0:
+            continue
+
+        signed_vals = signed[valid].values
+        peps = best_ref.loc[valid, 'peptide'].str.upper().values
+        for p in peps:
+            if p in detection_counts:
+                detection_counts[p] += 1
+
+        file_offsets[file_name] = float(np.mean(signed_vals))
+        file_ref_details[file_name] = list(zip(peps, signed_vals))
+
+    # ------------------------------------------------------------------
+    # Check detection-rate requirement
+    # ------------------------------------------------------------------
+    n_files = len(files)
+    min_detections = max(3, int(np.ceil(0.70 * n_files)))
+    qualified_refs = [p for p, cnt in detection_counts.items() if cnt >= min_detections]
+
+    if not qualified_refs:
+        det_summary = ", ".join(f"{p}: {detection_counts[p]}/{n_files}" for p in ref_set)
+        logging.warning(f"Mass Drift Correction: No reference peptide meets the detection "
+                        f"threshold (≥{min_detections} of {n_files} files). "
+                        f"Detections: {det_summary}. Skipping.")
+        return results_df
+
+    dropped = ref_set - set(qualified_refs)
+    if dropped:
+        logging.info(f"  Mass drift reference(s) dropped (too few files): "
+                     f"{', '.join(dropped)}")
+        _q_set = set(qualified_refs)
+        file_offsets_filtered = {}
+        for fname, details in file_ref_details.items():
+            q_drifts = [d for p, d in details if p in _q_set]
+            if q_drifts:
+                file_offsets_filtered[fname] = float(np.mean(q_drifts))
+        file_offsets = file_offsets_filtered
+
+    files_with_offset = [f for f in files if f in file_offsets]
+    if len(files_with_offset) < 3:
+        logging.warning(f"Mass Drift Correction: Only {len(files_with_offset)} files have "
+                        f"valid reference detections. Need at least 3. Skipping.")
+        return results_df
+
+    logging.info(f"  {len(qualified_refs)} qualified ref peptide(s), "
+                 f"{len(files_with_offset)}/{n_files} files with measured offsets")
+    for fn in files_with_offset:
+        logging.info(f"    run {file_order_map[fn]:>2d}: {fn}  ppm offset = "
+                     f"{file_offsets[fn]:+.3f}")
+
+    # ------------------------------------------------------------------
+    # Compute correction per file
+    # ------------------------------------------------------------------
+    results_df['mass_drift_correction_ppm'] = 0.0
+    sigma_mass = fragment_tolerance / 3.0
+
+    if model_type == 'trend_model':
+        x = np.array([file_order_map[f] for f in files_with_offset], dtype=float)
+        y = np.array([file_offsets[f] for f in files_with_offset], dtype=float)
+        try:
+            slope, intercept = np.polyfit(x, y, 1)
+        except Exception:
+            slope, intercept = 0.0, float(np.mean(y))
+        logging.info(f"  Trend model: slope = {slope:.5f} ppm/run, "
+                     f"intercept = {intercept:.5f} ppm")
+        for file_name in files:
+            fm = results_df['file'] == file_name
+            predicted_offset = slope * file_order_map[file_name] + intercept
+            _apply_mass_file_offset(results_df, fm, predicted_offset, sigma_mass)
+    else:
+        # Direct offset mode
+        for file_name in files:
+            fm = results_df['file'] == file_name
+            if file_name in file_offsets:
+                _apply_mass_file_offset(results_df, fm, file_offsets[file_name], sigma_mass)
+
+    # ------------------------------------------------------------------
+    # Leave-one-out (LOO) correction for reference peptides
+    # ------------------------------------------------------------------
+    # When the global per-file offset was computed from ALL reference
+    # peptides (including the one being corrected), each reference
+    # peptide's own mass error is artificially reduced.  LOO re-corrects
+    # reference-peptide PSMs using the offset derived from all OTHER
+    # reference peptides, preventing calibration overfitting.
+    _loo_q_set = set(qualified_refs)
+    _loo_count = 0
+    for file_name in files_with_offset:
+        details = file_ref_details.get(file_name, [])
+        q_details = [(p, d) for p, d in details if p in _loo_q_set]
+        if len(q_details) < 2:
+            # Only 1 reference peptide — LOO offset undefined; keep the
+            # global offset (the best we can do).
+            continue
+
+        global_offset = file_offsets[file_name]
+
+        for ref_pep, _ref_signed in q_details:
+            # LOO offset = mean signed ppm of all OTHER reference peptides
+            loo_drifts = [d for p, d in q_details if p != ref_pep]
+            loo_offset = float(np.mean(loo_drifts))
+
+            # Find all PSMs for this reference peptide in this file
+            ref_mask = (
+                (results_df['file'] == file_name) &
+                (results_df['peptide'].str.upper() == ref_pep) &
+                (~results_df['peptide'].str.startswith('DECOY_'))
+            )
+            if ref_mask.sum() == 0:
+                continue
+
+            # Undo global offset and re-apply LOO offset.
+            # Current signed = original − global_offset
+            # New signed     = original − loo_offset
+            #                = current_signed + (global_offset − loo_offset)
+            delta = global_offset - loo_offset
+            current_signed = pd.to_numeric(
+                results_df.loc[ref_mask, 'mass_accuracy_signed'],
+                errors='coerce'
+            ).fillna(0.0)
+            new_signed = current_signed + delta
+            results_df.loc[ref_mask, 'mass_accuracy_signed'] = new_signed
+            new_abs = np.abs(new_signed)
+            results_df.loc[ref_mask, 'mass_accuracy'] = new_abs
+            results_df.loc[ref_mask, 'mass_accuracy_corrected'] = new_abs
+            results_df.loc[ref_mask, 'mass_drift_correction_ppm'] = loo_offset
+            # Recompute Gaussian-normalized mass accuracy
+            norm = np.exp(-0.5 * (new_abs / sigma_mass) ** 2)
+            results_df.loc[ref_mask, 'norm_mass_accuracy'] = norm
+            _loo_count += ref_mask.sum()
+
+    if _loo_count > 0:
+        logging.info(f"  LOO correction applied to {_loo_count} reference-peptide PSMs "
+                     f"to avoid mass calibration overfitting.")
+
+    # ------------------------------------------------------------------
+    # Recalculate PSM scores for corrected files
+    # ------------------------------------------------------------------
+    corrected_mask = results_df['mass_drift_correction_ppm'] != 0.0
+    n_corrected_files = results_df.loc[corrected_mask, 'file'].nunique()
+    if n_corrected_files > 0:
+        logging.info(f"Mass Drift Correction applied to {n_corrected_files}/{n_files} file(s). "
+                     f"Recalculating scores...")
+
+        # Recalculate psm_score using updated norm_mass_accuracy
+        w_mass = 0.25
+        w_frag = 0.25
+        w_rt = 0.10
+        w_charge = 0.10
+        w_cont = 0.10
+        w_comp = 0.20
+        results_df['psm_score'] = (
+            w_mass * results_df['norm_mass_accuracy'].fillna(0).values +
+            w_frag * results_df['norm_fragment_count'].fillna(0).values +
+            w_rt * results_df['norm_rt_accuracy'].fillna(0.5).values +
+            w_charge * results_df['charge_consistency'].fillna(0).values +
+            w_cont * results_df['continuity_score'].fillna(0).values +
+            w_comp * results_df['complementarity_score'].fillna(0).values
+        )
+
+        # Store correction summary
+        results_df.attrs['mass_drift_corrections'] = [
+            {'run_order': file_order_map[f], 'file': f,
+             'offset_ppm': file_offsets.get(f, np.nan),
+             'model_type': model_type}
+            for f in files_with_offset
+        ]
+    else:
+        logging.warning("Mass Drift Correction: No corrections were applied.")
+
+    return results_df
+
+
+def _apply_mass_file_offset(results_df, file_mask, offset_ppm, sigma_mass):
+    """Apply a uniform signed-ppm offset correction to all PSMs matching *file_mask*.
+
+    Corrected signed ppm = original signed ppm − offset.
+    Corrected mass_accuracy = |corrected signed ppm|.
+    norm_mass_accuracy is recomputed with the Gaussian kernel.
+    """
+    results_df.loc[file_mask, 'mass_drift_correction_ppm'] = offset_ppm
+    signed = pd.to_numeric(results_df.loc[file_mask, 'mass_accuracy_signed'],
+                           errors='coerce').fillna(0.0)
+    corrected_signed = signed - offset_ppm
+    results_df.loc[file_mask, 'mass_accuracy_signed'] = corrected_signed
+    corrected_abs = np.abs(corrected_signed)
+    results_df.loc[file_mask, 'mass_accuracy'] = corrected_abs
+    results_df.loc[file_mask, 'mass_accuracy_corrected'] = corrected_abs
+    # Recompute Gaussian-normalized mass accuracy
+    norm = np.exp(-0.5 * (corrected_abs / sigma_mass) ** 2)
+    results_df.loc[file_mask, 'norm_mass_accuracy'] = norm
+
+
+def calculate_continuity_score(matched_fragments):
+    # Group fragments by ion type
+    ion_series = {}
+    for ion in matched_fragments:
+        ion_type = ion[0]  # b, y, etc.
+        fragment_position = ion[6]  # position number
+        
+        if ion_type not in ion_series:
+            ion_series[ion_type] = []
+        ion_series[ion_type].append(fragment_position)
+    
+    # Calculate continuity for each ion series
+    continuity_scores = []
+    for ion_type, positions in ion_series.items():
+        positions = sorted(positions)
+        consecutive_count = 0
+        for i in range(len(positions)-1):
+            if positions[i+1] - positions[i] == 1:
+                consecutive_count += 1
+        
+        # Normalize by maximum possible consecutive matches
+        if len(positions) > 1:
+            continuity = consecutive_count / (len(positions) - 1)
+            continuity_scores.append(continuity)
+    
+    # Average continuity across all ion types
+    return np.mean(continuity_scores) if continuity_scores else 0
+
+def calculate_complementarity_score(matched_fragments, peptide_length):
+    """
+    Calculate complementarity score for all types of fragment ions.
+    Higher scores indicate more complementary fragment pairs.
+    
+    Parameters:
+    -----------
+    matched_fragments : list
+        List of fragment ions with format (ion_type, theoretical_mz, charge, intensity, mass_accuracy_ppm, nl_type, fragment_position)
+    peptide_length : int
+        Length of the peptide sequence
+    
+    Returns:
+    --------
+    float
+        Complementarity score between 0 and 1
+    """
+    # Extract positions by ion type
+    ion_positions = {
+        'b': set(), 'y': set(),
+        'c': set(), 'z': set(),
+        'a': set(), 'x': set()
+    }
+    
+    for ion in matched_fragments:
+        ion_type = ion[0]  # b, y, c, z, a, or x
+        position = ion[6]  # fragment position
+        
+        # Only consider primary ion types (ignore neutral losses)
+        if ion_type in ion_positions:
+            ion_positions[ion_type].add(position)
+    
+    # Count complementary pairs for each fragmentation type
+    complementary_count = 0
+    total_possible = 0
+    
+    # Check b/y complementary pairs
+    # Denominator = peptide_length - 1 (theoretical max backbone cleavages)
+    if ion_positions['b'] and ion_positions['y']:
+        for b_pos in ion_positions['b']:
+            complement_y_pos = peptide_length - b_pos
+            if complement_y_pos in ion_positions['y']:
+                complementary_count += 1
+        total_possible += peptide_length - 1
+    
+    # Check c/z complementary pairs
+    if ion_positions['c'] and ion_positions['z']:
+        for c_pos in ion_positions['c']:
+            complement_z_pos = peptide_length - c_pos
+            if complement_z_pos in ion_positions['z']:
+                complementary_count += 1
+        total_possible += peptide_length - 1
+    
+    # Check a/x complementary pairs
+    if ion_positions['a'] and ion_positions['x']:
+        for a_pos in ion_positions['a']:
+            complement_x_pos = peptide_length - a_pos
+            if complement_x_pos in ion_positions['x']:
+                complementary_count += 1
+        total_possible += peptide_length - 1
+    
+    # Normalize by maximum possible complementary pairs
+    if total_possible > 0:
+        return complementary_count / total_possible
+    else:
+        return 0.0
+
+
+# ============================================================================
+# MS2PIP PREDICTED-INTENSITY ADAPTER  &  SPECTRAL SIMILARITY HELPERS
+# ============================================================================
+
+# --------------- Module-level MS2PIP prediction cache -----------------------
+_ms2pip_cache = {}          # key=(peptide, modification, charge, frag_type) -> {ion_key: pred_intensity}
+_ms2pip_cache_lock = threading.Lock()   # thread-safety for concurrent file workers
+_MS2PIP_MODEL_MAP = {
+    'HCD':  'HCD',
+    'CID':  'CID',
+    # ETD, EThcD, and UVPD are NOT supported by MS2PIP — no entry here.
+    # The calling code must check membership before requesting predictions.
+}
+
+# Fragmentation types that MS2PIP can model (used for user-facing validation)
+_MS2PIP_SUPPORTED_FRAG_TYPES = frozenset(_MS2PIP_MODEL_MAP.keys())
+
+
+def ms2pip_predict_intensities(peptide, modification, charge, fragmentation_type='HCD'):
+    """
+    Predict fragment-ion relative intensities for a peptide using MS2PIP.
+
+    Returns
+    -------
+    dict  {ion_key: predicted_intensity}
+        ion_key = (base_ion_type, fragment_position, ion_charge)  e.g. ('y', 5, 1)
+        predicted_intensity is normalised to [0, 1] (max = 1).
+    Returns empty dict when MS2PIP is unavailable or the prediction fails.
+    """
+    _ensure_ms2pip()
+    if not HAS_MS2PIP:
+        return {}
+
+    # Strip decoy prefix for prediction (predicted spectrum is sequence-based)
+    seq = peptide[6:] if peptide.startswith('DECOY_') else peptide
+
+    cache_key = (seq, modification if modification and str(modification) != 'nan' else '', charge, fragmentation_type)
+    with _ms2pip_cache_lock:
+        if cache_key in _ms2pip_cache:
+            return _ms2pip_cache[cache_key]
+
+    model = _MS2PIP_MODEL_MAP.get(fragmentation_type, 'HCD')
+
+    # Build MS2PIP modification string  "2|Oxidation|5|Phospho"  (1-based positions)
+    ms2pip_mod_str = ''
+    if modification and str(modification) != 'nan':
+        try:
+            parts = []
+            for m in re.finditer(r'(\d+)x(\S+?)\s*\[([^\]]+)\]', str(modification)):
+                mod_name = m.group(2)
+                bracket = m.group(3)
+                for pm in re.finditer(r'[A-Z](\d+)', bracket):
+                    pos = int(pm.group(1))  # already 1-based from PD
+                    parts.append(f'{pos}|{mod_name}')
+            ms2pip_mod_str = '|'.join(parts) if parts else '-'
+        except Exception:
+            ms2pip_mod_str = '-'
+    else:
+        ms2pip_mod_str = '-'
+
+    def _to_proforma(sequence, mods, precursor_charge):
+        """Convert internal modification string to a basic ProForma peptidoform."""
+        base = list(sequence)
+        tags = {}
+        if mods and str(mods) != 'nan':
+            try:
+                for m in re.finditer(r'(\d+)x(\S+?)\s*\[([^\]]+)\]', str(mods)):
+                    mod_name = m.group(2)
+                    bracket = m.group(3)
+                    for pm in re.finditer(r'[A-Z](\d+)', bracket):
+                        pos_1based = int(pm.group(1))  # already 1-based from PD
+                        if 1 <= pos_1based <= len(base):
+                            tags.setdefault(pos_1based, [])
+                            tags[pos_1based].append(f'[{mod_name}]')
+            except Exception:
+                tags = {}
+
+        out = []
+        for i, aa in enumerate(base, start=1):
+            out.append(aa)
+            if i in tags:
+                out.extend(tags[i])
+        return f"{''.join(out)}/{int(precursor_charge)}"
+
+    try:
+        preds = {}                  # (ion_type, position, charge) -> intensity
+        if _MS2PIP_BACKEND == 'legacy':
+            result = _ms2pip_sp.predict(
+                peptide=seq,
+                modifications=ms2pip_mod_str,
+                charge=int(charge),
+                model=model,
+            )
+            if result is not None and hasattr(result, 'iterrows'):
+                for _, row in result.iterrows():
+                    ion_str = str(row.get('ion', ''))        # e.g. 'y5', 'b3'
+                    if len(ion_str) < 2:
+                        continue
+                    ion_type = ion_str[0]                    # 'b' or 'y'
+                    try:
+                        frag_pos = int(ion_str[1:])
+                    except ValueError:
+                        continue
+                    pred_int = float(row.get('prediction', 0))
+                    preds[(ion_type, frag_pos, 1)] = pred_int  # charge 1 (legacy API default)
+        elif _MS2PIP_BACKEND == 'core':
+            peptidoform = _to_proforma(seq, modification, charge)
+            result = _ms2pip_core.predict_single(
+                peptidoform, model=model, model_dir=_ms2pip_model_dir()
+            )
+            pred_map = getattr(result, 'predicted_intensity', None) if result is not None else None
+            if isinstance(pred_map, dict):
+                for ion_key, intensities in pred_map.items():
+                    ion_key = str(ion_key).lower()
+                    m = re.match(r'([a-z]+?)(\d*)$', ion_key)
+                    if not m:
+                        continue
+                    ion_type = m.group(1)
+                    ion_charge = int(m.group(2)) if m.group(2) else 1
+                    if not isinstance(intensities, (list, tuple, np.ndarray)):
+                        continue
+                    for frag_pos, pred_int in enumerate(intensities, start=1):
+                        preds[(ion_type, frag_pos, ion_charge)] = float(pred_int)
+
+        # MS2PIP models return log2-transformed intensities; convert to linear
+        if preds:
+            if any(v < 0 for v in preds.values()):
+                preds = {k: 2.0 ** v for k, v in preds.items()}
+            # Normalise to [0, 1]
+            max_val = max(preds.values())
+            if max_val > 0:
+                preds = {k: v / max_val for k, v in preds.items()}
+
+        with _ms2pip_cache_lock:
+            _ms2pip_cache[cache_key] = preds
+        return preds
+    except Exception as exc:
+        logging.debug(f"MS2PIP prediction failed for {seq}: {exc}")
+        with _ms2pip_cache_lock:
+            _ms2pip_cache[cache_key] = {}
+        return {}
+
+
+def clear_ms2pip_cache():
+    """Free the prediction cache between runs."""
+    with _ms2pip_cache_lock:
+        _ms2pip_cache.clear()
+
+
+def ms2pip_predict_all_peptides(peptides_info, fragmentation_type='HCD'):
+    """
+    Pre-compute MS2PIP predicted intensities for ALL peptides in a single pass.
+
+    This function should be called ONCE from the main thread (in
+    ``diagnose_all_peptides``) before spawning file-processing threads.
+    It avoids:
+      * Redundant prediction across concurrent threads (GIL contention).
+      * Repeated XGBoost model loads.
+      * Race conditions on the module-level cache.
+
+    When the modern ``ms2pip.core`` back-end is available the function
+    first attempts the vectorised **batch API** (``predict_batch``),
+    which loads the XGBoost model once and processes all peptides in an
+    internal multiprocessing pool — typically 3-10x faster than looping
+    ``predict_single``.  If the batch API is unavailable or fails, it
+    falls back to sequential ``predict_single`` calls.
+
+    Parameters
+    ----------
+    peptides_info : list of tuples
+        Each element is ``(peptide, precursor_mz, charge, modification, ...)``.
+    fragmentation_type : str
+        'HCD', 'CID', etc.
+
+    Returns
+    -------
+    dict  {peptide_index: {(ion_type, position, charge): predicted_intensity}}
+    """
+    _ensure_ms2pip()
+    if not HAS_MS2PIP:
+        return {}
+
+    all_preds = {}  # {idx: {ion_key: intensity}}
+    n_total = len(peptides_info)
+
+    # ---- Attempt batch API (core backend only) ----------------------------
+    batch_ok = False
+    if _MS2PIP_BACKEND == 'core':
+        try:
+            from psm_utils import PSMList, Peptidoform as _PF
+            model = _MS2PIP_MODEL_MAP.get(fragmentation_type, 'HCD')
+            model_dir = _ms2pip_model_dir()
+
+            # Build list of (peptidoform_str, original_index) deduplicating by cache key
+            psm_items = []  # [(proforma_str, idx, cache_key)]
+            need_prediction = []
+
+            for pidx, pinfo in enumerate(peptides_info):
+                pep, _pmz, pch, pmod = pinfo[0], pinfo[1], pinfo[2], pinfo[3]
+                seq = pep[6:] if pep.startswith('DECOY_') else pep
+                cache_key = (seq, pmod if pmod and str(pmod) != 'nan' else '', pch, fragmentation_type)
+                with _ms2pip_cache_lock:
+                    if cache_key in _ms2pip_cache:
+                        all_preds[pidx] = _ms2pip_cache[cache_key]
+                        continue
+                # Build ProForma peptidoform
+                proforma = _to_proforma_standalone(seq, pmod, pch)
+                need_prediction.append((proforma, pidx, cache_key))
+
+            if need_prediction:
+                logging.info(f"MS2PIP batch prediction: {len(need_prediction)} peptides "
+                             f"({n_total - len(need_prediction)} cached) ...")
+                # Build PSMList for batch API
+                from psm_utils import PSM
+                psm_list = PSMList(psm_list=[
+                    PSM(peptidoform=pf, spectrum_id=str(pidx))
+                    for pf, pidx, _ck in need_prediction
+                ])
+                # Force single-process to avoid multiprocessing deadlocks
+                # on Windows (spawn start-method inside daemon threads) and to
+                # prevent loading the ~900 MB XGBoost model in multiple child
+                # processes, which can exhaust available RAM.
+                results = _ms2pip_core.predict_batch(
+                    psm_list, model=model, model_dir=model_dir, processes=1
+                )
+                # Parse results
+                for r_idx, result in enumerate(results):
+                    pf_str, pidx, cache_key = need_prediction[r_idx]
+                    preds = _parse_processing_result(result)
+                    with _ms2pip_cache_lock:
+                        _ms2pip_cache[cache_key] = preds
+                    all_preds[pidx] = preds
+
+                batch_ok = True
+                logging.info(f"MS2PIP batch prediction complete — "
+                             f"{sum(1 for v in all_preds.values() if v)}/{n_total} successful")
+
+        except Exception as exc:
+            logging.warning(f"MS2PIP batch prediction failed ({exc}); "
+                            f"falling back to sequential predict_single.")
+            batch_ok = False
+
+    # ---- Fallback: sequential predict_single ------------------------------
+    if not batch_ok:
+        logging.info(f"MS2PIP sequential prediction for {n_total} peptides ...")
+        t0 = time.time()
+        for pidx, pinfo in enumerate(peptides_info):
+            pep, _pmz, pch, pmod = pinfo[0], pinfo[1], pinfo[2], pinfo[3]
+            all_preds[pidx] = ms2pip_predict_intensities(pep, pmod, pch, fragmentation_type)
+            # Progress logging every 50 peptides
+            if (pidx + 1) % 50 == 0 or pidx + 1 == n_total:
+                elapsed = time.time() - t0
+                rate = (pidx + 1) / elapsed if elapsed > 0 else 0
+                logging.info(f"  MS2PIP progress: {pidx + 1}/{n_total} "
+                             f"({rate:.1f} peptides/s, {elapsed:.1f}s elapsed)")
+
+    return all_preds
+
+
+def _to_proforma_standalone(sequence, mods, precursor_charge):
+    """Convert internal modification string to a basic ProForma peptidoform (standalone helper)."""
+    base = list(sequence)
+    tags = {}
+    if mods and str(mods) != 'nan':
+        try:
+            for m in re.finditer(r'(\d+)x(\S+?)\s*\[([^\]]+)\]', str(mods)):
+                mod_name = m.group(2)
+                bracket = m.group(3)
+                for pm in re.finditer(r'[A-Z](\d+)', bracket):
+                    pos_1based = int(pm.group(1))  # already 1-based from PD
+                    if 1 <= pos_1based <= len(base):
+                        tags.setdefault(pos_1based, [])
+                        tags[pos_1based].append(f'[{mod_name}]')
+        except Exception:
+            tags = {}
+    out = []
+    for i, aa in enumerate(base, start=1):
+        out.append(aa)
+        if i in tags:
+            out.extend(tags[i])
+    return f"{''.join(out)}/{int(precursor_charge)}"
+
+
+def _parse_processing_result(result):
+    """Parse a ms2pip ProcessingResult into our {(ion_type, pos, charge): intensity} dict."""
+    preds = {}
+    pred_map = getattr(result, 'predicted_intensity', None)
+    if isinstance(pred_map, dict):
+        for ion_key, intensities in pred_map.items():
+            ion_key_str = str(ion_key).lower()
+            m = re.match(r'([a-z]+?)(\d*)$', ion_key_str)
+            if not m:
+                continue
+            ion_type = m.group(1)
+            ion_charge = int(m.group(2)) if m.group(2) else 1
+            if not isinstance(intensities, (list, tuple, np.ndarray)):
+                continue
+            for frag_pos, pred_int in enumerate(intensities, start=1):
+                preds[(ion_type, frag_pos, ion_charge)] = float(pred_int)
+    # MS2PIP models return log2-transformed intensities; convert to linear
+    if preds:
+        if any(v < 0 for v in preds.values()):
+            preds = {k: 2.0 ** v for k, v in preds.items()}
+        # Normalise to [0, 1]
+        max_val = max(preds.values())
+        if max_val > 0:
+            preds = {k: v / max_val for k, v in preds.items()}
+    return preds
+
+
+# ============================================================================
+# ALPHAPEPTDEEP  PREDICTED-INTENSITY ADAPTER
+# ============================================================================
+
+# Module-level AlphaPeptDeep predictor state
+_apd_ms2_model = None          # Cached ModelManager for MS2 prediction
+_apd_ms2_model_lock = threading.Lock()
+_apd_cache = {}                # key=(peptide, mod, charge, frag_type, instrument, nce) -> {ion_key: pred_intensity}
+_apd_cache_lock = threading.Lock()
+
+
+def _get_apd_model_manager(
+    instrument='Lumos',
+    nce=30.0,
+    fragmentation_type='HCD',
+    calibration_mgf=None,
+    calibration_nce=None,
+    calibration_psm=None,
+    calibrated_model_folder=None,
+):
+    """
+    Get or create an AlphaPeptDeep ModelManager for MS2 prediction.
+
+    If ``calibrated_model_folder`` is provided, a previously saved calibrated
+    model is loaded from that directory instead of running calibration.
+
+    If ``calibration_mgf`` is provided (and no pre-calibrated model), the
+    pretrained model is fine-tuned (transfer-learned) on the user's PSM
+    spectra from that MGF file before being used for prediction.
+
+    Device is auto-detected: GPU (CUDA) when available, CPU otherwise.
+
+    Parameters
+    ----------
+    instrument : str
+        One of 'QE', 'Lumos', 'timsTOF', 'SciexTOF', 'ThermoTOF'.
+    nce : float
+        Normalized collision energy (e.g. 25, 27, 30, 35).
+    fragmentation_type : str
+        'HCD' or 'CID'.
+    calibration_mgf : str or None
+        Path to an MGF file with identified PSMs for transfer learning.
+    calibration_nce : float or None
+        NCE used when acquiring the calibration MGF spectra (defaults to ``nce``).
+
+    Returns
+    -------
+    peptdeep.pretrained_models.ModelManager or None
+    """
+    global _apd_ms2_model
+    _ensure_peptdeep()
+    if not _ALPHAPEPTDEEP_AVAILABLE:
+        return None
+
+    with _apd_ms2_model_lock:
+        if _apd_ms2_model is not None and calibration_mgf is None and calibrated_model_folder is None:
+            return _apd_ms2_model
+
+        # ── Fast path: load a pre-calibrated model from disk ──
+        if calibrated_model_folder:
+            loaded = _load_apd_calibrated_model(calibrated_model_folder)
+            if loaded is not None:
+                loaded.instrument = instrument
+                loaded.nce = nce
+                _apd_ms2_model = loaded
+                return loaded
+            else:
+                logging.warning("AlphaPeptDeep: calibrated model load failed; "
+                                "falling back to generic pretrained model.")
+
+        try:
+            model_dir = _alphapeptdeep_model_dir()
+            logging.info(f"AlphaPeptDeep: loading pretrained models from {model_dir}")
+
+            # Auto-detect device: GPU when CUDA available, CPU otherwise
+            use_gpu = False
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    use_gpu = True
+                    logging.info(f"AlphaPeptDeep: using GPU ({torch.cuda.get_device_name(0)})")
+                else:
+                    logging.info("AlphaPeptDeep: CUDA not available, using CPU")
+            except ImportError:
+                logging.info("AlphaPeptDeep: PyTorch not available, using CPU")
+
+            mgr = _APD_ModelManager(device='gpu' if use_gpu else 'cpu')
+
+            # Override with bundled models if present (load_external_models
+            # takes individual .pth file paths, unlike load_installed_models
+            # which only accepts a model_type string like 'generic').
+            ms2_model_path = os.path.join(model_dir, 'generic', 'ms2.pth')
+            rt_model_path  = os.path.join(model_dir, 'generic', 'rt.pth')
+            ccs_model_path = os.path.join(model_dir, 'generic', 'ccs.pth')
+            chg_model_path = os.path.join(model_dir, 'generic', 'charge.pth')
+
+            if os.path.exists(ms2_model_path):
+                try:
+                    mgr.load_external_models(
+                        ms2_model_file=ms2_model_path,
+                        rt_model_file=rt_model_path if os.path.exists(rt_model_path) else '',
+                        ccs_model_file=ccs_model_path if os.path.exists(ccs_model_path) else '',
+                        charge_model_file=chg_model_path if os.path.exists(chg_model_path) else '',
+                    )
+                    _patch_apd_predict_bug(mgr)
+                    logging.info("AlphaPeptDeep: bundled pretrained models loaded successfully")
+                except Exception as exc:
+                    logging.warning(
+                        f"AlphaPeptDeep: failed to load bundled external models ({exc}); "
+                        f"falling back to installed/default models"
+                    )
+                    mgr.load_installed_models(model_type='generic')
+                    _patch_apd_predict_bug(mgr)
+                    logging.info("AlphaPeptDeep: fallback to installed/default models succeeded")
+            else:
+                # Constructor already loaded defaults from peptdeep's cache
+                _patch_apd_predict_bug(mgr)
+                logging.info("AlphaPeptDeep: using default peptdeep models")
+
+            # Set instrument and NCE for prediction
+            mgr.instrument = instrument
+            mgr.nce = nce
+
+            # Calibration (transfer learning) on user PSM data
+            if calibration_mgf and os.path.exists(calibration_mgf):
+                cal_nce = calibration_nce if calibration_nce is not None else nce
+                logging.info(f"AlphaPeptDeep: calibrating MS2 model with MGF: {calibration_mgf}")
+                logging.info(f"  Instrument={instrument}, NCE={cal_nce}, Frag={fragmentation_type}")
+
+                try:
+                    psm_df = _parse_mgf_for_alphapeptdeep(
+                        calibration_mgf, cal_nce, instrument,
+                        psm_file=calibration_psm)
+                    if len(psm_df) >= 10:
+                        # Extra safety: ensure sequence validity before AlphaBase allocation.
+                        _seq = psm_df['sequence'].astype(str).str.strip()
+                        _valid_seq = _seq.str.match(r'^[ACDEFGHIKLMNPQRSTVWY]{2,}$', na=False)
+                        if not bool(_valid_seq.all()):
+                            psm_df = psm_df.loc[_valid_seq].copy()
+
+                    if len(psm_df) >= 10:
+                        # ── Subsample BEFORE predict_all to cap computation ──
+                        _MAX_CAL_PSMS = 5_000
+                        if len(psm_df) > _MAX_CAL_PSMS:
+                            try:
+                                from peptdeep.pretrained_models import psm_sampling_with_important_mods
+                                psm_df = psm_sampling_with_important_mods(
+                                    psm_df, n_sample=_MAX_CAL_PSMS,
+                                    top_n_mods=10, n_sample_each_mod=100,
+                                ).reset_index(drop=True)
+                            except ImportError:
+                                psm_df = psm_df.sample(
+                                    n=_MAX_CAL_PSMS, random_state=42
+                                ).reset_index(drop=True)
+                            logging.info(f"AlphaPeptDeep: subsampled to {len(psm_df):,} PSMs "
+                                         f"(mod-aware) for transfer learning")
+
+                        # ── Step 1: predict fragments to get m/z positions ──
+                        cal_df = psm_df[['sequence', 'mods', 'mod_sites',
+                                         'charge', 'nce', 'instrument']].copy()
+                        # Track original row order so we can realign psm_df
+                        # after predict_all (which sorts by peptide length).
+                        cal_df['_orig_row'] = np.arange(len(cal_df))
+                        pred_result = mgr.predict_all(
+                            cal_df, predict_items=['ms2'],
+                            multiprocessing=False,
+                        )
+                        frag_mz_df = pred_result['fragment_mz_df']
+
+                        # predict_all sorts cal_df by nAA (peptide length) via
+                        # refine_precursor_df — realign psm_df to the same order
+                        # so that observed spectra match predicted fragments.
+                        psm_df = psm_df.iloc[cal_df['_orig_row'].values].reset_index(drop=True)
+                        cal_df = cal_df.drop(columns=['_orig_row'])
+
+                        # ── Step 2: match observed peaks → predicted m/z ──
+                        matched_intensity_df = _match_observed_to_predicted(
+                            cal_df, frag_mz_df, psm_df,
+                            frag_tol_ppm=20.0,
+                        )
+
+                        # ── Diagnostics: verify alignment & matching ──
+                        _nonzero_frag = (frag_mz_df.values > 0).sum()
+                        _nonzero_match = (matched_intensity_df.values > 0).sum()
+                        logging.info(
+                            f"AlphaPeptDeep diag: frag_mz_df shape={frag_mz_df.shape}, "
+                            f"non-zero m/z={_nonzero_frag:,}; "
+                            f"matched_intensity_df non-zero={_nonzero_match:,}")
+                        # Spot-check alignment: first 3 PSMs
+                        for _si in range(min(3, len(cal_df))):
+                            _seq = cal_df.iloc[_si].get('sequence', '?')
+                            _fs = int(cal_df.iloc[_si]['frag_start_idx'])
+                            _fe = int(cal_df.iloc[_si]['frag_stop_idx'])
+                            _obs_n = len(psm_df.iloc[_si]['spec_mzs']) if psm_df.iloc[_si]['spec_mzs'] is not None else 0
+                            _pred_nz = (frag_mz_df.values[_fs:_fe] > 0).sum()
+                            _match_nz = (matched_intensity_df.values[_fs:_fe] > 0).sum()
+                            logging.info(
+                                f"  PSM[{_si}] seq={_seq[:20]}, frag[{_fs}:{_fe}], "
+                                f"obs_peaks={_obs_n}, pred_mz_nonzero={_pred_nz}, "
+                                f"matched={_match_nz}")
+                        # Check column consistency
+                        _model_types = set(mgr.ms2_model.charged_frag_types)
+                        _frag_cols = set(frag_mz_df.columns)
+                        _match_cols = set(matched_intensity_df.columns)
+                        if _frag_cols != _model_types:
+                            logging.warning(
+                                f"AlphaPeptDeep diag: column mismatch! "
+                                f"model expects {sorted(_model_types)}, "
+                                f"frag_mz has {sorted(_frag_cols)}")
+                        if _frag_cols != _match_cols:
+                            logging.warning(
+                                f"AlphaPeptDeep diag: matched cols "
+                                f"{sorted(_match_cols)} != frag cols "
+                                f"{sorted(_frag_cols)}")
+
+                        # ── Step 3: train (transfer-learn) the MS2 model ──
+                        # Paper-recommended TL params: epoch=10, warmup=5,
+                        # lr=1e-5, dropout=0.1, batch_size=256.
+                        mgr.epoch_to_train_ms2 = 10
+                        mgr.warmup_epoch_to_train_ms2 = 5
+                        mgr.lr_to_train_ms2 = 1e-5
+                        mgr.batch_size_to_train_ms2 = 256
+                        mgr.psm_num_to_train_ms2 = _MAX_CAL_PSMS
+                        mgr.top_n_mods_to_train = 10
+                        mgr.psm_num_per_mod_to_train_ms2 = 100
+                        mgr.ms2_model.model.dropout.p = 0.1
+                        mgr.train_ms2_model(cal_df, matched_intensity_df)
+                        logging.info(f"AlphaPeptDeep: MS2 model calibrated on {len(cal_df)} PSMs")
+                    else:
+                        logging.warning(f"AlphaPeptDeep: only {len(psm_df)} PSMs in MGF — "
+                                        f"need ≥10 for calibration. Using uncalibrated model.")
+                except Exception as exc:
+                    logging.warning(f"AlphaPeptDeep: calibration failed ({exc}). "
+                                    f"Using uncalibrated pretrained model.")
+
+            if calibration_mgf is None and calibrated_model_folder is None:
+                _apd_ms2_model = mgr
+            return mgr
+
+        except Exception as exc:
+            logging.error(f"AlphaPeptDeep: failed to load models: {exc}")
+            return None
+
+
+def _load_psm_scan_map(psm_file):
+    """
+    Load a PSM identification file and return ``(scan_to_psm, warnings)``.
+
+    ``scan_to_psm`` maps **composite keys** to identification dicts.
+
+    Key format:
+        ``"<file_stem>:<scan>"`` — e.g. ``"Pool:902"``
+    where *file_stem* is the raw-file name without extension, lower-cased.
+    If the PSM file has no *Spectrum File* column the key falls back to
+    ``"*:<scan>"`` (wildcard file) so matching still works when only one
+    raw file was used.
+
+    Each value is a dict with keys:
+    ``sequence``, ``mods``, ``mod_sites``.
+
+    This is separated from MGF parsing so the PSM file can be loaded
+    *first*, enabling the MGF reader to skip unneeded spectra.
+    """
+    scan_to_psm = {}
+    warnings = []
+    if not psm_file or not os.path.exists(psm_file):
+        return scan_to_psm, warnings
+
+    try:
+        ext = psm_file.lower()
+        if ext.endswith(('.xlsx', '.xls')):
+            psm_df = pd.read_excel(psm_file)
+        elif ext.endswith('.tsv'):
+            psm_df = pd.read_csv(psm_file, sep='\t', low_memory=False)
+        else:
+            psm_df = pd.read_csv(psm_file, low_memory=False)
+
+        # Auto-detect column names (case-insensitive, strip whitespace)
+        col_map = {}
+        for col in psm_df.columns:
+            cl = str(col).strip().lower()
+            if cl in ('annotated sequence', 'annotatedsequence'):
+                col_map['annotated_seq'] = col
+            elif cl == 'sequence':
+                col_map.setdefault('sequence', col)
+            elif cl in ('modifications', 'modification'):
+                col_map['modifications'] = col
+            elif cl in ('first scan', 'firstscan', 'scan', 'scans', 'scan number'):
+                col_map['scan'] = col
+            elif cl == 'charge':
+                col_map['charge'] = col
+            elif cl in ('spectrum file', 'spectrumfile', 'raw file',
+                        'rawfile', 'source file', 'filename'):
+                col_map['spectrum_file'] = col
+
+        seq_col = col_map.get('sequence', col_map.get('annotated_seq'))
+        scan_col = col_map.get('scan')
+        mod_col = col_map.get('modifications')
+        file_col = col_map.get('spectrum_file')
+        # If only Annotated Sequence is available, flag for bracket stripping
+        using_annotated_seq = (seq_col == col_map.get('annotated_seq')
+                               and 'sequence' not in col_map)
+
+        if not seq_col or not scan_col:
+            missing = []
+            if not seq_col:
+                missing.append("'Annotated Sequence' or 'Sequence'")
+            if not scan_col:
+                missing.append("'First Scan' or 'Scan'")
+            warnings.append(
+                f"PSM file missing columns: {', '.join(missing)}. "
+                f"Available: {list(psm_df.columns[:10])}")
+            return scan_to_psm, warnings
+
+        # Vectorised extraction — avoid iterrows()
+        scans = psm_df[scan_col].dropna().astype(int).astype(str)
+        seqs = psm_df[seq_col].astype(str).str.strip()
+        mods_raw = psm_df[mod_col].astype(str) if mod_col else pd.Series(
+            '', index=psm_df.index)
+        # Build file-stem series for composite keying.
+        # Stem = filename without extension, lowered.
+        if file_col is not None:
+            file_stems = (
+                psm_df[file_col]
+                .astype(str)
+                .apply(lambda f: os.path.splitext(os.path.basename(f.strip()))[0].lower())
+            )
+            _has_file = True
+        else:
+            file_stems = pd.Series('*', index=psm_df.index)
+            _has_file = False
+
+        for idx in scans.index:
+            scan_val = scans[idx]
+            raw_seq = seqs[idx]
+
+            if using_annotated_seq:
+                # Annotated Sequence: strip flanking residues & mod annotations
+                # e.g. K.PEPTM(Oxidation)IDEK.R  or  R.PEPTc[+57]IDEK.F
+                if len(raw_seq) > 4 and raw_seq[1] == '.' and raw_seq[-2] == '.':
+                    raw_seq = raw_seq[2:-2]
+                # Remove everything inside (...) or [...] brackets, then
+                # keep only uppercase letters (the actual amino acids).
+                raw_seq = re.sub(r'\([^)]*\)', '', raw_seq)
+                raw_seq = re.sub(r'\[[^\]]*\]', '', raw_seq)
+                clean_seq = ''.join(c for c in raw_seq if c.isupper())
+            else:
+                # Clean Sequence column — already contains the plain peptide
+                clean_seq = raw_seq.strip()
+
+            if not clean_seq:
+                continue
+
+            mod_str = ''
+            mod_sites_str = ''
+            m_raw = mods_raw[idx]
+            if mod_col and m_raw and m_raw.lower() not in ('nan', ''):
+                mod_str, mod_sites_str = _pd_mods_to_peptdeep_format(
+                    m_raw, clean_seq)
+                # Guard: drop any modification whose site exceeds the
+                # sequence length — this avoids an IndexError inside
+                # alphabase's calc_mod_masses_for_same_len_seqs.
+                if mod_sites_str:
+                    valid_mods, valid_sites = [], []
+                    for ms, ss in zip(mod_str.split(';'),
+                                      mod_sites_str.split(';')):
+                        try:
+                            if 1 <= int(ss) <= len(clean_seq):
+                                valid_mods.append(ms)
+                                valid_sites.append(ss)
+                        except ValueError:
+                            pass
+                    mod_str = ';'.join(valid_mods)
+                    mod_sites_str = ';'.join(valid_sites)
+
+            # Composite key: "file_stem:scan" (or "*:scan" if no file col)
+            composite_key = f"{file_stems[idx]}:{scan_val}"
+            scan_to_psm[composite_key] = {
+                'sequence': clean_seq,
+                'mods': mod_str,
+                'mod_sites': mod_sites_str,
+            }
+
+        if _has_file:
+            n_files = file_stems.loc[scans.index].nunique()
+            logging.info(f"AlphaPeptDeep: loaded {len(scan_to_psm):,} PSM identifications "
+                         f"from {os.path.basename(psm_file)} "
+                         f"({n_files} raw files, composite file:scan keys)")
+        else:
+            logging.info(f"AlphaPeptDeep: loaded {len(scan_to_psm):,} PSM identifications "
+                         f"from {os.path.basename(psm_file)} "
+                         f"(no Spectrum File column — scan-only keys)")
+    except Exception as exc:
+        warnings.append(f"Could not read PSM file: {exc}")
+
+    return scan_to_psm, warnings
+
+
+def _parse_mgf_for_alphapeptdeep(mgf_path, nce, instrument, psm_file=None):
+    """
+    Parse an MGF file into a DataFrame suitable for AlphaPeptDeep calibration.
+
+    **Performance strategy** — when a PSM file is provided the function:
+      1. Loads the PSM file *first* to build a set of needed scan numbers.
+      2. Streams the MGF line-by-line, parsing only the header fields of each
+         spectrum.  If the scan number is NOT in the needed set, the
+         peak-list lines (the bulk of a 9 GB file) are **skipped entirely**.
+      3. Only spectra that match a PSM identification have their peak data
+         stored.
+
+    This avoids reading hundreds of thousands of unneeded spectra into
+    memory and reduces I/O from minutes to seconds for large MGF files.
+
+    Returns a DataFrame with columns expected by peptdeep for fine-tuning:
+    sequence, mods, mod_sites, charge, nce, instrument, precursor_mz, etc.
+    """
+    # ── Step 1: load PSM scan map ───────────────────────────────────────
+    scan_to_psm, psm_warnings = _load_psm_scan_map(psm_file)
+    for w in psm_warnings:
+        logging.warning(f"AlphaPeptDeep: {w}")
+
+    # If a PSM file was explicitly provided but no PSMs were loaded,
+    # fail fast instead of parsing the whole MGF as unidentified spectra.
+    if psm_file and not scan_to_psm:
+        logging.error(
+            "AlphaPeptDeep: no valid PSMs loaded from the provided PSM file; "
+            "calibration requires identified PSMs."
+        )
+        return pd.DataFrame()
+
+    needed_keys = set(scan_to_psm.keys()) if scan_to_psm else None
+    # Build an auxiliary set of bare scan numbers for quick pre-filtering:
+    # if a scan number doesn't appear in *any* PSM file, we can skip peaks
+    # before the TITLE line is even seen.
+    _has_wildcard_keys = any(k.startswith('*:') for k in (needed_keys or set()))
+    if needed_keys is not None:
+        _needed_bare_scans = {k.split(':', 1)[1] for k in needed_keys}
+    else:
+        _needed_bare_scans = None
+    # If no PSM file we must keep all spectra (needed_keys=None → keep all)
+
+    # ── Step 2: stream MGF, skipping unneeded spectra ───────────────────
+    spectra = []
+    # Counters for logging
+    n_total_spectra = 0
+    n_kept = 0
+    _scan_from_scans = 0   # count how many scans came from SCANS= line
+    _scan_from_title = 0   # count how many scans came from TITLE= fallback
+
+    BUFSIZE = 1 << 20  # 1 MB read buffer for large files
+    _RE_FILE_IN_TITLE = re.compile(
+        r'File:\s*"([^"]+)"', re.IGNORECASE)
+    _RE_SCAN_IN_TITLE = re.compile(
+        r'(?:scans?)[=:"]\s*"?(\d+)', re.IGNORECASE)
+
+    def _stem(path_str):
+        """Extract lowered file stem (no extension) from a path string."""
+        return os.path.splitext(os.path.basename(path_str.strip()))[0].lower()
+
+    with open(mgf_path, 'r', buffering=BUFSIZE) as f:
+        current = None
+        skip_peaks = False   # True when we know this spectrum is unneeded
+
+        for line in f:
+            sline = line.strip()
+
+            if sline == 'BEGIN IONS':
+                current = {}
+                skip_peaks = False
+                continue
+
+            if sline == 'END IONS':
+                n_total_spectra += 1
+                if current is not None and not skip_peaks and 'mzs' in current:
+                    # Final composite-key check: if we deferred the
+                    # decision (file stem wasn't known when SCANS= was
+                    # seen), resolve it now.
+                    if needed_keys is not None:
+                        scan_v = current.get('scan', '')
+                        fstem = current.get('_file_stem', '*')
+                        ckey = f"{fstem}:{scan_v}"
+                        # Try composite first, then wildcard fallback
+                        if ckey not in needed_keys:
+                            wkey = f"*:{scan_v}"
+                            if wkey not in needed_keys:
+                                current = None
+                                continue
+                    spectra.append(current)
+                    n_kept += 1
+                current = None
+                continue
+
+            if current is None:
+                continue  # outside a spectrum block
+
+            # ── Header fields ──
+            if sline.startswith('SCANS='):
+                scan_val = sline[6:].strip()
+                current['scan'] = scan_val
+                # If TITLE= already set the scan, don't double-count
+                if current.get('_scan_src') != 'TITLE':
+                    _scan_from_scans += 1
+                current['_scan_src'] = 'SCANS'
+                # Quick pre-filter: if bare scan not in any PSM file,
+                # skip peaks immediately (final check is at END IONS).
+                if _needed_bare_scans is not None and scan_val not in _needed_bare_scans:
+                    skip_peaks = True
+                continue
+
+            if sline.startswith('PEPMASS='):
+                parts = sline[8:].split()
+                current['precursor_mz'] = float(parts[0])
+                if len(parts) > 1:
+                    current['precursor_intensity'] = float(parts[1])
+                continue
+
+            if sline.startswith('CHARGE='):
+                charge_str = sline[7:].replace('+', '').replace('-', '')
+                try:
+                    current['charge'] = int(charge_str)
+                except ValueError:
+                    current['charge'] = 2
+                continue
+
+            if sline.startswith('RTINSECONDS='):
+                current['rt'] = float(sline[12:]) / 60.0
+                continue
+
+            if sline.startswith('TITLE='):
+                title = sline[6:]
+                current['title'] = title
+                # Extract raw-file stem from TITLE (e.g. File: "G:\...\Pool.raw")
+                fm = _RE_FILE_IN_TITLE.search(title)
+                if fm:
+                    current['_file_stem'] = _stem(fm.group(1))
+
+                # Fallback: extract scan number from TITLE if SCANS= not
+                # yet seen for this spectrum.  Common TITLE formats:
+                #   scans: "902"               (PD / MSConvert)
+                #   scan=12345                 (ProteoWizard)
+                #   Scan Number: 12345
+                if '_scan_src' not in current:
+                    sm = _RE_SCAN_IN_TITLE.search(title)
+                    if sm:
+                        scan_val = sm.group(1)
+                        current['scan'] = scan_val
+                        current['_scan_src'] = 'TITLE'
+                        _scan_from_title += 1
+                        if _needed_bare_scans is not None and scan_val not in _needed_bare_scans:
+                            skip_peaks = True
+                continue
+
+            # ── Peak lines (m/z  intensity) ──
+            if skip_peaks:
+                continue  # <-- the key optimisation: don't parse unneeded peaks
+
+            if sline and sline[0].isdigit():
+                parts = sline.split()
+                if len(parts) >= 2:
+                    try:
+                        if 'mzs' not in current:
+                            current['mzs'] = []
+                            current['intensities'] = []
+                        current['mzs'].append(float(parts[0]))
+                        current['intensities'].append(float(parts[1]))
+                    except ValueError:
+                        pass
+
+    if needed_keys is not None:
+        logging.info(f"AlphaPeptDeep: streamed {n_total_spectra:,} MGF spectra, "
+                     f"kept {n_kept:,} matching PSM scans "
+                     f"(skipped {n_total_spectra - n_kept:,})")
+        # Diagnostic: scan-number source breakdown
+        n_no_scan = n_total_spectra - _scan_from_scans - _scan_from_title
+        if n_no_scan > 0:
+            logging.warning(
+                f"AlphaPeptDeep: {n_no_scan:,}/{n_total_spectra:,} MGF spectra "
+                f"had no scan number (no SCANS= or parseable TITLE=). "
+                f"These spectra cannot be matched to PSMs."
+            )
+        logging.info(f"AlphaPeptDeep: scan source — SCANS= field: "
+                     f"{_scan_from_scans:,}, TITLE= fallback: "
+                     f"{_scan_from_title:,}")
+        # Diagnostic: show sample composite keys from kept spectra
+        if spectra:
+            _sample_mgf_keys = []
+            for _sp in spectra[:5]:
+                _sk = _sp.get('scan', '?')
+                _fs = _sp.get('_file_stem', '*')
+                _sample_mgf_keys.append(f"{_fs}:{_sk}")
+            logging.info(f"AlphaPeptDeep: sample MGF composite keys: {_sample_mgf_keys}")
+        # Show sample PSM keys
+        _sample_psm_keys = list(scan_to_psm.keys())[:5]
+        logging.info(f"AlphaPeptDeep: sample PSM composite keys: {_sample_psm_keys}")
+        # Show unique file stems from MGF
+        _unique_mgf_stems = set()
+        for _sp in spectra[:1000]:
+            _unique_mgf_stems.add(_sp.get('_file_stem', '*'))
+        if len(spectra) > 1000:
+            for _sp in spectra[-100:]:
+                _unique_mgf_stems.add(_sp.get('_file_stem', '*'))
+        logging.info(f"AlphaPeptDeep: MGF file stems (sampled): {sorted(_unique_mgf_stems)}")
+    else:
+        logging.info(f"AlphaPeptDeep: parsed {n_total_spectra:,} MGF spectra (no PSM filter)")
+
+    if not spectra:
+        return pd.DataFrame()
+
+    # ── Step 3: build DataFrame ─────────────────────────────────────────
+    rows = []
+    for spec in spectra:
+        charge = spec.get('charge', 2)
+        pmz = spec.get('precursor_mz', 0)
+        rt = spec.get('rt', 0)
+        scan_key = spec.get('scan', '')
+        file_stem = spec.get('_file_stem', '*')
+        # Look up PSM with composite key; fall back to wildcard
+        composite_key = f"{file_stem}:{scan_key}"
+        psm_info = scan_to_psm.get(composite_key)
+        if psm_info is None:
+            psm_info = scan_to_psm.get(f"*:{scan_key}", {})
+
+        rows.append({
+            'precursor_mz': pmz,
+            'charge': charge,
+            'rt': rt,
+            'nce': nce,
+            'instrument': instrument,
+            'sequence': psm_info.get('sequence', ''),
+            'mods': psm_info.get('mods', ''),
+            'mod_sites': psm_info.get('mod_sites', ''),
+            'scan_num': scan_key,
+            'raw_name': spec.get('title', ''),
+            'spec_mzs': np.array(spec['mzs'], dtype=np.float64),
+            'spec_intensities': np.array(spec['intensities'], dtype=np.float64),
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Filter to only spectra with identified sequences
+    if scan_to_psm:
+        identified = df[df['sequence'].str.len() > 0]
+        match_pct = 100.0 * len(identified) / len(df) if len(df) else 0
+        logging.info(f"AlphaPeptDeep: {len(identified)}/{len(df)} spectra "
+                     f"matched to PSM identifications ({match_pct:.1f}%)")
+
+        # Warn about suspicious match rates
+        if len(identified) == 0:
+            logging.warning(
+                "AlphaPeptDeep: ZERO spectra matched PSM scan numbers. "
+                "Check that the MGF and PSM files come from the same "
+                "raw acquisition. Ensure 'First Scan' values in the PSM "
+                "file correspond to 'SCANS=' values in the MGF."
+            )
+        elif match_pct > 95 and len(df) > 2 * len(scan_to_psm):
+            logging.warning(
+                f"AlphaPeptDeep: suspiciously high match rate "
+                f"({len(identified):,} matched from {len(scan_to_psm):,} "
+                f"unique PSM scans). Verify that MGF scan numbering "
+                f"corresponds to PSM scan numbering."
+            )
+
+        if len(identified) >= 10:
+            df = identified
+        else:
+            logging.warning(f"AlphaPeptDeep: only {len(identified)} identified spectra — "
+                            f"need ≥10. Using all {len(df)} spectra (unidentified).")
+
+    # Guard against invalid sequences that can break alphabase fragment allocation
+    # (e.g. empty or 1-aa peptides causing negative fragment dimensions).
+    if not df.empty:
+        _seq = df['sequence'].astype(str).str.strip()
+        _valid_seq_mask = _seq.str.match(r'^[ACDEFGHIKLMNPQRSTVWY]{2,}$', na=False)
+        n_invalid = int((~_valid_seq_mask).sum())
+        if n_invalid > 0:
+            logging.warning(f"AlphaPeptDeep: dropping {n_invalid:,} invalid/short sequences before calibration")
+            df = df.loc[_valid_seq_mask].copy()
+
+    return df
+
+
+def _pd_mods_to_peptdeep_format(mod_string, sequence):
+    """
+    Convert Proteome Discoverer-style modification strings to peptdeep format.
+
+    Input format examples:
+        'C28(Carbamidomethyl)'
+        'C1(Carbamidomethyl); M16(Oxidation)'
+
+    Returns (mods_str, mod_sites_str):
+        mods_str     = 'Carbamidomethyl@C;Oxidation@M' (peptdeep format)
+        mod_sites_str = '28;16' (1-based positions)
+    """
+    if not mod_string or mod_string.strip().lower() == 'nan':
+        return '', ''
+
+    import re
+    mods_parts = []
+    sites_parts = []
+    for token in re.split(r';\s*', mod_string.strip()):
+        token = token.strip()
+        if not token:
+            continue
+        m = re.match(r'^([A-Z])(\d+)\((.+?)\)$', token)
+        if m:
+            residue, pos, mod_name = m.group(1), m.group(2), m.group(3)
+            mods_parts.append(f'{mod_name}@{residue}')
+            sites_parts.append(pos)
+        else:
+            # Try format without residue prefix: '10(Oxidation)'
+            m2 = re.match(r'^(\d+)[xX]?(.+)$', token)
+            if m2:
+                pos, mod_name = m2.group(1), m2.group(2).strip('() ')
+                # Infer residue from sequence position
+                try:
+                    idx = int(pos) - 1
+                    residue = sequence[idx] if 0 <= idx < len(sequence) else '?'
+                except (ValueError, IndexError):
+                    residue = '?'
+                mods_parts.append(f'{mod_name}@{residue}')
+                sites_parts.append(pos)
+
+    return ';'.join(mods_parts), ';'.join(sites_parts)
+
+
+def _match_observed_to_predicted(cal_df, frag_mz_df, psm_df, frag_tol_ppm=20.0):
+    """
+    Build a ``matched_intensity_df`` suitable for
+    ``ModelManager.train_ms2_model()`` by matching observed spectrum peaks
+    against the *predicted* fragment m/z values from ``frag_mz_df``.
+
+    Parameters
+    ----------
+    cal_df : pd.DataFrame
+        Precursor DataFrame (has ``frag_start_idx``, ``frag_stop_idx``
+        populated by ``predict_all()``).
+    frag_mz_df : pd.DataFrame
+        Fragment m/z DataFrame from ``predict_all()``; same shape as the
+        fragment intensity DataFrame — one row per fragment position, columns
+        are charged fragment types (b_z1, b_z2, y_z1, y_z2, …).
+    psm_df : pd.DataFrame
+        Original parsed-MGF DataFrame.  Must have ``spec_mzs`` and
+        ``spec_intensities`` columns (numpy arrays of observed peaks).
+    frag_tol_ppm : float
+        Mass tolerance in ppm for peak matching.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame with the same index and columns as ``frag_mz_df``,
+        but filled with *matched observed intensities* (0 where no peak
+        matches).
+    """
+    frag_mz_arr = frag_mz_df.values
+    matched = np.zeros_like(frag_mz_arr, dtype=np.float64)
+    frag_cols = list(frag_mz_df.columns)
+
+    # Pre-extract arrays to avoid repeated .iloc overhead (Fix #6)
+    frag_starts = cal_df['frag_start_idx'].values.astype(int)
+    frag_stops = cal_df['frag_stop_idx'].values.astype(int)
+    spec_mzs_list = psm_df['spec_mzs'].values
+    spec_ints_list = psm_df['spec_intensities'].values
+
+    for row_idx in range(len(cal_df)):
+        frag_start = frag_starts[row_idx]
+        frag_stop = frag_stops[row_idx]
+        obs_mzs = spec_mzs_list[row_idx]
+        obs_ints = spec_ints_list[row_idx]
+        if obs_mzs is None or len(obs_mzs) == 0:
+            continue
+        obs_mzs = np.asarray(obs_mzs, dtype=np.float64)
+        obs_ints = np.asarray(obs_ints, dtype=np.float64)
+        sort_idx = np.argsort(obs_mzs)
+        obs_mzs = obs_mzs[sort_idx]
+        obs_ints = obs_ints[sort_idx]
+
+        # Vectorise the inner frag_row × col loop: batch all
+        # predicted m/z values into two searchsorted calls instead
+        # of one per (row, col).
+        pred_block = frag_mz_arr[frag_start:frag_stop, :]
+        flat_pred = pred_block.ravel()
+        valid_mask = flat_pred > 0
+        valid_mzs = flat_pred[valid_mask]
+        if len(valid_mzs) == 0:
+            continue
+
+        tols = valid_mzs * frag_tol_ppm * 1e-6
+        lo_indices = np.searchsorted(obs_mzs, valid_mzs - tols)
+        hi_indices = np.searchsorted(obs_mzs, valid_mzs + tols, side='right')
+
+        has_match = hi_indices > lo_indices
+        if not has_match.any():
+            continue
+
+        valid_positions = np.where(valid_mask)[0]
+        flat_matched = np.zeros(len(flat_pred), dtype=np.float64)
+
+        # Single-peak matches (most common): direct array indexing
+        single = has_match & ((hi_indices - lo_indices) == 1)
+        if single.any():
+            flat_matched[valid_positions[single]] = obs_ints[lo_indices[single]]
+
+        # Multi-peak matches: need argmax per window (rare)
+        multi_idx = np.where(has_match & ~single)[0]
+        for k in multi_idx:
+            lo, hi = lo_indices[k], hi_indices[k]
+            best = lo + np.argmax(obs_ints[lo:hi])
+            flat_matched[valid_positions[k]] = obs_ints[best]
+
+        matched[frag_start:frag_stop, :] = flat_matched.reshape(pred_block.shape)
+
+    # Normalise per-spectrum: max intensity → 1  (peptdeep expects this)
+    for row_idx in range(len(cal_df)):
+        frag_start = frag_starts[row_idx]
+        frag_stop = frag_stops[row_idx]
+        spec_block = matched[frag_start:frag_stop, :]
+        mx = spec_block.max()
+        if mx > 0:
+            matched[frag_start:frag_stop, :] = spec_block / mx
+
+    matched_df = pd.DataFrame(matched, columns=frag_cols)
+    return matched_df
+
+
+def _validate_calibration_mgf(mgf_path, expected_frag_type, expected_nce,
+                               expected_instrument, target_charges=None):
+    """
+    Validate a calibration MGF file before using it for AlphaPeptDeep
+    transfer learning.  Checks:
+      1. File readability and minimum spectrum count
+      2. Fragmentation-type consistency (from TITLE / ACTIVATION / filter strings)
+      3. NCE consistency (from TITLE / filter strings)
+      4. Charge-state distribution overlap with target peptides
+
+    Returns
+    -------
+    (is_ok, warnings) : (bool, list[str])
+        is_ok is True when no blocking issues are found.
+        warnings is a list of human-readable warning strings.
+    """
+    warnings_list = []
+    if not mgf_path or not os.path.exists(mgf_path):
+        return False, ["Calibration MGF file not found."]
+
+    charges_in_mgf = []
+    nce_values = []
+    frag_types_found = set()
+    n_spectra = 0
+
+    try:
+        with open(mgf_path, 'r') as fh:
+            for line in fh:
+                line = line.strip()
+                if line == 'BEGIN IONS':
+                    n_spectra += 1
+                    continue
+
+                # --- Extract charge ---
+                if line.startswith('CHARGE='):
+                    ch_str = line[7:].replace('+', '').replace('-', '')
+                    try:
+                        charges_in_mgf.append(int(ch_str))
+                    except ValueError:
+                        pass
+
+                # --- Extract NCE from filter string in TITLE ---
+                if line.startswith('TITLE=') or line.startswith('FILTER='):
+                    txt = line.split('=', 1)[1] if '=' in line else ''
+                    # Thermo filter: "...@hcd30.00..." or "...@cid35.00..."
+                    nce_m = re.search(r'@(\w+?)([\d.]+)', txt, re.IGNORECASE)
+                    if nce_m:
+                        frag_types_found.add(nce_m.group(1).upper())
+                        try:
+                            nce_values.append(float(nce_m.group(2)))
+                        except ValueError:
+                            pass
+
+                # --- Explicit ACTIVATION= field (some MGF exporters) ---
+                if line.startswith('ACTIVATION='):
+                    act = line.split('=', 1)[1].strip().upper()
+                    if act:
+                        frag_types_found.add(act)
+
+                # --- Explicit HCD_ENERGY= field ---
+                if line.startswith('HCD_ENERGY=') or line.startswith('COLLISION_ENERGY='):
+                    try:
+                        nce_values.append(float(line.split('=', 1)[1]))
+                    except (ValueError, IndexError):
+                        pass
+    except Exception as exc:
+        return False, [f"Could not read MGF file: {exc}"]
+
+    # --- Minimum spectra ---
+    if n_spectra < 10:
+        warnings_list.append(
+            f"Only {n_spectra} spectra in MGF — need ≥10 for calibration.  "
+            f"Recommend ≥50 for meaningful improvement."
+        )
+
+    # --- Fragmentation-type mismatch ---
+    if frag_types_found:
+        normalised_frag = set()
+        for ft in frag_types_found:
+            if ft in ('HCD', 'BEAM', 'BEAM-TYPE CID'):
+                normalised_frag.add('HCD')
+            elif ft in ('CID', 'IT-CID', 'ION TRAP CID'):
+                normalised_frag.add('CID')
+            else:
+                normalised_frag.add(ft)
+        if expected_frag_type.upper() not in normalised_frag:
+            warnings_list.append(
+                f"Fragmentation mismatch: calibration MGF contains "
+                f"{', '.join(sorted(normalised_frag))} spectra but "
+                f"'{expected_frag_type}' is selected.  "
+                f"Using mismatched fragmentation data will degrade prediction accuracy."
+            )
+
+    # --- NCE mismatch ---
+    if nce_values:
+        median_nce = float(np.median(nce_values))
+        if abs(median_nce - expected_nce) > 3.0:
+            warnings_list.append(
+                f"NCE mismatch: calibration spectra have a median NCE of "
+                f"{median_nce:.1f} but {expected_nce:.1f} is selected.  "
+                f"Consider setting the Calibration NCE to {median_nce:.0f}."
+            )
+
+    # --- Charge-state distribution overlap ---
+    if charges_in_mgf and target_charges:
+        from collections import Counter
+        mgf_charge_dist = Counter(charges_in_mgf)
+        tgt_charge_dist = Counter(target_charges)
+        mgf_charge_set = set(mgf_charge_dist.keys())
+        tgt_charge_set = set(tgt_charge_dist.keys())
+        missing_in_mgf = tgt_charge_set - mgf_charge_set
+        if missing_in_mgf:
+            warnings_list.append(
+                f"Charge-state gap: target peptides include charge state(s) "
+                f"{', '.join(str(c)+'+' for c in sorted(missing_in_mgf))} "
+                f"but no calibration spectra have those charges.  "
+                f"Prediction accuracy may be reduced for those charge states."
+            )
+        # Check distribution skew
+        mgf_total = sum(mgf_charge_dist.values())
+        tgt_total = sum(tgt_charge_dist.values())
+        for cs in tgt_charge_set & mgf_charge_set:
+            mgf_frac = mgf_charge_dist[cs] / mgf_total
+            tgt_frac = tgt_charge_dist[cs] / tgt_total
+            if tgt_frac > 0.15 and mgf_frac < 0.02:
+                warnings_list.append(
+                    f"Charge {cs}+ represents {tgt_frac:.0%} of target peptides "
+                    f"but only {mgf_frac:.0%} of calibration spectra.  "
+                    f"Consider adding more {cs}+ PSMs to the calibration MGF."
+                )
+
+    is_ok = not any('mismatch' in w.lower() for w in warnings_list)
+    return is_ok, warnings_list
+
+
+def _detect_instrument_from_file(file_path):
+    """
+    Auto-detect the instrument type from an mzML or .raw file metadata.
+
+    Returns one of the AlphaPeptDeep instrument labels
+    ('QE', 'Lumos', 'timsTOF', 'SciexTOF', 'ThermoTOF') or None
+    if the instrument cannot be determined.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+
+    instrument_text = ''
+
+    # --- mzML: parse the <instrumentConfiguration> XML element ---
+    if ext == '.mzml':
+        try:
+            import xml.etree.ElementTree as ET
+            # Only read the first 200 KB to find the header metadata
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                header = fh.read(200_000)
+
+            # Extract the instrument model CV param
+            # Pattern: <cvParam ... name="instrument model" value="..."/>
+            # or accession MS:1000031 / child terms
+            model_match = re.search(
+                r'<cvParam[^>]*(?:accession="MS:1000031"|name="instrument model")[^>]*'
+                r'value="([^"]*)"',
+                header, re.IGNORECASE
+            )
+            if model_match:
+                instrument_text = model_match.group(1)
+            else:
+                # Try broader search for known instrument names in CV params
+                for pattern in [r'Q Exactive', r'Orbitrap Fusion', r'Lumos',
+                                r'Eclipse', r'Astral', r'Exploris',
+                                r'timsTOF', r'TripleTOF', r'SCIEX']:
+                    if re.search(pattern, header, re.IGNORECASE):
+                        instrument_text = pattern
+                        break
+        except Exception as exc:
+            logging.debug(f"Instrument detection from mzML failed: {exc}")
+
+    # --- .raw: try fisher_py ---
+    elif ext == '.raw' and _check_fisher_available():
+        try:
+            from fisher_py import RawFile
+            raw = RawFile(file_path)
+            instrument_text = str(getattr(raw, 'instrument_model', ''))
+            if not instrument_text:
+                # Try the first scan's filter to infer Thermo vs Bruker
+                filt = raw.get_scan_event_str_from_scan_number(raw.first_scan)
+                if 'FTMS' in filt or 'ITMS' in filt:
+                    instrument_text = 'Thermo'
+        except Exception as exc:
+            logging.debug(f"Instrument detection from .raw failed: {exc}")
+
+    # --- Map free-text to AlphaPeptDeep instrument label ---
+    if not instrument_text:
+        return None
+
+    text_lower = instrument_text.lower()
+
+    # Mapping rules (order matters — more specific first)
+    if any(k in text_lower for k in ['astral', 'thermotof']):
+        return 'ThermoTOF'
+    if any(k in text_lower for k in ['tims', 'bruker']):
+        return 'timsTOF'
+    if any(k in text_lower for k in ['tripletof', 'sciex', 'sciextof']):
+        return 'SciexTOF'
+    if any(k in text_lower for k in ['fusion', 'lumos', 'eclipse', 'tribrid']):
+        return 'Lumos'
+    if any(k in text_lower for k in ['q exactive', 'qe', 'exploris', 'hf-x', 'hfx', 'hf ']):
+        return 'QE'
+    # Generic Thermo → default to Lumos (most common PRM platform)
+    if 'thermo' in text_lower or 'orbitrap' in text_lower:
+        return 'Lumos'
+
+    return None
+
+
+def alphapeptdeep_predict_intensities(
+    peptide, modification, charge,
+    fragmentation_type='HCD', instrument='Lumos', nce=30.0,
+    model_manager=None
+):
+    """
+    Predict fragment-ion relative intensities for a peptide using AlphaPeptDeep.
+
+    Returns
+    -------
+    dict  {(ion_type, fragment_position, ion_charge): predicted_intensity}
+        Same format as ms2pip_predict_intensities() for drop-in compatibility.
+        predicted_intensity is normalised to [0, 1] (max = 1).
+    Returns empty dict when AlphaPeptDeep is unavailable or the prediction fails.
+    """
+    _ensure_peptdeep()
+    if not _ALPHAPEPTDEEP_AVAILABLE:
+        return {}
+
+    seq = peptide[6:] if peptide.startswith('DECOY_') else peptide
+
+    cache_key = (seq, modification if modification and str(modification) != 'nan' else '',
+                 charge, fragmentation_type, instrument, nce)
+    with _apd_cache_lock:
+        if cache_key in _apd_cache:
+            return _apd_cache[cache_key]
+
+    try:
+        mgr = model_manager or _get_apd_model_manager(
+            instrument=instrument, nce=nce, fragmentation_type=fragmentation_type
+        )
+        if mgr is None:
+            return {}
+
+        # Build peptdeep input DataFrame
+        mods_str, mod_sites_str = _convert_pd_mods_to_alphapeptdeep(seq, modification)
+
+        precursor_df = pd.DataFrame([{
+            'sequence': seq,
+            'mods': mods_str,
+            'mod_sites': mod_sites_str,
+            'charge': int(charge),
+            'nce': float(nce),
+            'instrument': instrument,
+        }])
+
+        # Predict
+        result = mgr.predict_ms2(precursor_df)
+
+        # Parse result into our standard format
+        preds = _parse_alphapeptdeep_ms2_result(result, len(seq))
+
+        with _apd_cache_lock:
+            _apd_cache[cache_key] = preds
+        return preds
+
+    except Exception as exc:
+        logging.debug(f"AlphaPeptDeep prediction failed for {seq}: {exc}")
+        with _apd_cache_lock:
+            _apd_cache[cache_key] = {}
+        return {}
+
+
+def _convert_pd_mods_to_alphapeptdeep(sequence, modification):
+    """
+    Convert Proteome Discoverer modification format to AlphaPeptDeep format.
+
+    PD format:  '1xOxidation [M3]; 1xCarbamidomethyl [C9]'
+    APD format: mods='Oxidation@M;Carbamidomethyl@C', mod_sites='3;9'
+
+    AlphaBase (the engine behind peptdeep) requires the ``ModName@Site`` key
+    so it can look up the mass shift in its modification table.
+
+    Returns
+    -------
+    (mods_str, mod_sites_str) : tuple of str
+    """
+    if not modification or str(modification) == 'nan' or not str(modification).strip():
+        return '', ''
+
+    mods = []
+    sites = []
+    mod_str = str(modification)
+    try:
+        # Handle N-terminal / C-terminal modifications first
+        # PD: 'Acetyl [N-Term]' or 'Acetyl [Protein N-Term]'
+        for m in re.finditer(r'(?:\d+x)?(\S+?)\s*\[(?:Protein\s+)?N-[Tt]erm\]', mod_str):
+            mod_name = m.group(1).strip()
+            mods.append(f'{mod_name}@Any_N-term')
+            sites.append('0')
+        for m in re.finditer(r'(?:\d+x)?(\S+?)\s*\[(?:Protein\s+)?C-[Tt]erm\]', mod_str):
+            mod_name = m.group(1).strip()
+            mods.append(f'{mod_name}@Any_C-term')
+            sites.append(str(len(sequence)))  # C-term position = seq length
+        # Handle residue-specific modifications: '1xCarbamidomethyl [C9]' or '2xCarbamidomethyl [C4; C10]'
+        for m in re.finditer(r'(?:\d+x)?(\S+?)\s*\[([^\]]+)\]', mod_str):
+            mod_name = m.group(1).strip()
+            bracket = m.group(2)
+            # Skip N-term / C-term entries (already handled above)
+            if re.search(r'[NC]-[Tt]erm', bracket):
+                continue
+            for pm in re.finditer(r'([A-Za-z])(\d+)', bracket):
+                residue = pm.group(1)          # e.g. 'C', 'M', 'S', …
+                pos     = int(pm.group(2))     # 1-based in PD, 1-based in peptdeep
+                mods.append(f'{mod_name}@{residue}')
+                sites.append(str(pos))
+    except Exception:
+        return '', ''
+
+    return ';'.join(mods), ';'.join(sites)
+
+
+def _parse_alphapeptdeep_ms2_result(result, seq_len):
+    """
+    Parse AlphaPeptDeep MS2 prediction result into our standard
+    {(ion_type, position, charge): intensity} format.
+
+    AlphaPeptDeep predicts b/y ions of charge 1 and 2, plus modification-loss
+    variants.  The output is a flat array of shape (seq_len-1, n_frag_types).
+
+    The fragment types are ordered as:
+      b_z1, b_z2, y_z1, y_z2, b_modloss_z1, b_modloss_z2, y_modloss_z1, y_modloss_z2
+    """
+    preds = {}
+
+    try:
+        if result is None:
+            return preds
+
+        # peptdeep returns a DataFrame or dict with predicted intensities
+        if isinstance(result, pd.DataFrame):
+            # Columns are fragment type names, rows are positions
+            for col_idx, frag_type in enumerate(_APD_FRAG_TYPES):
+                # Parse fragment type: e.g. 'b_z1' -> ion_type='b', charge=1
+                parts = frag_type.split('_')
+                if 'modloss' in frag_type:
+                    continue  # Skip mod-loss ions (not in our standard format)
+                ion_type = parts[0]  # 'b' or 'y'
+                ion_charge = int(parts[1].replace('z', ''))
+
+                if col_idx < result.shape[1]:
+                    intensities = result.iloc[:, col_idx].values
+                    for pos_idx, intensity in enumerate(intensities):
+                        frag_pos = pos_idx + 1
+                        if float(intensity) > 0:
+                            preds[(ion_type, frag_pos, ion_charge)] = float(intensity)
+
+        elif isinstance(result, dict):
+            # Handle dict-style result
+            for frag_type, intensities in result.items():
+                frag_type_str = str(frag_type).lower()
+                if 'modloss' in frag_type_str:
+                    continue
+                parts = frag_type_str.split('_')
+                if len(parts) < 2:
+                    continue
+                ion_type = parts[0]
+                ion_charge = int(parts[1].replace('z', ''))
+
+                if isinstance(intensities, (list, tuple, np.ndarray)):
+                    for pos_idx, intensity in enumerate(intensities):
+                        frag_pos = pos_idx + 1
+                        if float(intensity) > 0:
+                            preds[(ion_type, frag_pos, ion_charge)] = float(intensity)
+
+        elif isinstance(result, np.ndarray):
+            # Flat array: shape (seq_len-1, n_frag_types) or (n_frag_types * (seq_len-1),)
+            if result.ndim == 2:
+                for col_idx, frag_type in enumerate(_APD_FRAG_TYPES):
+                    if 'modloss' in frag_type:
+                        continue
+                    parts = frag_type.split('_')
+                    ion_type = parts[0]
+                    ion_charge = int(parts[1].replace('z', ''))
+                    if col_idx < result.shape[1]:
+                        for pos_idx in range(result.shape[0]):
+                            intensity = float(result[pos_idx, col_idx])
+                            if intensity > 0:
+                                preds[(ion_type, pos_idx + 1, ion_charge)] = intensity
+            elif result.ndim == 1:
+                n_pos = seq_len - 1
+                n_types = len(_APD_FRAG_TYPES)
+                for col_idx, frag_type in enumerate(_APD_FRAG_TYPES):
+                    if 'modloss' in frag_type:
+                        continue
+                    parts = frag_type.split('_')
+                    ion_type = parts[0]
+                    ion_charge = int(parts[1].replace('z', ''))
+                    for pos_idx in range(n_pos):
+                        flat_idx = pos_idx * n_types + col_idx
+                        if flat_idx < len(result):
+                            intensity = float(result[flat_idx])
+                            if intensity > 0:
+                                preds[(ion_type, pos_idx + 1, ion_charge)] = intensity
+
+    except Exception as exc:
+        logging.debug(f"AlphaPeptDeep result parsing failed: {exc}")
+        return {}
+
+    # Normalise to [0, 1]
+    if preds:
+        max_val = max(preds.values())
+        if max_val > 0:
+            preds = {k: v / max_val for k, v in preds.items()}
+
+    return preds
+
+
+def clear_alphapeptdeep_cache():
+    """Free the AlphaPeptDeep prediction cache between runs."""
+    with _apd_cache_lock:
+        _apd_cache.clear()
+
+
+def alphapeptdeep_predict_all_peptides(
+    peptides_info,
+    fragmentation_type='HCD',
+    instrument='Lumos',
+    nce=30.0,
+    calibration_mgf=None,
+    calibration_nce=None,
+    calibration_psm=None,
+    calibrated_model_folder=None,
+):
+    """
+    Pre-compute AlphaPeptDeep predicted intensities for ALL peptides.
+
+    This is the AlphaPeptDeep equivalent of ``ms2pip_predict_all_peptides``.
+    It should be called ONCE from the main thread before spawning file-
+    processing threads.
+
+    When ``calibration_mgf`` is provided, the pretrained model is first
+    fine-tuned on the user's PSM data for instrument-specific accuracy.
+
+    Device is auto-detected: GPU (CUDA) when available, CPU otherwise.
+
+    Parameters
+    ----------
+    peptides_info : list of tuples
+        Each element is (peptide, precursor_mz, charge, modification, ...).
+    fragmentation_type : str
+        'HCD' or 'CID'.
+    instrument : str
+        Instrument type for AlphaPeptDeep.
+    nce : float
+        Normalized collision energy.
+    calibration_mgf : str or None
+        Path to MGF for transfer learning.
+    calibration_nce : float or None
+        NCE of the calibration MGF spectra.
+    calibration_psm : str or None
+        Path to PSM file (xlsx/csv/tsv) paired with the calibration MGF.
+        Supplies peptide identities (sequence, mods) for calibration spectra.
+
+    Returns
+    -------
+    dict  {peptide_index: {(ion_type, position, charge): predicted_intensity}}
+    """
+    _ensure_peptdeep()
+    if not _ALPHAPEPTDEEP_AVAILABLE:
+        return {}
+
+    all_preds = {}
+    n_total = len(peptides_info)
+
+    logging.info(f"AlphaPeptDeep: predicting {n_total} peptides "
+                 f"(instrument={instrument}, NCE={nce}, frag={fragmentation_type})")
+
+    # Initialize model (with optional calibration)
+    mgr = _get_apd_model_manager(
+        instrument=instrument,
+        nce=nce,
+        fragmentation_type=fragmentation_type,
+        calibration_mgf=calibration_mgf,
+        calibration_nce=calibration_nce,
+        calibration_psm=calibration_psm,
+        calibrated_model_folder=calibrated_model_folder,
+    )
+    if mgr is None:
+        logging.error("AlphaPeptDeep: failed to initialize model manager")
+        return {}
+
+    # Attempt batch prediction
+    try:
+        batch_rows = []
+        idx_map = []  # maps batch row index → original peptide index
+
+        for pidx, pinfo in enumerate(peptides_info):
+            pep, _pmz, pch, pmod = pinfo[0], pinfo[1], pinfo[2], pinfo[3]
+            seq = pep[6:] if pep.startswith('DECOY_') else pep
+
+            cache_key = (seq, pmod if pmod and str(pmod) != 'nan' else '',
+                         pch, fragmentation_type, instrument, nce)
+            with _apd_cache_lock:
+                if cache_key in _apd_cache:
+                    all_preds[pidx] = _apd_cache[cache_key]
+                    continue
+
+            mods_str, mod_sites_str = _convert_pd_mods_to_alphapeptdeep(seq, pmod)
+            batch_rows.append({
+                'sequence': seq,
+                'mods': mods_str,
+                'mod_sites': mod_sites_str,
+                'charge': int(pch),
+                'nce': float(nce),
+                'instrument': instrument,
+            })
+            idx_map.append(pidx)
+
+        if batch_rows:
+            logging.info(f"AlphaPeptDeep: batch predicting {len(batch_rows)} peptides "
+                         f"({n_total - len(batch_rows)} cached)")
+
+            batch_df = pd.DataFrame(batch_rows)
+
+            try:
+                # Use predict_all for multiprocessing support on CPU
+                # peptdeep default threshold is 3000 precursors before
+                # spawning sub-processes — keep that default so small
+                # batches (< 3000) avoid heavy per-process model-loading.
+                # Force single-process to avoid multiprocessing deadlocks
+                # on Windows (spawn start-method inside daemon threads) and to
+                # prevent loading the ~2 GB model in multiple child processes.
+                pred_result = mgr.predict_all(
+                    batch_df,
+                    predict_items=['ms2'],
+                    multiprocessing=False,
+                )
+                frag_int_df = pred_result.get('fragment_intensity_df')
+
+                # Parse batch results using frag_start_idx / frag_stop_idx
+                if frag_int_df is not None and 'frag_start_idx' in batch_df.columns:
+                    for batch_idx, pidx in enumerate(idx_map):
+                        pinfo = peptides_info[pidx]
+                        pep, _pmz, pch, pmod = pinfo[0], pinfo[1], pinfo[2], pinfo[3]
+                        seq = pep[6:] if pep.startswith('DECOY_') else pep
+
+                        try:
+                            frag_start = int(batch_df.iloc[batch_idx]['frag_start_idx'])
+                            frag_stop = int(batch_df.iloc[batch_idx]['frag_stop_idx'])
+                            pep_frag_df = frag_int_df.iloc[frag_start:frag_stop]
+                            preds = _parse_alphapeptdeep_fragment_block(pep_frag_df)
+                        except Exception:
+                            preds = {}
+
+                        cache_key = (seq, pmod if pmod and str(pmod) != 'nan' else '',
+                                     pch, fragmentation_type, instrument, nce)
+                        with _apd_cache_lock:
+                            _apd_cache[cache_key] = preds
+                        all_preds[pidx] = preds
+
+                    _n_ok = sum(1 for v in all_preds.values() if v)
+                    logging.info(f"AlphaPeptDeep: batch prediction complete — "
+                                 f"{_n_ok}/{n_total} peptides have predictions")
+                    return all_preds
+
+            except Exception as exc:
+                logging.warning(f"AlphaPeptDeep batch prediction failed ({exc}); "
+                                f"falling back to sequential prediction.")
+
+        # Fallback: sequential prediction
+        if batch_rows:
+            logging.info(f"AlphaPeptDeep: sequential prediction for {len(batch_rows)} peptides")
+            t0 = time.time()
+            for batch_idx, pidx in enumerate(idx_map):
+                pinfo = peptides_info[pidx]
+                pep, _pmz, pch, pmod = pinfo[0], pinfo[1], pinfo[2], pinfo[3]
+                all_preds[pidx] = alphapeptdeep_predict_intensities(
+                    pep, pmod, pch, fragmentation_type, instrument, nce,
+                    model_manager=mgr
+                )
+                if (batch_idx + 1) % 50 == 0 or batch_idx + 1 == len(batch_rows):
+                    elapsed = time.time() - t0
+                    rate = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+                    logging.info(f"  AlphaPeptDeep progress: {batch_idx + 1}/{len(batch_rows)} "
+                                 f"({rate:.1f} peptides/s, {elapsed:.1f}s elapsed)")
+
+    except Exception as exc:
+        logging.error(f"AlphaPeptDeep prediction failed: {exc}")
+
+    return all_preds
+
+
+def _parse_alphapeptdeep_ms2_row(row_result, seq_len):
+    """Parse a single row from AlphaPeptDeep batch MS2 prediction."""
+    preds = {}
+    try:
+        for frag_type in _APD_FRAG_TYPES:
+            if 'modloss' in frag_type:
+                continue
+            parts = frag_type.split('_')
+            ion_type = parts[0]
+            ion_charge = int(parts[1].replace('z', ''))
+
+            # Try accessing by fragment type column name
+            if hasattr(row_result, frag_type):
+                vals = getattr(row_result, frag_type)
+                if isinstance(vals, (list, tuple, np.ndarray)):
+                    for pos_idx, intensity in enumerate(vals):
+                        if float(intensity) > 0:
+                            preds[(ion_type, pos_idx + 1, ion_charge)] = float(intensity)
+    except Exception as exc:
+        logging.debug(f"AlphaPeptDeep row parsing failed: {exc}")
+
+    # Normalise to [0, 1]
+    if preds:
+        max_val = max(preds.values())
+        if max_val > 0:
+            preds = {k: v / max_val for k, v in preds.items()}
+    return preds
+
+
+def _parse_alphapeptdeep_fragment_block(frag_block_df):
+    """
+    Parse a fragment intensity DataFrame block for a single peptide
+    into our standard ``{(ion_type, position, charge): intensity}`` format.
+
+    ``frag_block_df`` is a slice of the full fragment_intensity_df
+    (rows ``frag_start_idx`` to ``frag_stop_idx``) with columns
+    like ``b_z1``, ``b_z2``, ``y_z1``, ``y_z2``, etc.
+    """
+    preds = {}
+    try:
+        for col in frag_block_df.columns:
+            if 'modloss' in col:
+                continue
+            parts = col.split('_')
+            if len(parts) < 2:
+                continue
+            ion_type = parts[0]          # 'b' or 'y'
+            ion_charge = int(parts[1].replace('z', ''))
+            vals = frag_block_df[col].values
+            for pos_idx, intensity in enumerate(vals):
+                if float(intensity) > 0:
+                    preds[(ion_type, pos_idx + 1, ion_charge)] = float(intensity)
+    except Exception as exc:
+        logging.debug(f"AlphaPeptDeep fragment block parsing failed: {exc}")
+
+    # Normalise to [0, 1]
+    if preds:
+        max_val = max(preds.values())
+        if max_val > 0:
+            preds = {k: v / max_val for k, v in preds.items()}
+    return preds
+
+
+# --------------- Spectral similarity metrics --------------------------------
+
+def spectral_cosine_similarity(obs_intensities, pred_intensities):
+    """
+    Normalised dot product (cosine similarity) between square-root-transformed
+    observed and predicted intensity vectors.
+
+    Parameters
+    ----------
+    obs_intensities, pred_intensities : array-like of equal length
+        Intensity values for matched fragment ions (same ordering).
+
+    Returns
+    -------
+    float   cosine similarity in [0, 1]  (0 → orthogonal, 1 → identical)
+    """
+    obs = np.sqrt(np.asarray(obs_intensities, dtype=np.float64).clip(min=0))
+    pred = np.sqrt(np.asarray(pred_intensities, dtype=np.float64).clip(min=0))
+    norm_obs = np.linalg.norm(obs)
+    norm_pred = np.linalg.norm(pred)
+    if norm_obs == 0 or norm_pred == 0:
+        return 0.0
+    cos = np.dot(obs, pred) / (norm_obs * norm_pred)
+    return float(np.clip(cos, 0.0, 1.0))
+
+
+def spectral_contrast_angle(obs_intensities, pred_intensities):
+    """
+    Spectral contrast angle (SA) — the gold-standard metric used by DIA-NN
+    and EncyclopeDIA.  SA = 1 - (2/pi) * arccos(cosine_sim).
+
+    Returns
+    -------
+    float   SA in [0, 1]  (1 = perfect match)
+    """
+    cos_sim = spectral_cosine_similarity(obs_intensities, pred_intensities)
+    return 1.0 - (2.0 / np.pi) * np.arccos(np.clip(cos_sim, -1.0, 1.0))
+
+
+def compute_spectral_similarity(matched_ions, predicted_intensities, method='SA'):
+    """
+    Compute spectral similarity between observed matched ions and MS2PIP-predicted
+    intensities.
+
+    Parameters
+    ----------
+    matched_ions : list of tuples
+        Standard matched-ion tuples: (ion_type, theo_mz, charge, intensity, ppm, nl, pos)
+    predicted_intensities : dict
+        {(ion_type, position, charge): predicted_intensity} from ms2pip_predict_intensities.
+    method : str
+        'SA' for spectral contrast angle, 'cosine' for normalised dot product.
+
+    Returns
+    -------
+    tuple (float, int)
+        (similarity_score in [0, 1], number_of_matched_predicted_peaks)
+        Returns (0.0, 0) when insufficient overlap.
+    """
+    if not predicted_intensities:
+        return 0.0, 0
+
+    obs_vec, pred_vec = [], []
+    for ion in matched_ions:
+        ion_type, _mz, ion_charge, intensity, _ppm, nl_type, frag_pos = ion
+        if nl_type is not None:
+            continue                       # skip neutral-loss ions (not modelled by MS2PIP)
+        key = (ion_type, frag_pos, ion_charge)
+        if key not in predicted_intensities and ion_charge > 1:
+            # MS2PIP only predicts charge-1 fragment intensities;
+            # fall back to charge-1 prediction for higher-charge ions.
+            key = (ion_type, frag_pos, 1)
+        if key in predicted_intensities:
+            obs_vec.append(intensity)
+            pred_vec.append(predicted_intensities[key])
+
+    n_matched_predicted = len(obs_vec)
+    if n_matched_predicted < 3:            # too few overlapping ions for meaningful similarity
+        return 0.0, n_matched_predicted
+
+    if method == 'cosine':
+        return spectral_cosine_similarity(obs_vec, pred_vec), n_matched_predicted
+    return spectral_contrast_angle(obs_vec, pred_vec), n_matched_predicted
+
+
+# --------------- Chimeric deconvolution: responsibility weights --------------
+
+def compute_precursor_evidence(unique_ions, all_matched_ions, predicted_intensities,
+                               rt_error, rt_window_width, precursor_mz_error_ppm,
+                               precursor_tol_ppm=10.0):
+    """
+    Multi-evidence score for how strongly a candidate precursor is supported
+    in this scan.  Combines:
+      1. Spectral angle on *unique* (non-shared) ions
+      2. RT proximity Gaussian
+      3. Precursor m/z fit Gaussian
+      4. Mass accuracy of unique ions
+
+    Returns
+    -------
+    float  evidence score in [0, 1]
+    """
+    # 1. SA on unique ions  (weight 0.40)
+    sa, _n_pred = compute_spectral_similarity(unique_ions, predicted_intensities, method='SA')
+
+    # 2. RT proximity  (weight 0.20)
+    if rt_window_width is not None and rt_window_width > 0 and rt_error is not None:
+        sigma_rt = rt_window_width / 4.0
+        rt_score = float(np.exp(-0.5 * (rt_error / sigma_rt) ** 2))
+    else:
+        rt_score = 0.5
+
+    # 3. Precursor m/z fit  (weight 0.20)
+    sigma_prec = precursor_tol_ppm / 3.0
+    prec_score = float(np.exp(-0.5 * (precursor_mz_error_ppm / sigma_prec) ** 2)) if precursor_mz_error_ppm is not None else 0.5
+
+    # 4. Mean mass accuracy of unique ions  (weight 0.20)
+    if unique_ions:
+        _ppm = np.array([ion[4] for ion in unique_ions])
+        _int = np.array([ion[3] for ion in unique_ions])
+        if _int.sum() > 0:
+            w_ppm = float(np.average(np.abs(_ppm), weights=_int))
+        else:
+            w_ppm = float(np.mean(np.abs(_ppm)))
+        # Use Gaussian with sigma = 5 ppm (tight)
+        mass_score = float(np.exp(-0.5 * (w_ppm / 5.0) ** 2))
+    else:
+        mass_score = 0.0
+
+    evidence = 0.40 * sa + 0.20 * rt_score + 0.20 * prec_score + 0.20 * mass_score
+    return float(np.clip(evidence, 0.0, 1.0))
+
+
+def precompute_evidence_by_scan(
+    rt_windows_dict, peptides_info, ambiguous_by_scan, ambiguous_candidates_by_scan,
+    all_peptide_predictions, fragmentation_type, fragment_tolerance, fragment_unit,
+    precursor_tolerance, precursor_unit, selected_neutral_losses,
+    scan_window_lower, scan_window_upper, fragment_mz_lower, fragment_mz_upper,
+    min_intensity_threshold,
+):
+    """
+    Pre-compute per-scan evidence scores for EVERY peptide involved in
+    ambiguous scans.  This replaces the flat 0.3/0.5 competitor
+    approximation with real four-component evidence.
+
+    Strategy
+    --------
+    1. Collect only scans that have ambiguity (len(ambig_set) > 0).
+    2. For each such scan, identify every peptide that participates in
+       at least one ambiguous ion.
+    3. For each (scan, peptide) pair:
+       a) Generate theoretical ions (cached).
+       b) Match fragments once.
+       c) Separate unique vs shared matched ions.
+       d) Compute full ``compute_precursor_evidence``.
+    4. Vectorise the three Gaussian sub-scores (RT, precursor m/z,
+       mass accuracy) across all pairs in a single NumPy pass;
+       only the spectral-angle component is computed per-pair.
+
+    Returns
+    -------
+    dict  {scan_id: {peptide_idx: float}}
+        Evidence scores for every (scan, peptide) pair with ambiguity.
+    """
+    ambig_scan_ids = [sid for sid, s in ambiguous_by_scan.items() if s]
+    if not ambig_scan_ids:
+        return {}
+
+    scan_lookup = {}
+    for spectra in rt_windows_dict.values():
+        for sp in spectra:
+            sid = sp.get('id')
+            if sid is not None:
+                scan_lookup[sid] = sp
+
+    pair_scan_ids = []
+    pair_pep_idxs = []
+    pair_spectra = []
+    pair_theo_ions = []
+    pair_pep_infos = []
+
+    for scan_id in ambig_scan_ids:
+        sp = scan_lookup.get(scan_id)
+        if sp is None:
+            continue
+        ambig_set = ambiguous_by_scan[scan_id]
+        involved = {t[0] for t in ambig_set}
+        for pep_idx in involved:
+            if pep_idx >= len(peptides_info):
+                continue
+            pair_scan_ids.append(scan_id)
+            pair_pep_idxs.append(pep_idx)
+            pair_spectra.append(sp)
+            pinfo = peptides_info[pep_idx]
+            pair_pep_infos.append(pinfo)
+            pair_theo_ions.append(
+                generate_theoretical_ions_cached(
+                    pinfo[0], pinfo[3], fragmentation_type, selected_neutral_losses
+                )
+            )
+
+    n_pairs = len(pair_scan_ids)
+    if n_pairs == 0:
+        return {}
+
+    sa_arr = np.empty(n_pairs)
+    rt_err_arr = np.empty(n_pairs)
+    rt_ww_arr = np.empty(n_pairs)
+    prec_ppm_arr = np.empty(n_pairs)
+    mass_acc_arr = np.empty(n_pairs)
+    has_rt = np.ones(n_pairs, dtype=bool)
+    has_prec = np.ones(n_pairs, dtype=bool)
+    has_mass = np.ones(n_pairs, dtype=bool)
+
+    for i in range(n_pairs):
+        sp = pair_spectra[i]
+        pep_idx = pair_pep_idxs[i]
+        pinfo = pair_pep_infos[i]
+        peptide, precursor_mz, charge, modification, start_rt, stop_rt, known_rt = pinfo
+        scan_id = pair_scan_ids[i]
+        ambig_set = ambiguous_by_scan[scan_id]
+
+        matched_ions, _ = calculate_fragment_intensity(
+            pair_theo_ions[i], sp, fragment_tolerance, fragment_unit,
+            scan_window_lower=scan_window_lower, scan_window_upper=scan_window_upper,
+            fragment_mz_lower=fragment_mz_lower, fragment_mz_upper=fragment_mz_upper,
+            min_intensity_threshold=min_intensity_threshold,
+        )
+
+        unique_ions = [
+            ion for ion in matched_ions
+            if (pep_idx, ion[0], ion[2], ion[1]) not in ambig_set
+        ]
+
+        pred_dict = all_peptide_predictions.get(pep_idx, {})
+        sa_val, _ = compute_spectral_similarity(unique_ions, pred_dict, method='SA')
+        sa_arr[i] = sa_val
+
+        scan_rt = sp.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
+        if known_rt is not None:
+            rt_err_arr[i] = abs(scan_rt - known_rt)
+        else:
+            has_rt[i] = False
+            rt_err_arr[i] = 0.0
+
+        if start_rt is not None and stop_rt is not None and (stop_rt - start_rt) > 0:
+            rt_ww_arr[i] = stop_rt - start_rt
+        else:
+            has_rt[i] = False
+            rt_ww_arr[i] = 1.0
+
+        obs_prec = sp.get('precursorList', {}).get(
+            'precursor', [{}])[0].get('selectedIonList', {}).get(
+            'selectedIon', [{}])[0].get('selected ion m/z', None)
+        if obs_prec is not None and precursor_mz > 0:
+            prec_ppm_arr[i] = (obs_prec - precursor_mz) / precursor_mz * 1e6
+        else:
+            has_prec[i] = False
+            prec_ppm_arr[i] = 0.0
+
+        if unique_ions:
+            _ppm = np.array([ion[4] for ion in unique_ions])
+            _intens = np.array([ion[3] for ion in unique_ions])
+            if _intens.sum() > 0:
+                mass_acc_arr[i] = float(np.average(np.abs(_ppm), weights=_intens))
+            else:
+                mass_acc_arr[i] = float(np.mean(np.abs(_ppm)))
+        else:
+            has_mass[i] = False
+            mass_acc_arr[i] = 0.0
+
+    sigma_rt = rt_ww_arr / 4.0
+    np.clip(sigma_rt, 1e-9, None, out=sigma_rt)
+    rt_scores = np.exp(-0.5 * (rt_err_arr / sigma_rt) ** 2)
+    rt_scores[~has_rt] = 0.5
+
+    sigma_prec = precursor_tolerance / 3.0
+    prec_scores = np.exp(-0.5 * (prec_ppm_arr / max(sigma_prec, 1e-9)) ** 2)
+    prec_scores[~has_prec] = 0.5
+
+    mass_scores = np.exp(-0.5 * (mass_acc_arr / 5.0) ** 2)
+    mass_scores[~has_mass] = 0.0
+
+    evidence_arr = 0.40 * sa_arr + 0.20 * rt_scores + 0.20 * prec_scores + 0.20 * mass_scores
+    np.clip(evidence_arr, 0.0, 1.0, out=evidence_arr)
+
+    result = {}
+    for i in range(n_pairs):
+        sid = pair_scan_ids[i]
+        if sid not in result:
+            result[sid] = {}
+        result[sid][pair_pep_idxs[i]] = float(evidence_arr[i])
+
+    return result
+
+
+def compute_responsibility_weights(shared_ion_key, candidate_predicted, candidate_evidence,
+                                   temperature=1.0, min_weight=0.05):
+    """
+    Compute responsibility weight for a shared fragment ion across candidate
+    precursors using softmax over (predicted_intensity * evidence).
+
+    Parameters
+    ----------
+    shared_ion_key : tuple
+        (ion_type, fragment_position, charge) of the shared ion.
+    candidate_predicted : dict
+        {peptide_idx: predicted_intensity_for_this_ion}
+    candidate_evidence : dict
+        {peptide_idx: precursor_evidence_score}
+    temperature : float
+        Softmax temperature.  Lower → sharper (more winner-take-all).
+    min_weight : float
+        Floor for responsibility weight.  Candidates below this
+        are zeroed and their weight redistributed.
+
+    Returns
+    -------
+    dict  {peptide_idx: responsibility_weight}   weights sum to 1.0
+    """
+    if not candidate_predicted:
+        return {}
+
+    # Vectorised softmax using NumPy arrays — avoids per-element Python dict ops
+    cand_indices = list(candidate_predicted.keys())
+    n = len(cand_indices)
+    logits = np.empty(n)
+    inv_temp = 1.0 / max(temperature, 1e-9)
+    for i, pep_idx in enumerate(cand_indices):
+        logits[i] = candidate_predicted[pep_idx] * candidate_evidence.get(pep_idx, 0.0) * inv_temp
+
+    # Numerically stable softmax
+    logits -= logits.max()
+    exp_vals = np.exp(logits)
+    total = exp_vals.sum()
+    if total == 0:
+        return {}
+
+    weights = exp_vals / total
+
+    # Apply minimum-weight floor
+    below_mask = weights < min_weight
+    if below_mask.any() and not below_mask.all():
+        weights[below_mask] = 0.0
+        re_total = weights.sum()
+        if re_total > 0:
+            weights /= re_total
+
+    return {cand_indices[i]: float(weights[i]) for i in range(n)}
+
+
+def assign_shared_intensities(matched_ions_all, ambiguous_set, peptide_idx,
+                              all_peptide_predictions, all_peptide_evidence,
+                              ambiguous_candidates):
+    """
+    Probabilistic assignment of shared fragment intensities.
+
+    For each matched ion:
+      - If the ion is NOT ambiguous → keep full observed intensity.
+      - If ambiguous → multiply observed intensity by responsibility weight
+        for this peptide.
+
+    Optimised version: inlines softmax, uses NumPy arrays, groups ions by
+    candidate set to avoid redundant work.
+
+    Parameters
+    ----------
+    matched_ions_all : list of tuples
+        Full matched-ion list for this peptide in this scan.
+    ambiguous_set : set
+        Set of (peptide_idx, ion_type, charge, theo_mz) flagging ambiguous ions.
+    peptide_idx : int
+        Index of the current peptide in peptides_info.
+    all_peptide_predictions : dict
+        {peptide_idx: {(ion_type, pos, charge): pred_intensity}}  from MS2PIP.
+    all_peptide_evidence : dict
+        {peptide_idx: evidence_score}  from compute_precursor_evidence.
+    ambiguous_candidates : dict
+        Cache of {(ion_type, charge, theo_mz) -> set-of-peptide_indices}
+        (which peptides claim this ion).
+
+    Returns
+    -------
+    assigned_ions : list of tuples
+        Same format as matched_ions_all but with intensity replaced by
+        responsibility-weighted value for shared ions.
+    n_shared : int
+        Number of shared ions that were probabilistically split.
+    total_shared_intensity : float
+        Sum of assigned (not raw) intensity for shared ions.
+    deconv_confidence : float
+        Mean responsibility weight for the assigned shared ions (higher = less ambiguous).
+    """
+    # --- Fast first pass: separate unique from shared ions ---
+    n_ions = len(matched_ions_all)
+    if n_ions == 0:
+        return [], 0, 0.0, 1.0
+
+    shared_indices = []  # indices into matched_ions_all that are shared
+    for i, ion in enumerate(matched_ions_all):
+        ion_type, theo_mz, ion_charge = ion[0], ion[1], ion[2]
+        if (peptide_idx, ion_type, ion_charge, theo_mz) in ambiguous_set:
+            shared_indices.append(i)
+
+    if not shared_indices:
+        # No shared ions at all — skip all deconvolution math
+        return list(matched_ions_all), 0, 0.0, 1.0
+
+    # --- Process shared ions with inlined vectorised softmax ---
+    assigned_ions = list(matched_ions_all)  # copy; we'll overwrite shared entries
+    n_shared = len(shared_indices)
+    shared_assigned_total = 0.0
+    resp_weights_arr = np.empty(n_shared)
+
+    for si, ion_idx in enumerate(shared_indices):
+        ion = matched_ions_all[ion_idx]
+        ion_type, theo_mz, ion_charge, intensity, ppm, nl_type, frag_pos = ion
+
+        obs_key = (ion_type, ion_charge, theo_mz)
+        candidates = ambiguous_candidates.get(obs_key)
+        if not candidates:
+            # Should not happen, but guard: treat as unique
+            resp_weights_arr[si] = 1.0
+            shared_assigned_total += intensity
+            continue
+
+        # Build logits array directly (inlined softmax — no dict intermediaries)
+        cand_list = list(candidates)
+        n_cand = len(cand_list)
+        logits = np.empty(n_cand)
+        our_pos = -1
+        # MS2PIP only predicts charge-1 fragment intensities.
+        # For charge 2+ ions, fall back to the charge-1 prediction so the
+        # deconvolution is guided by predicted relative intensity rather
+        # than defaulting to an uninformative equal split.
+        pred_key = (ion_type, frag_pos, ion_charge)
+        pred_key_fallback = (ion_type, frag_pos, 1) if ion_charge > 1 else None
+        for ci, cand_idx in enumerate(cand_list):
+            pred_dict = all_peptide_predictions.get(cand_idx)
+            if pred_dict:
+                p_int = pred_dict.get(pred_key, 0.0)
+                if p_int == 0.0 and pred_key_fallback is not None:
+                    p_int = pred_dict.get(pred_key_fallback, 0.0)
+            else:
+                p_int = 0.0
+            e_val = all_peptide_evidence.get(cand_idx, 0.0)
+            logits[ci] = p_int * e_val
+            if cand_idx == peptide_idx:
+                our_pos = ci
+
+        if our_pos < 0:
+            # Current peptide not among candidates — keep as-is with zero weight
+            resp_weights_arr[si] = 0.0
+            assigned_ions[ion_idx] = (ion_type, theo_mz, ion_charge, 0.0, ppm, nl_type, frag_pos)
+            continue
+
+        # Stable softmax
+        logits -= logits.max()
+        exp_vals = np.exp(logits)
+        total = exp_vals.sum()
+        if total == 0:
+            resp_weights_arr[si] = 0.0
+            assigned_ions[ion_idx] = (ion_type, theo_mz, ion_charge, 0.0, ppm, nl_type, frag_pos)
+            continue
+
+        weights = exp_vals / total
+
+        # Min-weight floor (0.05)
+        below_mask = weights < 0.05
+        if below_mask.any() and not below_mask.all():
+            weights[below_mask] = 0.0
+            re_total = weights.sum()
+            if re_total > 0:
+                weights /= re_total
+
+        w = float(weights[our_pos])
+        assigned_intensity = intensity * w
+        assigned_ions[ion_idx] = (ion_type, theo_mz, ion_charge, assigned_intensity, ppm, nl_type, frag_pos)
+        shared_assigned_total += assigned_intensity
+        resp_weights_arr[si] = w
+
+    deconv_confidence = float(resp_weights_arr.mean())
+    return assigned_ions, n_shared, shared_assigned_total, deconv_confidence
+
+
+def calculate_psm_score(mass_accuracy, fragment_count, rt_accuracy, charge_state_consistency,
+                        fragment_tolerance=20.0, max_fragments=100,
+                        rt_window_width=None, continuity_score=0.0, complementarity_score=0.0):
+    """
+    Calculate normalized PSM score in [0, 1] with optimized weights.
+    Single PSM version - use calculate_psm_scores_batch for batch processing.
+
+    Improvements over earlier versions:
+      - Gaussian mass accuracy kernel (σ = tolerance / 3)
+      - Log-scaled fragment count normalisation
+      - Gaussian RT accuracy scaled to the user's RT window
+      - Continuity & complementarity folded into the weighted sum
+        (no multiplicative bonuses that break the [0, 1] range)
+    """
+    # --- Gaussian mass accuracy (σ ≈ tolerance / 3) --------------------------
+    sigma_mass = fragment_tolerance / 3.0
+    norm_mass_accuracy = np.exp(-0.5 * (mass_accuracy / sigma_mass) ** 2)
+
+    # --- Log-scaled fragment count -------------------------------------------
+    norm_fragment_count = (np.log1p(fragment_count) / np.log1p(max_fragments)
+                           if max_fragments > 0 else 0.0)
+    norm_fragment_count = min(norm_fragment_count, 1.0)
+
+    # --- Gaussian RT accuracy (σ_RT = window half-width / 2) -----------------
+    if rt_accuracy is not None and rt_window_width is not None and rt_window_width > 0:
+        sigma_rt = rt_window_width / 4.0          # half-width / 2
+        norm_rt_accuracy = np.exp(-0.5 * (rt_accuracy / sigma_rt) ** 2)
+    elif rt_accuracy is not None:
+        # Fallback: logistic decay when no window info is available
+        norm_rt_accuracy = 1.0 / (1.0 + rt_accuracy)
+    else:
+        norm_rt_accuracy = 0.5                    # neutral when RT unknown
+
+    # --- Weights (sum to 1.0 → score stays in [0, 1]) -----------------------
+    weights = {
+        'mass_accuracy':     0.25,
+        'fragment_count':    0.25,
+        'rt_accuracy':       0.10,
+        'charge_consistency': 0.10,
+        'continuity':        0.10,
+        'complementarity':   0.20,
+    }
+
+    # --- Weighted sum --------------------------------------------------------
+    psm_score = (
+        weights['mass_accuracy']      * norm_mass_accuracy +
+        weights['fragment_count']     * norm_fragment_count +
+        weights['rt_accuracy']        * norm_rt_accuracy +
+        weights['charge_consistency'] * charge_state_consistency +
+        weights['continuity']         * continuity_score +
+        weights['complementarity']    * complementarity_score
+    )
+
+    return psm_score
+
+def calculate_psm_scores_batch(mass_accuracies, fragment_counts, rt_accuracies, charge_consistencies,
+                               fragment_tolerance=20.0, max_fragments=100,
+                               rt_window_widths=None, continuity_scores=None,
+                               complementarity_scores=None):
+    """
+    GPU-ACCELERATED batch PSM score calculation.
+    Processes all PSMs in parallel using vectorized operations.
+
+    Improvements (v1.0.7+):
+      - Gaussian mass accuracy kernel (σ = tolerance / 3)
+      - Log-scaled fragment count normalisation
+      - Gaussian RT accuracy scaled to user RT windows
+      - Continuity & complementarity folded into weighted sum
+
+    Parameters:
+    -----------
+    mass_accuracies : array-like
+        Intensity-weighted mean mass error (ppm) per PSM.
+    fragment_counts : array-like
+        Number of matched fragment ions per PSM.
+    rt_accuracies : array-like
+        |ΔRT| values per PSM (same units as rt_window_widths).
+    charge_consistencies : array-like
+        Charge consistency metric per PSM.
+    fragment_tolerance : float
+        Fragment mass tolerance in ppm (used to derive σ for Gaussian).
+    max_fragments : int
+        Maximum possible theoretical fragment count.
+    rt_window_widths : array-like or None
+        RT window width per PSM (stop - start).  If None, falls back to
+        logistic decay.
+    continuity_scores : array-like or None
+        Ion-series continuity scores [0, 1] per PSM.
+    complementarity_scores : array-like or None
+        Ion-series complementarity scores [0, 1] per PSM.
+
+    Returns:
+    --------
+    numpy.ndarray
+        Array of PSM scores in [0, 1].
+    """
+    use_gpu = GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE
+
+    if use_gpu:
+        try:
+            import cupy as cp
+            xp = cp
+        except Exception:
+            xp = np
+            use_gpu = False
+    else:
+        xp = np
+
+    # Convert inputs to arrays
+    mass_acc = xp.asarray(mass_accuracies, dtype=xp.float64)
+    frag_counts = xp.asarray(fragment_counts, dtype=xp.float64)
+    rt_acc = xp.asarray(rt_accuracies, dtype=xp.float64)
+    charge_cons = xp.asarray(charge_consistencies, dtype=xp.float64)
+    cont_sc = xp.asarray(continuity_scores if continuity_scores is not None
+                         else np.zeros(len(mass_accuracies)), dtype=xp.float64)
+    comp_sc = xp.asarray(complementarity_scores if complementarity_scores is not None
+                         else np.zeros(len(mass_accuracies)), dtype=xp.float64)
+
+    # --- Gaussian mass accuracy (σ = tolerance / 3) --------------------------
+    sigma_mass = fragment_tolerance / 3.0
+    norm_mass_accuracy = xp.exp(-0.5 * (mass_acc / sigma_mass) ** 2)
+
+    # --- Log-scaled fragment count -------------------------------------------
+    log_max = xp.float64(np.log1p(max_fragments)) if max_fragments > 0 else xp.float64(1.0)
+    norm_fragment_count = xp.clip(xp.log1p(frag_counts) / log_max, 0.0, 1.0)
+
+    # --- Gaussian RT accuracy ------------------------------------------------
+    rt_is_nan = xp.isnan(rt_acc)
+    rt_acc_safe = xp.where(rt_is_nan, xp.float64(0.0), rt_acc)
+
+    if rt_window_widths is not None:
+        rt_ww = xp.asarray(rt_window_widths, dtype=xp.float64)
+        sigma_rt = xp.where(rt_ww > 0, rt_ww / 4.0, xp.float64(1.0))
+        norm_rt_accuracy = xp.where(
+            rt_is_nan, xp.float64(0.5),
+            xp.exp(-0.5 * (rt_acc_safe / sigma_rt) ** 2)
+        )
+    else:
+        # Fallback: logistic decay (no window info)
+        norm_rt_accuracy = xp.where(rt_is_nan, xp.float64(0.5),
+                                     1.0 / (1.0 + rt_acc_safe))
+
+    # --- Weights (sum to 1.0) ------------------------------------------------
+    w_mass  = 0.25
+    w_frag  = 0.25
+    w_rt    = 0.10
+    w_charge = 0.10
+    w_cont  = 0.10
+    w_comp  = 0.20
+
+    # --- Vectorized weighted sum (GPU parallel) ------------------------------
+    psm_scores = (
+        w_mass   * norm_mass_accuracy +
+        w_frag   * norm_fragment_count +
+        w_rt     * norm_rt_accuracy +
+        w_charge * charge_cons +
+        w_cont   * cont_sc +
+        w_comp   * comp_sc
+    )
+
+    # Transfer back to CPU if needed
+    if use_gpu:
+        return cp.asnumpy(psm_scores)
+    return psm_scores
+
+def get_modification_mass_shift(mod_name):
+    """
+    Get the mass shift for a modification from the Chemical Modifications Manager.
+
+    Parameters:
+    -----------
+    mod_name : str
+        Name of the modification to look up (case-insensitive)
+
+    Returns:
+    --------
+    float
+        Mass shift value for the modification
+
+    Raises:
+    -------
+    ValueError if the modification is not found in the Chemical Modifications Manager or Unimod.
+    """
+    mod_name_lower = mod_name.lower()
+
+    # Check fixed modifications first
+    for mod in FIXED_MODIFICATIONS:
+        if mod['name'].lower() == mod_name_lower:
+            return mod['mass_shift']
+
+    # Then check variable modifications
+    for mod in VARIABLE_MODIFICATIONS:
+        if mod['name'].lower() == mod_name_lower:
+            return mod['mass_shift']
+
+    # If not found, try to get from Unimod as a fallback
+    if UNIMOD_MODIFICATIONS:
+        for name, info in UNIMOD_MODIFICATIONS.items():
+            if name.lower() == mod_name_lower:
+                return info['delta_mono']
+
+    # If we get here, the modification wasn't found
+    raise ValueError(f"Modification '{mod_name}' not found in Chemical Modifications Manager or Unimod.")
+
+def normalize_modification_positions(modification_string):
+    """
+    Normalize modification string to ensure all amino acids have position numbers.
+    If position is missing (e.g., [M] or [M; M16]), default to position 1.
+    Examples:
+        "1xOxidation [M]" -> "1xOxidation [M1]"
+        "2xOxidation [M; M16]" -> "2xOxidation [M1; M16]"
+        "1xCarbamidomethyl [C10]; 1xOxidation [M]" -> "1xCarbamidomethyl [C10]; 1xOxidation [M1]"
+    """
+    if pd.isna(modification_string) or not modification_string.strip():
+        return modification_string
+    
+    # Pattern to find amino acids without position numbers: letter followed by ], ;, or end of bracket
+    # Matches: [M], [M;, etc.
+    result = re.sub(r'\[([A-Z])([;\]])', r'[\g<1>1\g<2>', modification_string)
+    
+    return result
+
+def parse_modifications(modification_string):
+    """
+    Parse modification string and return positions for modifications.
+    Returns:
+        {
+          'oxidation': [], 'acetyl': False, 'phospho': [],
+          'custom_mods': { position_idx: [(mod_name, residue)], ... }
+        }
+    """
+    if pd.isna(modification_string) or not modification_string.strip():
+        return {'oxidation': [], 'acetyl': False, 'phospho': [], 'custom_mods': {}}
+
+    # Normalize modification string to handle missing position numbers
+    modification_string = normalize_modification_positions(modification_string)
+
+    mods = {'oxidation': [], 'acetyl': False, 'phospho': [], 'custom_mods': {}}
+    
+    parts = []
+    current_part = ""
+    in_brackets = False
+    
+    for char in modification_string:
+        if char == '[':
+            in_brackets = True
+            current_part += char
+        elif char == ']':
+            in_brackets = False
+            current_part += char
+        elif char == ';' and not in_brackets:
+            if current_part.strip():
+                parts.append(current_part.strip())
+            current_part = ""
+        else:
+            current_part += char
+    
+    # Don't forget the last part
+    if current_part.strip():
+        parts.append(current_part.strip())
+    
+    for p in parts:
+        pl = p.lower()
+        # REMOVED: No logging here
+
+        # Oxidation[M3;M7]
+        if 'oxidation' in pl and '[' in p:
+            inside = p.split('[',1)[1].rstrip(']')
+            for tok in inside.split(';'):
+                t = tok.strip()
+                if t.startswith('M') and t[1:].isdigit():
+                    pos = int(t[1:]) - 1
+                    mods['oxidation'].append(pos)
+                    # REMOVED: No logging here
+            continue
+            
+        # Acetyl at N-Term
+        if 'acetyl' in pl and 'n-term' in pl:
+            mods['acetyl'] = True
+            # REMOVED: No logging here
+            continue
+            
+        # Phospho[S3;T5]
+        if 'phospho' in pl and '[' in p:
+            inside = p.split('[',1)[1].rstrip(']')
+            for tok in inside.split(';'):
+                t = tok.strip()
+                if t and t[0] in ('S','T','Y') and t[1:].isdigit():
+                    pos = int(t[1:]) - 1
+                    mods['phospho'].append(pos)
+                    # REMOVED: No logging here
+            continue
+            
+        # Custom e.g. "2xCarbamidomethyl [C4; C10]"
+        if '[' in p and 'x' in p:
+            name = p.split('x',1)[1].split('[',1)[0].strip()
+            inside = p.split('[',1)[1].rstrip(']')
+            for tok in inside.split(';'):
+                t = tok.strip()
+                if t.lower().endswith('term'):
+                    continue
+                elif len(t) > 1 and t[1:].isdigit():
+                    residue = t[0]
+                    pos = int(t[1:]) - 1
+                    if pos not in mods['custom_mods']:
+                        mods['custom_mods'][pos] = []
+                    mods['custom_mods'][pos].append((name, residue))
+                    # REMOVED: No logging here
+            continue
+            
+    return mods
+
+def _build_prefix_sums(peptide, mod_positions):
+    """Pre-compute residue and modification prefix sums for O(n) ion generation.
+    
+    Returns:
+        prefix_mass: prefix_mass[i] = sum of residue masses for positions [0, i)
+        mod_prefix:  mod_prefix[i] = total modification mass for positions [0, i)
+    """
+    n = len(peptide)
+    # Residue mass prefix sum
+    prefix_mass = [0.0] * (n + 1)
+    for k in range(n):
+        prefix_mass[k + 1] = prefix_mass[k] + get_amino_acid_mass(peptide[k])
+    
+    # Per-position modification mass
+    pos_mod_mass = [0.0] * n
+    for pos in mod_positions.get('oxidation', []):
+        if 0 <= pos < n:
+            pos_mod_mass[pos] += OXIDATION_MASS
+    for pos in mod_positions.get('phospho', []):
+        if 0 <= pos < n:
+            pos_mod_mass[pos] += 79.966331
+    if 'custom_mods' in mod_positions:
+        for pos, mod_list in mod_positions['custom_mods'].items():
+            if 0 <= pos < n:
+                for mod_name, residue in mod_list:
+                    try:
+                        pos_mod_mass[pos] += get_modification_mass_shift(mod_name)
+                    except ValueError:
+                        continue
+    
+    # Modification prefix sum
+    mod_prefix = [0.0] * (n + 1)
+    for k in range(n):
+        mod_prefix[k + 1] = mod_prefix[k] + pos_mod_mass[k]
+    
+    return prefix_mass, mod_prefix
+
+
+def generate_hcd_ions(peptide, modifications):
+    """Generate b and y ion series with modifications applied.
+    Uses O(n) prefix sums instead of O(n²) inner loops."""
+    ions = {'b': {1: [], 2: [], 3: []}, 'y': {1: [], 2: [], 3: []}}
+    mod_positions = parse_modifications_cached(modifications)
+    n = len(peptide)
+    
+    prefix_mass, mod_prefix = _build_prefix_sums(peptide, mod_positions)
+    acetyl_mass = ACETYL_MASS if mod_positions['acetyl'] else 0.0
+    
+    # Generate b-ions (N-terminal fragments) — b_i covers residues [0, i)
+    for i in range(1, n):
+        b_ion_mass = prefix_mass[i] + mod_prefix[i] + acetyl_mass
+        for charge in range(1, 4):
+            mz = (b_ion_mass + charge * PROTON_MASS) / charge
+            ions['b'][charge].append(mz)
+    
+    # Generate y-ions (C-terminal fragments) — y_i covers residues [n-i, n)
+    y_ions_by_charge = {1: [], 2: [], 3: []}
+    for i in range(1, n):
+        y_ion_mass = (prefix_mass[n] - prefix_mass[n - i]) + (mod_prefix[n] - mod_prefix[n - i]) + NEUTRAL_LOSS['H2O']
+        for charge in range(1, 4):
+            mz = (y_ion_mass + charge * PROTON_MASS) / charge
+            y_ions_by_charge[charge].append(mz)
+    
+    for charge in range(1, 4):
+        ions['y'][charge] = y_ions_by_charge[charge]
+    
+    return ions
+
+def generate_etd_ions(peptide, modifications):
+    """Generate c and z ion series with modifications applied.
+    Uses O(n) prefix sums instead of O(n²) inner loops."""
+    ions = {'c': {1: [], 2: [], 3: []}, 'z': {1: [], 2: [], 3: []}}
+    mod_positions = parse_modifications_cached(modifications)
+    n = len(peptide)
+    
+    prefix_mass, mod_prefix = _build_prefix_sums(peptide, mod_positions)
+    acetyl_mass = ACETYL_MASS if mod_positions['acetyl'] else 0.0
+    
+    # Generate c-ions (N-terminal fragments) — c_i covers residues [0, i)
+    for i in range(1, n):
+        c_ion_mass = prefix_mass[i] + mod_prefix[i] + acetyl_mass + 17.026549  # + NH3
+        for charge in range(1, 4):
+            mz = (c_ion_mass + charge * PROTON_MASS) / charge
+            ions['c'][charge].append(mz)
+    
+    # Generate z-ions (C-terminal fragments) — z_i covers residues [n-i, n)
+    z_ions_by_charge = {1: [], 2: [], 3: []}
+    for i in range(1, n):
+        z_ion_mass = (prefix_mass[n] - prefix_mass[n - i]) + (mod_prefix[n] - mod_prefix[n - i]) + 0.984016  # + (H2O - NH3)
+        for charge in range(1, 4):
+            mz = (z_ion_mass + charge * PROTON_MASS) / charge
+            z_ions_by_charge[charge].append(mz)
+    
+    for charge in range(1, 4):
+        ions['z'][charge] = z_ions_by_charge[charge]
+    
+    return ions
+
+def generate_uvpd_ions(peptide, modifications):
+    """Generate a and x ions for UVPD fragmentation.
+    Uses O(n) prefix sums instead of O(n²) inner loops."""
+    ions = {'a': {1: [], 2: [], 3: []}, 'x': {1: [], 2: [], 3: []}}
+    mod_positions = parse_modifications_cached(modifications)
+    n = len(peptide)
+    
+    prefix_mass, mod_prefix = _build_prefix_sums(peptide, mod_positions)
+    acetyl_mass = ACETYL_MASS if mod_positions['acetyl'] else 0.0
+    
+    # Generate a-ions (N-terminal fragments) — a_i covers residues [0, i)
+    for i in range(1, n):
+        a_ion_mass = prefix_mass[i] + mod_prefix[i] + acetyl_mass - 27.994915  # - CO
+        for charge in range(1, 4):
+            mz = (a_ion_mass + charge * PROTON_MASS) / charge
+            ions['a'][charge].append(mz)
+    
+    # Generate x-ions (C-terminal fragments) — x_i covers residues [n-i, n)
+    x_ions_by_charge = {1: [], 2: [], 3: []}
+    for i in range(1, n):
+        x_ion_mass = (prefix_mass[n] - prefix_mass[n - i]) + (mod_prefix[n] - mod_prefix[n - i]) + 46.005480  # + CO + H2O
+        for charge in range(1, 4):
+            mz = (x_ion_mass + charge * PROTON_MASS) / charge
+            x_ions_by_charge[charge].append(mz)
+    
+    for charge in range(1, 4):
+        ions['x'][charge] = x_ions_by_charge[charge]
+    
+    return ions
+
+def generate_neutral_loss_ions(peptide, modifications, ion_type, base_ions, selected_neutral_losses=None):
+    """
+    Generate neutral loss ions for a specific ion type (b, y, c, z, a, x).
+    
+    Only generates a neutral loss variant for a specific fragment if the
+    loss-prone residue is actually contained within that fragment's sequence range.
+    
+    Parameters:
+    -----------
+    peptide : str
+        Peptide sequence
+    modifications : str
+        Modification string
+    ion_type : str
+        Base ion type ('b', 'y', 'c', 'z', 'a', 'x')
+    base_ions : dict
+        Base ions from which neutral losses will be calculated {charge: [mz_list]}
+    selected_neutral_losses : list or None
+        List of selected neutral loss types. If None, generate all. If empty list, generate none.
+    
+    Returns:
+    --------
+    dict
+        Neutral loss ions with keys as 'ion_type-loss_type'
+    """
+    # Return empty dict immediately if selected_neutral_losses is an empty list
+    if selected_neutral_losses is not None and len(selected_neutral_losses) == 0:
+        return {}
+        
+    mod_positions = parse_modifications_cached(modifications)
+    neutral_loss_ions = {}
+    n = len(peptide)
+    
+    # Determine if ion_type is N-terminal (b, c, a) or C-terminal (y, z, x)
+    is_n_terminal = ion_type in ('b', 'c', 'a')
+    
+    # For each neutral loss type
+    for loss_type, loss_mass in NEUTRAL_LOSS.items():
+        # Skip if this loss type is not in the selected list
+        if selected_neutral_losses is not None and len(selected_neutral_losses) > 0 and loss_type not in selected_neutral_losses:
+            continue
+        
+        # Get loss-prone residues for this loss type
+        prone_residues = set()
+        if loss_type in NEUTRAL_LOSS_RESIDUES:
+            prone_residues = set(NEUTRAL_LOSS_RESIDUES[loss_type])
+        
+        # Check if any fragment can structurally produce this loss
+        # Phospho-dependent losses need phospho modification
+        needs_phospho = loss_type == 'H3PO4'
+        # Oxidation-dependent losses need oxidation modification on M
+        needs_oxidation = loss_type in ['CH3SOH', 'CH3SOH-H2O', '2CH3SOH', '2CH3SOH-H2O', '3CH3SOH', '3CH3SOH-H2O']
+        
+        # Quick whole-peptide check — if no prone residues exist at all, skip entirely
+        has_any_prone = any(aa in prone_residues for aa in peptide) if prone_residues else False
+        has_phospho = bool(mod_positions['phospho']) if needs_phospho else False
+        has_oxidation = bool(mod_positions['oxidation']) if needs_oxidation else False
+        
+        if not has_any_prone and not has_phospho and not (needs_oxidation and has_oxidation):
+            continue
+        
+        # Now generate per-fragment: only add neutral loss if that specific fragment
+        # contains the loss-prone residue (or modification site)
+        neutral_loss_ions[f"{ion_type}-{loss_type}"] = {}
+        
+        for charge, mz_values in base_ions.items():
+            nl_mz_list = []
+            
+            for frag_idx, mz in enumerate(mz_values):
+                # Determine residue range for this fragment
+                # frag_idx corresponds to fragment number (0-based in list, fragment i+1)
+                i = frag_idx + 1  # fragment position (1-indexed)
+                
+                if is_n_terminal:
+                    # N-terminal fragments cover residues [0, i)
+                    frag_start, frag_end = 0, i
+                else:
+                    # C-terminal fragments cover residues [n-i, n)
+                    frag_start, frag_end = n - i, n
+                
+                fragment_seq = peptide[frag_start:frag_end]
+                
+                # Check if this specific fragment contains a loss-prone residue
+                frag_has_loss = False
+                
+                if prone_residues and any(aa in prone_residues for aa in fragment_seq):
+                    # For oxidation-dependent losses, also need an oxidation mod in range
+                    if needs_oxidation:
+                        if any(frag_start <= pos < frag_end for pos in mod_positions['oxidation']):
+                            frag_has_loss = True
+                    else:
+                        frag_has_loss = True
+                
+                if needs_phospho:
+                    if any(frag_start <= pos < frag_end for pos in mod_positions['phospho']):
+                        frag_has_loss = True
+                
+                if frag_has_loss:
+                    nl_mz = mz - loss_mass / charge
+                    nl_mz_list.append(nl_mz)
+                else:
+                    # Append None as placeholder to keep indexing aligned with base ions
+                    nl_mz_list.append(None)
+            
+            # Keep None placeholders so list indices stay aligned with
+            # base-ion positions (fragment_position = index + 1).
+            neutral_loss_ions[f"{ion_type}-{loss_type}"][charge] = nl_mz_list
+    
+    # Remove empty loss types (no fragments had the prone residue)
+    neutral_loss_ions = {k: v for k, v in neutral_loss_ions.items() 
+                         if any(any(m is not None for m in mzs) for mzs in v.values())}
+    
+    return neutral_loss_ions
+
+def generate_theoretical_ions(peptide, modifications, fragmentation_type, selected_neutral_losses=None):
+    """Generate theoretical fragment ions based on fragmentation type"""
+    ions = {}
+    
+    if 'HCD' in fragmentation_type or 'CID' in fragmentation_type:
+        # b and y ions
+        b_y_ions = generate_hcd_ions(peptide, modifications)
+        ions.update(b_y_ions)
+        
+        # Add neutral losses for b and y ions
+        for ion_type in ['b', 'y']:
+            if ion_type in b_y_ions:
+                neutral_losses = generate_neutral_loss_ions(
+                    peptide, modifications, ion_type, b_y_ions[ion_type], selected_neutral_losses=selected_neutral_losses)
+                ions.update(neutral_losses)
+    
+    if 'ETD' in fragmentation_type:
+        # c and z ions
+        c_z_ions = generate_etd_ions(peptide, modifications)
+        ions.update(c_z_ions)
+        
+        # Add neutral losses for c and z ions
+        for ion_type in ['c', 'z']:
+            if ion_type in c_z_ions:
+                neutral_losses = generate_neutral_loss_ions(
+                    peptide, modifications, ion_type, c_z_ions[ion_type], selected_neutral_losses=selected_neutral_losses)
+                ions.update(neutral_losses)
+        
+    if 'UVPD' in fragmentation_type:
+        # a, x ions and internal fragments
+        a_x_ions = generate_uvpd_ions(peptide, modifications)
+        ions.update(a_x_ions)
+        
+        # Add neutral losses for a and x ions
+        for ion_type in ['a', 'x']:
+            if ion_type in a_x_ions:
+                neutral_losses = generate_neutral_loss_ions(
+                    peptide, modifications, ion_type, a_x_ions[ion_type], selected_neutral_losses=selected_neutral_losses)
+                ions.update(neutral_losses)
+    
+    if 'EThcD' in fragmentation_type:
+        # b, y, c, z ions
+        b_y_ions = generate_hcd_ions(peptide, modifications)
+        c_z_ions = generate_etd_ions(peptide, modifications)
+        ions.update(b_y_ions)
+        ions.update(c_z_ions)
+        
+        # Add neutral losses for all ion types
+        for ion_type in ['b', 'y', 'c', 'z']:
+            if ion_type in ions:
+                base_ions = b_y_ions[ion_type] if ion_type in ['b', 'y'] else c_z_ions[ion_type]
+                neutral_losses = generate_neutral_loss_ions(
+                    peptide, modifications, ion_type, base_ions, selected_neutral_losses=selected_neutral_losses)
+                ions.update(neutral_losses)
+    
+    return ions
+
+def build_fragment_index(peptides, modifications_list, fragmentation_type, tolerance, rt_windows=None, selected_neutral_losses=None, tolerance_unit='ppm'):
+    """
+    Returns a dict: {(charge, mz): set(peptide_indices)} where any two fragments within tolerance are considered shared.
+    Optionally restricts to peptides with overlapping RT windows.
+    """
+    all_frags = []  # List of (mz, idx, ion_type, charge, rt_window)
+    all_theoretical_ions = []
+    for idx, (pep, mods) in enumerate(zip(peptides, modifications_list)):
+        ions = generate_theoretical_ions_cached(pep, mods, fragmentation_type, selected_neutral_losses)
+        all_theoretical_ions.append(ions)
+        # Optionally get RT window for this peptide
+        rt_win = rt_windows[idx] if rt_windows is not None else None
+        for ion_type, charges in ions.items():
+            for charge, mzs in charges.items():
+                for mz in mzs:
+                    if mz is None:  # NL placeholder — skip
+                        continue
+                    all_frags.append((mz, idx, ion_type, charge, rt_win))
+
+    # Now, group fragments within tolerance and charge (and overlapping RT if provided)
+    frag_index = []
+    used = set()
+    all_frags.sort(key=lambda x: (x[3], x[0]))  # sort by charge, then m/z
+    for i, (mz_i, idx_i, ion_type_i, charge_i, rt_win_i) in enumerate(all_frags):
+        if (mz_i, idx_i, ion_type_i, charge_i) in used:
+            continue
+        group = set([(idx_i, ion_type_i, mz_i)])
+        # Compute tolerance in Da for this reference m/z
+        tol_da = mz_i * tolerance / 1e6 if tolerance_unit == 'ppm' else tolerance
+        for j in range(i+1, len(all_frags)):
+            mz_j, idx_j, ion_type_j, charge_j, rt_win_j = all_frags[j]
+            if charge_j != charge_i:
+                continue
+            if abs(mz_j - mz_i) <= tol_da:
+                # If RT windows are provided, check for overlap
+                if rt_win_i and rt_win_j:
+                    # rt_win = (start_rt, stop_rt)
+                    overlap = not (rt_win_i[1] < rt_win_j[0] or rt_win_j[1] < rt_win_i[0])
+                    if not overlap:
+                        continue
+                group.add((idx_j, ion_type_j, mz_j))
+                used.add((mz_j, idx_j, ion_type_j, charge_j))
+            elif mz_j - mz_i > tol_da:
+                break
+        frag_index.append((charge_i, group))
+    return frag_index, all_theoretical_ions
+
+# Then, for each peptide, determine unique fragments:
+def get_unique_fragments_for_peptide(idx, all_theoretical_ions, frag_index, tolerance=0.01, tolerance_unit='ppm'):
+    unique = []
+    ions = all_theoretical_ions[idx]
+    for ion_type, charges in ions.items():
+        for charge, mzs in charges.items():
+            for mz in mzs:
+                if mz is None:  # NL placeholder — skip
+                    continue
+                is_unique = True
+                # Compute tolerance in Da for this m/z
+                tol_da = mz * tolerance / 1e6 if tolerance_unit == 'ppm' else tolerance
+                for ch, group in frag_index:
+                    if ch != charge:
+                        continue
+                    # If this fragment is in a group with more than one peptide, it's shared
+                    if any(abs(mz - mz2) <= tol_da and idx2 != idx for idx2, ion_type2, mz2 in group):
+                        is_unique = False
+                        break
+                if is_unique:
+                    unique.append((ion_type, charge, mz))
+    return unique
+
+def find_ambiguous_fragments_per_scan(ms2_spectra, peptides, modifications, fragmentation_type, tolerance, precursor_mzs=None, rt_windows=None, precursor_tol=10, selected_neutral_losses=None, tolerance_unit='ppm'):
+    """
+    For each scan, find ambiguous fragments: experimental peaks that match theoretical fragments from >1 peptide,
+    but only compare peptides with similar precursor m/z and overlapping RT windows.
+
+    Returns
+    -------
+    ambiguous_by_scan : dict
+        {scan_id: set of (peptide_idx, ion_type, charge, theoretical_mz)}
+    ambiguous_candidates_by_scan : dict
+        {scan_id: {(ion_type, charge, theo_mz): set_of_peptide_indices}}
+        Maps each ambiguous ion to ALL candidate peptides that claim it.
+        Used by probabilistic deconvolution to compute responsibility weights.
+
+    Performance: Uses np.searchsorted for O(E * log(F)) per scan instead of O(E * P * F).
+    """
+    # Precompute all theoretical fragments ONCE for all peptides
+    peptide_ions = []
+    for pep, mods in zip(peptides, modifications):
+        peptide_ions.append(generate_theoretical_ions_cached(pep, mods, fragmentation_type, selected_neutral_losses))
+
+    # Build peptide lookup by precursor m/z and RT window
+    peptide_lookup = []
+    for idx, (pep, mods) in enumerate(zip(peptides, modifications)):
+        if precursor_mzs is not None and rt_windows is not None:
+            precursor_mz = precursor_mzs[idx]
+            rt_start, rt_stop = rt_windows[idx]
+        else:
+            precursor_mz = None
+            rt_start, rt_stop = None, None
+        peptide_lookup.append({
+            'idx': idx,
+            'precursor_mz': precursor_mz,
+            'rt_start': rt_start,
+            'rt_stop': rt_stop,
+            'ions': peptide_ions[idx]
+        })
+
+    ambiguous_by_scan = {}
+    ambiguous_candidates_by_scan = {}
+
+    for spectrum in ms2_spectra:
+        scan_id = spectrum.get('id', None)
+        if scan_id is None:
+            continue
+
+        # Get scan precursor m/z and RT
+        scan_precursor = spectrum.get('precursorList', {}).get('precursor', [{}])[0].get('selectedIonList', {}).get('selectedIon', [{}])[0].get('selected ion m/z', None)
+        scan_rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', None)
+
+        # Find relevant peptides for this scan
+        relevant_peptides = []
+        for p in peptide_lookup:
+            if p['precursor_mz'] is not None and scan_precursor is not None:
+                mz_tol = p['precursor_mz'] * precursor_tol / 1e6
+                if abs(scan_precursor - p['precursor_mz']) > mz_tol:
+                    continue
+            if p['rt_start'] is not None and p['rt_stop'] is not None and scan_rt is not None:
+                if not (p['rt_start'] <= scan_rt <= p['rt_stop']):
+                    continue
+            relevant_peptides.append(p)
+
+        if len(relevant_peptides) < 2:
+            # Can't have ambiguity with fewer than 2 peptides
+            ambiguous_by_scan[scan_id] = set()
+            ambiguous_candidates_by_scan[scan_id] = {}
+            continue
+
+        exp_mz = np.array(spectrum['m/z array'])
+        if exp_mz.size == 0:
+            ambiguous_by_scan[scan_id] = set()
+            ambiguous_candidates_by_scan[scan_id] = {}
+            continue
+        
+        ambiguous = set()
+        candidates_map = {}       # (ion_type, charge, theo_mz) -> set of peptide_indices
+
+        # For each charge state, build a sorted array of all theoretical fragments
+        # from all relevant peptides, then use searchsorted for fast matching
+        for charge in [1, 2, 3]:
+            # Collect all theoretical fragments for this charge across relevant peptides
+            all_theo = []  # list of (mz, peptide_idx, ion_type)
+            for p in relevant_peptides:
+                idx = p['idx']
+                for ion_type, charges_dict in p['ions'].items():
+                    if charge in charges_dict:
+                        for theo_mz in charges_dict[charge]:
+                            if theo_mz is None:  # NL placeholder — skip
+                                continue
+                            all_theo.append((theo_mz, idx, ion_type))
+            
+            if not all_theo:
+                continue
+            
+            # Sort by m/z for binary search
+            all_theo.sort(key=lambda x: x[0])
+            theo_mz_sorted = np.array([t[0] for t in all_theo], dtype=np.float64)
+            
+            # For each experimental peak, find all matching theoretical fragments using searchsorted
+            for obs_mz in exp_mz:
+                if tolerance_unit == 'ppm':
+                    tol_da = obs_mz * tolerance / 1e6
+                else:
+                    tol_da = tolerance
+                
+                lo = np.searchsorted(theo_mz_sorted, obs_mz - tol_da, side='left')
+                hi = np.searchsorted(theo_mz_sorted, obs_mz + tol_da, side='right')
+                
+                if hi - lo < 2:
+                    continue  # Need matches from at least 2 different peptides
+                
+                matching_fragments = all_theo[lo:hi]
+                peptide_indices = set(frag[1] for frag in matching_fragments)
+                
+                if len(peptide_indices) > 1:
+                    # This peak matches fragments from multiple peptides — all are ambiguous.
+                    # Add ALL competing peptide indices to EVERY candidate key in this
+                    # cluster so the deconvolution sees the full set of competitors
+                    # even when their theoretical m/z values differ slightly.
+                    for theo_mz_val, p_idx, ion_type in matching_fragments:
+                        ambiguous.add((p_idx, ion_type, charge, theo_mz_val))
+                        # Record which peptides share each ion (for responsibility weighting)
+                        cand_key = (ion_type, charge, theo_mz_val)
+                        if cand_key not in candidates_map:
+                            candidates_map[cand_key] = set()
+                        candidates_map[cand_key].update(peptide_indices)
+        
+        ambiguous_by_scan[scan_id] = ambiguous
+        ambiguous_candidates_by_scan[scan_id] = candidates_map
+
+    return ambiguous_by_scan, ambiguous_candidates_by_scan
+
+# Module-level constant: monoisotopic amino acid residue masses (avoid rebuilding dict per call)
+_AMINO_ACID_MASSES = {
+    'A': 71.037113805, 'R': 156.101111050, 'N': 114.042927470, 'D': 115.026943065,
+    'C': 103.009184505, 'E': 129.042593135, 'Q': 128.058577540, 'G': 57.021463735,
+    'H': 137.058911875, 'I': 113.084064015, 'L': 113.084064015, 'K': 128.094963050,
+    'M': 131.040484645, 'F': 147.068413945, 'P': 97.052763875, 'S': 87.032028435,
+    'T': 101.047678505, 'W': 186.079312980, 'Y': 163.063328575, 'V': 99.068413945,
+    'U': 150.953633405, 'O': 237.147726925
+}
+
+def get_amino_acid_mass(aa):
+    mass = _AMINO_ACID_MASSES.get(aa)
+    if mass is None:
+        logging.warning(
+            f"Unknown amino acid residue '{aa}' — using 0 Da mass. "
+            f"Theoretical m/z values for peptides containing this residue "
+            f"will be incorrect."
+        )
+        return 0.0
+    return mass
+    
+def get_ms2_spectra(mzml_path, precursor_mz, start_rt, stop_rt, tolerance, unit='ppm'):
+    """
+    Get MS2 spectra within RT window for a given precursor m/z
+    
+    Parameters:
+    -----------
+    mzml_path : str
+        Path to mzML file
+    precursor_mz : float
+        Precursor m/z value to match
+    start_rt : float
+        Start retention time in minutes
+    stop_rt : float
+        Stop retention time in minutes
+    tolerance : float
+        Mass tolerance for precursor matching
+    unit : str
+        Mass tolerance unit ('ppm' or 'Da')
+    
+    Returns:
+    --------
+    list
+        List of matching MS2 spectra
+    """
+    matching_spectra = []
+    
+    try:
+        with read_spectra(mzml_path, use_preindexed=True) as reader:
+            for spectrum in reader:
+                # Check if it's an MS2 spectrum
+                if spectrum.get('ms level', 0) != 2:
+                    continue
+                
+                # Get retention time
+                rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
+                
+                # Check if within RT window
+                if rt < start_rt or rt > stop_rt:
+                    continue
+                
+                # Get precursor information
+                precursor_list = spectrum.get('precursorList', {}).get('precursor', [])
+                if not precursor_list:
+                    continue
+                    
+                selected_ions = precursor_list[0].get('selectedIonList', {}).get('selectedIon', [])
+                if not selected_ions:
+                    continue
+                
+                # Get observed precursor m/z
+                observed_mz = selected_ions[0].get('selected ion m/z')
+                if observed_mz is None:
+                    continue
+                
+                # Calculate tolerance window
+                if unit == 'ppm':
+                    mass_tolerance = precursor_mz * tolerance / 1e6
+                else:  # Da
+                    mass_tolerance = tolerance
+                
+                # Check if precursor matches within tolerance
+                if abs(observed_mz - precursor_mz) <= mass_tolerance:
+                    matching_spectra.append(spectrum)
+    
+    except Exception as e:
+        logging.error(f"Error reading mzML file {mzml_path}: {str(e)}")
+        return []
+    
+    logging.debug(f"Found {len(matching_spectra)} matching MS2 spectra")
+    return matching_spectra
+
+def process_raw_file(
+    mzml_file, mzml_folder, peptides_info, 
+    precursor_tolerance, fragment_tolerance, precursor_unit, fragment_unit, 
+    stop_event, eic_records=None, fragmentation_type="HCD", selected_neutral_losses=None,
+    unique_frag_option="quant_only", flag_ambiguous=True,
+    frag_index=None, all_theoretical_ions=None, peptides=None, modifications=None,
+    min_intensity_threshold=2.0, fragment_mz_lower=None, fragment_mz_upper=None,
+    precomputed_predictions=None
+):
+    start_time = time.time()
+    logging.info(f"Processing raw file {os.path.basename(mzml_file)}")
+    selected_neutral_losses = normalize_neutral_losses(selected_neutral_losses)
+    if stop_event.is_set():
+        logging.info(f"Stop requested before processing {os.path.basename(mzml_file)}; skipping file.")
+        return []
+    results = []
+    mzml_path = os.path.join(mzml_folder, mzml_file)
+    scan_window_lower, scan_window_upper = get_scan_window_limits(mzml_path)
+
+    # Prepare unique fragment index if needed
+    if unique_frag_option in ("quant_only", "both"):
+        if peptides is None or modifications is None:
+            peptides = [p[0] for p in peptides_info]
+            modifications = [p[3] for p in peptides_info]
+        if frag_index is None or all_theoretical_ions is None:
+            frag_index, all_theoretical_ions = build_fragment_index(
+                peptides, modifications, fragmentation_type, fragment_tolerance,
+                selected_neutral_losses=selected_neutral_losses,
+                tolerance_unit=fragment_unit
+            )
+
+    try:
+        # Compute the global RT range of all target peptides so spectra
+        # outside this range are discarded immediately (saves memory).
+        _all_start_rts = [float(p[4]) for p in peptides_info if p[4] is not None]
+        _all_stop_rts  = [float(p[5]) for p in peptides_info if p[5] is not None]
+        _global_rt_lo = min(_all_start_rts) if _all_start_rts else 0.0
+        _global_rt_hi = max(_all_stop_rts) if _all_stop_rts else float('inf')
+
+        # Cache MS2 spectra by RT windows (only within global peptide RT range)
+        rt_windows = {}
+        with read_spectra(mzml_path) as reader:
+            for spectrum in reader:
+                if spectrum['ms level'] == 2:
+                    rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
+                    if rt < _global_rt_lo or rt > _global_rt_hi:
+                        continue  # Outside all peptide RT windows — skip
+                    rt_key = int(rt // 1)  # Group by minute
+                    if rt_key not in rt_windows:
+                        rt_windows[rt_key] = []
+                    rt_windows[rt_key].append(spectrum)
+
+        # Precompute ambiguous fragments per scan only if we need to filter them later
+        ambiguous_by_scan = {}
+        ambiguous_candidates_by_scan = {}   # {scan_id: {(ion_type, charge, theo_mz): set_of_peptide_indices}}
+        needs_ambiguity_map = flag_ambiguous or unique_frag_option != "all"
+        if needs_ambiguity_map:
+            if stop_event.is_set():
+                logging.info("Stop requested before building ambiguity map; aborting file processing.")
+                return results
+            peptides_list = [p[0] for p in peptides_info]
+            modifications_list = [p[3] for p in peptides_info]
+            all_ms2_spectra = [spec for spectra in rt_windows.values() for spec in spectra]
+            logging.debug("Building ambiguous fragment map for %s (%d spectra, %d peptides)",
+                          os.path.basename(mzml_file), len(all_ms2_spectra), len(peptides_list))
+            ambiguity_start = time.time()
+            ambiguous_by_scan, ambiguous_candidates_by_scan = find_ambiguous_fragments_per_scan(
+                all_ms2_spectra, peptides_list, modifications_list, fragmentation_type, fragment_tolerance,
+                precursor_mzs=[p[1] for p in peptides_info],
+                rt_windows=[(p[4], p[5]) for p in peptides_info],
+                precursor_tol=precursor_tolerance,
+                selected_neutral_losses=selected_neutral_losses,
+                tolerance_unit=fragment_unit
+            )
+            logging.debug("Ambiguous fragment map built in %.2fs", time.time() - ambiguity_start)
+
+        probabilistic_available = (unique_frag_option == "probabilistic"
+                                   and precomputed_predictions is not None
+                                   and len(precomputed_predictions) > 0)
+        all_peptide_predictions = precomputed_predictions if precomputed_predictions else {}
+        if unique_frag_option == "probabilistic" and not probabilistic_available:
+            logging.debug("Probabilistic deconvolution unavailable for %s — using unique-only.",
+                          os.path.basename(mzml_file))
+
+        _evidence_by_scan = {}
+        if probabilistic_available and ambiguous_by_scan:
+            _ev_start = time.time()
+            _evidence_by_scan = precompute_evidence_by_scan(
+                rt_windows, peptides_info, ambiguous_by_scan, ambiguous_candidates_by_scan,
+                all_peptide_predictions, fragmentation_type, fragment_tolerance, fragment_unit,
+                precursor_tolerance, precursor_unit, selected_neutral_losses,
+                scan_window_lower, scan_window_upper, fragment_mz_lower, fragment_mz_upper,
+                min_intensity_threshold,
+            )
+            logging.debug("Evidence pre-computation: %d scans, %.2fs",
+                          len(_evidence_by_scan), time.time() - _ev_start)
+
+        # Process each peptide
+        for idx, peptide_info in enumerate(peptides_info):
+            if stop_event.is_set():
+                break
+
+            peptide, precursor_mz, charge, modification, start_rt, stop_rt, known_rt = peptide_info
+
+            # Get relevant spectra from RT window bins
+            relevant_spectra = []
+            for rt_key in range(int(float(start_rt) // 1), int(float(stop_rt) // 1) + 1):
+                if rt_key in rt_windows:
+                    relevant_spectra.extend(rt_windows[rt_key])
+
+            # Calculate mass tolerance for precursor
+            if precursor_unit == 'ppm':
+                tolerance = precursor_mz * precursor_tolerance / 1e6
+            else:  # Da
+                tolerance = precursor_tolerance
+
+            ms2_spectra = []
+            for spectrum in relevant_spectra:
+                # Filter by RT window first
+                spectrum_rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
+                if spectrum_rt < start_rt or spectrum_rt > stop_rt:
+                    continue
+                
+                # Then filter by precursor m/z
+                observed_mz = spectrum.get('precursorList', {}).get('precursor', [{}])[0] \
+                    .get('selectedIonList', {}).get('selectedIon', [{}])[0].get('selected ion m/z', 0)
+                if abs(observed_mz - precursor_mz) > tolerance:
+                    continue
+                ms2_spectra.append(spectrum)
+
+            ambiguous_fragments = False
+            unique_frags = None
+            if unique_frag_option in ("quant_only", "both"):
+                if all_theoretical_ions is not None and frag_index is not None:
+                    unique_frags = get_unique_fragments_for_peptide(
+                        idx, all_theoretical_ions, frag_index, fragment_tolerance,
+                        tolerance_unit=fragment_unit
+                    )
+                else:
+                    unique_frags = None
+                if flag_ambiguous and (unique_frags is None or len(unique_frags) == 0):
+                    ambiguous_fragments = True
+
+            if ms2_spectra:
+                # Select theoretical ions for this peptide
+                if unique_frag_option == "both" and unique_frags is not None:
+                    theoretical_ions = generate_theoretical_ions_cached(
+                        peptide, modification, fragmentation_type,
+                        selected_neutral_losses
+                    )
+                    theoretical_ions = filter_ions_by_unique(theoretical_ions, unique_frags)
+                else:
+                    theoretical_ions = generate_theoretical_ions_cached(
+                        peptide, modification, fragmentation_type,
+                        selected_neutral_losses
+                    )
+
+                max_fragments = sum(len(ions) for ion_type in theoretical_ions.values() for ions in ion_type.values())
+
+                fragment_eic_areas, total_eic_area = calculate_fragment_eic_areas(
+                    ms2_spectra, theoretical_ions, fragment_tolerance, fragment_unit,
+                    scan_window_lower=scan_window_lower, scan_window_upper=scan_window_upper,
+                    min_intensity_threshold=min_intensity_threshold
+                )
+
+                # When probabilistic deconvolution is active, the raw EIC
+                # double-counts shared-fragment intensity.  We accumulate the
+                # deconvolved (responsibility-weighted) intensities per
+                # fragment per RT during the scan loop, then recompute the
+                # EIC area from the corrected chromatograms afterward.
+                _is_probabilistic_eic = (
+                    unique_frag_option == "probabilistic" and probabilistic_available
+                )
+                _deconv_eic_accum = {}   # {(frag_label, charge): {rt: intensity}}
+                _results_start_idx = len(results)
+
+                all_intensities = 0
+                max_intensity = 0
+
+                for spectrum in ms2_spectra:
+                    scan_id = spectrum.get('id', '')
+                    scan_result = {
+                        'file': os.path.basename(mzml_file),
+                        'scan_number': scan_id,
+                        'peptide': peptide,
+                        'modification': modification if modification and pd.notna(modification) else '',
+                        'm_z': precursor_mz,
+                        'charge': charge,
+                        'rt': spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0),
+                        'known_rt': known_rt if known_rt is not None else np.nan,
+                        'start_rt': start_rt,
+                        'stop_rt': stop_rt,
+                        'matched_fragments': 0,
+                        'fragment_mzs': '',
+                        'fragment_charges': '',
+                        'predicted_fragment_intensities': '',
+                        'mass_accuracy': 0,
+                        'mass_accuracy_signed': 0.0,
+                        'rt_accuracy': 0,
+                        'charge_consistency': 0,
+                        'psm_score': 0,
+                        'matched_predicted_peaks': 0,
+                        'predicted_base_peak_matched': False,
+                        'predicted_top3_matched': False,
+                        'norm_mass_accuracy': 0,
+                        'norm_rt_accuracy': 0,
+                        'norm_fragment_count': 0,
+                        'total_intensity': 0,
+                        'max_intensity': 0,
+                        'eic_area': total_eic_area,
+                        'PSM ambiguity': ambiguous_fragments
+                    }
+                    # Fragment matching for identification
+                    matched_ions, all_matched_intensity = calculate_fragment_intensity(
+                        theoretical_ions, spectrum, fragment_tolerance, fragment_unit,
+                        scan_window_lower=scan_window_lower, scan_window_upper=scan_window_upper,
+                        fragment_mz_lower=fragment_mz_lower, fragment_mz_upper=fragment_mz_upper,
+                        min_intensity_threshold=min_intensity_threshold
+                    )
+                    ambiguous_fragments_this_scan = ambiguous_by_scan.get(scan_id, set())
+                    ambiguous_candidates_this_scan = ambiguous_candidates_by_scan.get(scan_id, {})
+                    # ------------------------------------------------------------------
+                    # Quantification-ion selection (3 modes)
+                    # ------------------------------------------------------------------
+                    _n_shared_ions = 0
+                    _shared_assigned_intensity = 0.0
+                    _deconv_confidence = 1.0
+
+                    if unique_frag_option == "all":
+                        matched_ions_quant = matched_ions
+
+                    elif unique_frag_option == "probabilistic" and probabilistic_available:
+                        # ---------- Probabilistic shared-ion deconvolution ----------
+
+                        # EARLY EXIT: check if this peptide has ANY shared ions in this scan.
+                        # When there are none, skip all deconvolution math entirely.
+                        _has_shared = False
+                        if ambiguous_fragments_this_scan:
+                            for _ion in matched_ions:
+                                if (idx, _ion[0], _ion[2], _ion[1]) in ambiguous_fragments_this_scan:
+                                    _has_shared = True
+                                    break
+
+                        if not _has_shared:
+                            # All ions are unique — no deconvolution needed
+                            matched_ions_quant = matched_ions
+                            _deconv_confidence = 1.0
+                        else:
+                            # 1. Identify unique (non-shared) ions for this peptide
+                            unique_ions_this = [
+                                ion for ion in matched_ions
+                                if (idx, ion[0], ion[2], ion[1]) not in ambiguous_fragments_this_scan
+                            ]
+
+                            # 2. Retrieve full per-scan evidence for ALL competing
+                            #    peptides (pre-computed via vectorised batch).
+                            _all_evidence = _evidence_by_scan.get(scan_id, {})
+
+                            # 3. Run probabilistic assignment (vectorised softmax)
+                            matched_ions_quant, _n_shared_ions, _shared_assigned_intensity, _deconv_confidence = \
+                                assign_shared_intensities(
+                                    matched_ions, ambiguous_fragments_this_scan, idx,
+                                    all_peptide_predictions, _all_evidence,
+                                    ambiguous_candidates_this_scan
+                                )
+
+                            # Fallback: if no ions left (all shared with zero weight), keep uniques
+                            if not matched_ions_quant or sum(ion[3] for ion in matched_ions_quant) == 0:
+                                matched_ions_quant = unique_ions_this
+                                _deconv_confidence = 0.0
+
+                    elif unique_frag_option == "probabilistic" and not probabilistic_available:
+                        # Probabilistic mode requested but unavailable -> use unique-only quantification
+                        matched_ions_quant = [
+                            ion for ion in matched_ions
+                            if (idx, ion[0], ion[2], ion[1]) not in ambiguous_fragments_this_scan
+                        ]
+
+                    else:
+                        # Default: only keep non-ambiguous fragments for quantification
+                        matched_ions_quant = [
+                            ion for ion in matched_ions
+                            if (idx, ion[0], ion[2], ion[1]) not in ambiguous_fragments_this_scan
+                        ]
+
+                    # If all fragments are ambiguous, flag and skip quantification
+                    if flag_ambiguous and (not matched_ions_quant or len(matched_ions_quant) == 0):
+                        scan_result['PSM ambiguity'] = True
+                        scan_result['matched_fragments'] = 0
+                        scan_result['fragment_mzs'] = ''
+                        scan_result['fragment_charges'] = ''
+                        scan_result['psm_score'] = 0
+                        scan_result['note'] = "All fragments ambiguous (scan-level)"
+                        results.append(scan_result)
+                        continue
+
+                    if matched_ions:
+                        rt_value = scan_result['rt']
+                        _pred_for_sa = all_peptide_predictions.get(idx, {})
+
+                        # Add matched ions to this scan's record
+                        for ion in matched_ions:
+                            ion_type, mz, ion_charge, intensity, mass_accuracy, nl_type, fragment_position = ion
+                            pred_key = (ion_type, fragment_position, ion_charge)
+                            pred_int = _pred_for_sa.get(pred_key)
+                            if pred_int is None and ion_charge > 1:
+                                pred_int = _pred_for_sa.get((ion_type, fragment_position, 1))
+                            if pred_int is None:
+                                pred_int = np.nan
+                            all_intensities += intensity
+                            max_intensity = max(max_intensity, intensity)
+                            if eic_records is not None:
+                                _charge_suffix = '' if ion_charge == 1 else '\u00b2\u207a' if ion_charge == 2 else '\u00b3\u207a' if ion_charge == 3 else f'{ion_charge}+'
+                                eic_records.append({
+                                    'peptide': peptide,
+                                    'modification': modification,
+                                    'precursor_mz': precursor_mz,
+                                    'precursor_charge': charge,
+                                    'file': os.path.basename(mzml_file),
+                                    'scan_number': scan_id,
+                                    'ion_type': f"{ion_type}{fragment_position}{_charge_suffix}",
+                                    'neutral_loss': nl_type,
+                                    'fragment_theoretical_mz': mz,
+                                    'fragment_charge': ion_charge,
+                                    'predicted_intensity': pred_int,
+                                    'rt': rt_value,
+                                    'intensity': intensity
+                                })
+
+                        # ── Add UNMATCHED predicted fragments (intensity=0) so the
+                        #    mirror plot can display the full predicted spectrum  ──
+                        if eic_records is not None and _pred_for_sa:
+                            _matched_keys = set()
+                            for ion in matched_ions:
+                                _it, _mz, _ic, _intens, _ma, _nl, _fp = ion
+                                _matched_keys.add((_it, _fp, _ic))
+                                if _ic > 1:
+                                    _matched_keys.add((_it, _fp, 1))
+                            for (p_ion_type, p_pos, p_charge), p_int in _pred_for_sa.items():
+                                if (p_ion_type, p_pos, p_charge) in _matched_keys:
+                                    continue
+                                # Look up theoretical m/z from the theoretical_ions dict
+                                _theo_mz = np.nan
+                                _charge_ions = theoretical_ions.get(p_ion_type, {}).get(p_charge)
+                                if _charge_ions is not None and 0 < p_pos <= len(_charge_ions):
+                                    _tmz = _charge_ions[p_pos - 1]
+                                    if _tmz is not None:
+                                        _theo_mz = _tmz
+                                if np.isnan(_theo_mz):
+                                    continue
+                                _p_charge_suffix = '' if p_charge == 1 else '\u00b2\u207a' if p_charge == 2 else '\u00b3\u207a' if p_charge == 3 else f'{p_charge}+'
+                                eic_records.append({
+                                    'peptide': peptide,
+                                    'modification': modification,
+                                    'precursor_mz': precursor_mz,
+                                    'precursor_charge': charge,
+                                    'file': os.path.basename(mzml_file),
+                                    'scan_number': scan_id,
+                                    'ion_type': f"{p_ion_type}{p_pos}{_p_charge_suffix}",
+                                    'neutral_loss': '',
+                                    'fragment_theoretical_mz': _theo_mz,
+                                    'fragment_charge': p_charge,
+                                    'predicted_intensity': p_int,
+                                    'rt': rt_value,
+                                    'intensity': 0
+                                })
+
+                        # Intensity-weighted mean absolute mass accuracy (ppm)
+                        _ion_ppm = np.array([ion[4] for ion in matched_ions])
+                        _ion_int = np.array([ion[3] for ion in matched_ions])
+                        if _ion_int.sum() > 0:
+                            mass_accuracy = float(np.average(np.abs(_ion_ppm), weights=_ion_int))
+                            mass_accuracy_signed = float(np.average(_ion_ppm, weights=_ion_int))
+                        else:
+                            mass_accuracy = float(np.mean(np.abs(_ion_ppm)))
+                            mass_accuracy_signed = float(np.mean(_ion_ppm))
+
+                        rt_accuracy = abs(rt_value - known_rt) if known_rt is not None else 0
+                        fragment_count = len(matched_ions)
+                        # Fraction of fragments with charge ≤ precursor charge
+                        # (higher-charge fragments are physically unlikely and
+                        #  suggest false matches)
+                        charge_consistency = (
+                            sum(1 for ion in matched_ions if ion[2] <= charge)
+                            / len(matched_ions)
+                        ) if matched_ions else 0.0
+
+                        continuity_score = calculate_continuity_score(matched_ions)
+                        complementarity_score = calculate_complementarity_score(matched_ions, len(peptide))
+
+                        # Spectral similarity (SA) against MS2PIP predictions
+                        _spectral_angle, _matched_predicted_peaks = compute_spectral_similarity(
+                            matched_ions, _pred_for_sa, method='SA'
+                        )
+
+                        # CHIMERYS-style predicted peak coverage checks:
+                        # Determine if the predicted base peak (overall most intense
+                        # predicted fragment) was among the matched ions, and
+                        # whether any of the top-3 predicted peaks were matched.
+                        _pred_base_peak_matched = False
+                        _pred_top3_matched = False
+                        if _pred_for_sa:
+                            _all_pred_vals = list(_pred_for_sa.values())
+                            _all_pred_vals_sorted = sorted(_all_pred_vals, reverse=True)
+                            _pred_base_val = _all_pred_vals_sorted[0]
+                            _top3_threshold = _all_pred_vals_sorted[min(2, len(_all_pred_vals_sorted) - 1)]
+
+                            # Build set of matched predicted keys
+                            _matched_pred_keys = set()
+                            for _ion in matched_ions:
+                                _it, _mz2, _ic, _intens, _pp, _nl, _fp = _ion
+                                if _nl is not None:
+                                    continue
+                                _k = (_it, _fp, _ic)
+                                if _k in _pred_for_sa:
+                                    _matched_pred_keys.add(_k)
+                                elif _ic > 1 and (_it, _fp, 1) in _pred_for_sa:
+                                    _matched_pred_keys.add((_it, _fp, 1))
+
+                            for _k in _matched_pred_keys:
+                                _pv = _pred_for_sa[_k]
+                                if _pv >= _pred_base_val:
+                                    _pred_base_peak_matched = True
+                                if _pv >= _top3_threshold:
+                                    _pred_top3_matched = True
+
+                        # RT window width for Gaussian RT normalisation
+                        _rt_window_width = (stop_rt - start_rt) if (start_rt is not None and stop_rt is not None) else None
+
+                        psm_score = calculate_psm_score(
+                            mass_accuracy, fragment_count, rt_accuracy,
+                            charge_consistency, fragment_tolerance,
+                            max_fragments=max_fragments,
+                            rt_window_width=_rt_window_width,
+                            continuity_score=continuity_score,
+                            complementarity_score=complementarity_score
+                        )
+
+                        quant_count = len(matched_ions_quant)
+                        quant_intensity = sum(ion[3] for ion in matched_ions_quant)
+                        quant_mzs = ', '.join(f"{ion[1]:.4f}:{ion[4]:.6f}" for ion in matched_ions_quant)
+                        quant_charges = ', '.join(str(ion[2]) for ion in matched_ions_quant)
+
+                        # Accumulate deconvolved intensities for EIC recomputation.
+                        # Each ion in matched_ions_quant carries the responsibility-
+                        # weighted intensity; unique ions keep their raw value.
+                        if _is_probabilistic_eic:
+                            _rt_eic = scan_result['rt']
+                            for _qi in matched_ions_quant:
+                                _qi_type, _qi_mz, _qi_ch, _qi_int, _qi_ma, _qi_nl, _qi_pos = _qi
+                                _fk = (
+                                    f"{_qi_type}{_qi_pos}-{_qi_nl}" if _qi_nl
+                                    else f"{_qi_type}{_qi_pos}",
+                                    _qi_ch,
+                                )
+                                if _fk not in _deconv_eic_accum:
+                                    _deconv_eic_accum[_fk] = {}
+                                # Max intensity at this RT (mirrors raw EIC logic)
+                                _prev = _deconv_eic_accum[_fk].get(_rt_eic, 0.0)
+                                if _qi_int > _prev:
+                                    _deconv_eic_accum[_fk][_rt_eic] = _qi_int
+
+                        # Store all-matched-ion fragment info (consistent with PSM score inputs)
+                        all_mzs = ', '.join(f"{ion[1]:.4f}:{ion[4]:.6f}" for ion in matched_ions)
+                        all_charges = ', '.join(str(ion[2]) for ion in matched_ions)
+                        all_pred_ints = ', '.join(
+                            f"{float(_pred_for_sa.get((ion[0], ion[6], ion[2]), _pred_for_sa.get((ion[0], ion[6], 1), np.nan))):.6f}"
+                            if pd.notna(_pred_for_sa.get((ion[0], ion[6], ion[2]), _pred_for_sa.get((ion[0], ion[6], 1), np.nan)))
+                            else ""
+                            for ion in matched_ions
+                        )
+
+                        # Gaussian-normalised diagnostics (consistent with PSM score inputs)
+                        _sigma_mass_diag = fragment_tolerance / 3.0
+                        _norm_mass_acc = float(np.exp(-0.5 * (mass_accuracy / _sigma_mass_diag) ** 2))
+                        _norm_frag_cnt = float(np.log1p(fragment_count) / np.log1p(max_fragments)) if max_fragments > 0 else 0.0
+                        if rt_accuracy is not None and _rt_window_width is not None and _rt_window_width > 0:
+                            _sigma_rt_diag = _rt_window_width / 4.0
+                            _norm_rt_acc = float(np.exp(-0.5 * (rt_accuracy / _sigma_rt_diag) ** 2))
+                        elif rt_accuracy is not None:
+                            _norm_rt_acc = 1.0 / (1.0 + rt_accuracy)
+                        else:
+                            _norm_rt_acc = 0.5
+
+                        scan_result.update({
+                            'matched_fragments': fragment_count,
+                            'fragment_mzs': all_mzs,
+                            'fragment_charges': all_charges,
+                            'predicted_fragment_intensities': all_pred_ints,
+                            'mass_accuracy': mass_accuracy,
+                            'mass_accuracy_signed': mass_accuracy_signed,
+                            'rt_accuracy': rt_accuracy,
+                            'charge_consistency': charge_consistency,
+                            'continuity_score': continuity_score,
+                            'complementarity_score': complementarity_score,
+                            'spectral_angle': _spectral_angle,
+                            'matched_predicted_peaks': _matched_predicted_peaks,
+                            'predicted_base_peak_matched': _pred_base_peak_matched,
+                            'predicted_top3_matched': _pred_top3_matched,
+                            'psm_score': psm_score,
+                            'norm_mass_accuracy': _norm_mass_acc,
+                            'norm_rt_accuracy': _norm_rt_acc,
+                            'norm_fragment_count': min(_norm_frag_cnt, 1.0),
+                            'total_intensity': quant_intensity,
+                            'max_intensity': max_intensity,
+                            'eic_area': total_eic_area,
+                            'PSM ambiguity': False,
+                            'shared_ion_count': _n_shared_ions,
+                            'deconv_confidence': _deconv_confidence,
+                        })
+
+                        results.append(scan_result)
+
+                # ── Recompute EIC from deconvolved intensities ──────────
+                # Replaces the raw total_eic_area (which double-counts shared
+                # fragments) with an area integrated from the responsibility-
+                # weighted chromatograms collected during the scan loop.
+                if _is_probabilistic_eic and _deconv_eic_accum:
+                    _deconv_total_eic = 0.0
+                    for _fk, _rt_dict in _deconv_eic_accum.items():
+                        if len(_rt_dict) < 3:
+                            # Same min-scans rule as raw EIC integration
+                            continue
+                        _srt = sorted(_rt_dict.keys())
+                        _sint = [_rt_dict[r] for r in _srt]
+                        _area = trapezoid(_sint, _srt)
+                        if _area > 0:
+                            _deconv_total_eic += _area
+                    # Back-fill every result row for this peptide/file
+                    for _ri in range(_results_start_idx, len(results)):
+                        results[_ri]['eic_area'] = _deconv_total_eic
+
+        return results
+    except Exception as e:
+        logging.error(f"Error processing file {mzml_file}: {str(e)}")
+        traceback.print_exc()
+        return []
+                        
+# Helper function to filter theoretical ions to only unique fragments
+def filter_ions_by_unique(theoretical_ions, unique_frags, tolerance=1e-6):
+    """
+    Filter a theoretical_ions dict to only keep ions present in unique_frags.
+
+    Uses tolerance-based matching (default 1e-6 Da) instead of rounding,
+    which avoids edge-case mismatches at rounding boundaries.
+
+    Parameters
+    ----------
+    theoretical_ions : dict
+        {ion_type: {charge: [mz, ...]}}
+    unique_frags : list of (ion_type, charge, mz)
+    tolerance : float
+        Absolute m/z tolerance in Da for matching (default 1e-6).
+    """
+    filtered = {}
+    # Group unique frags by (ion_type, charge) and sort for binary search
+    unique_by_key = {}
+    for ion_type, charge, mz in unique_frags:
+        key = (ion_type, charge)
+        if key not in unique_by_key:
+            unique_by_key[key] = []
+        unique_by_key[key].append(mz)
+    for key in unique_by_key:
+        unique_by_key[key] = np.array(sorted(unique_by_key[key]))
+
+    for ion_type, charges in theoretical_ions.items():
+        filtered[ion_type] = {}
+        for charge, mzs in charges.items():
+            filtered_mzs = []
+            unique_arr = unique_by_key.get((ion_type, charge))
+            if unique_arr is None or len(unique_arr) == 0:
+                filtered[ion_type][charge] = filtered_mzs
+                continue
+            for mz in mzs:
+                if mz is None:  # NL placeholder — skip
+                    continue
+                # Binary search for closest unique fragment
+                idx = np.searchsorted(unique_arr, mz)
+                matched = False
+                for check_idx in (idx - 1, idx):
+                    if 0 <= check_idx < len(unique_arr):
+                        if abs(unique_arr[check_idx] - mz) <= tolerance:
+                            matched = True
+                            break
+                if matched:
+                    filtered_mzs.append(mz)
+            filtered[ion_type][charge] = filtered_mzs
+    return filtered
+        
+def prepare_mokapot_features(results_df, rt_drift_applied=False):
+    """Prepare features for Mokapot rescoring.
+
+    When ``rt_drift_applied`` is True the raw rt_accuracy (which has
+    already been corrected in-place by apply_rt_drift_correction) is
+    kept as a feature **but its weight is reduced** by replacing the
+    raw mass×RT interaction term with a mass-only term.  The corrected
+    rt_accuracy still carries useful residual information (random
+    scatter) that helps separate true from false PSMs, so dropping it
+    entirely would lose discriminative power.
+    """
+    features = pd.DataFrame()
+    
+    # Use pre-calculated metrics from PSM identification
+    features['mass_accuracy'] = results_df['mass_accuracy']
+    # rt_accuracy is already the corrected value when drift correction was applied
+    features['rt_accuracy'] = results_df['rt_accuracy']
+    features['charge_consistency'] = results_df['charge_consistency']
+    features['psm_score'] = results_df['psm_score']
+    
+    # Add continuity score if available
+    if 'continuity_score' in results_df.columns:
+        features['continuity_score'] = results_df['continuity_score']
+    else:
+        features['continuity_score'] = 0  # Default value if not calculated
+    
+    # Add complementarity score if available
+    if 'complementarity_score' in results_df.columns:
+        features['complementarity_score'] = results_df['complementarity_score']
+    else:
+        features['complementarity_score'] = 0  # Default value if not calculated
+
+    # Spectral angle from MS2PIP predicted-vs-observed comparison
+    if 'spectral_angle' in results_df.columns:
+        features['spectral_angle'] = results_df['spectral_angle']
+    else:
+        features['spectral_angle'] = 0
+
+    # Calculate max theoretical fragments: 2*(N-1) for b+y singly-charged
+    _seq_lens = results_df['peptide'].str.replace(r'^DECOY_', '', regex=True).str.len()
+    _max_theo = 2 * (_seq_lens - 1)
+    _max_theo = _max_theo.clip(lower=1)  # avoid division by zero
+
+    # Number of matched peaks that also have a predicted intensity
+    # Normalize by max theoretical fragments to avoid penalising short peptides.
+    if 'matched_predicted_peaks' in results_df.columns:
+        features['matched_predicted_peaks_ratio'] = (
+            results_df['matched_predicted_peaks'] / _max_theo
+        )
+    else:
+        features['matched_predicted_peaks_ratio'] = 0
+
+    # Predicted base peak matched (boolean → 0/1)
+    if 'predicted_base_peak_matched' in results_df.columns:
+        features['predicted_base_peak_matched'] = results_df['predicted_base_peak_matched'].astype(float)
+    else:
+        features['predicted_base_peak_matched'] = 1.0
+
+    # Predicted top-3 peak matched (boolean → 0/1)
+    if 'predicted_top3_matched' in results_df.columns:
+        features['predicted_top3_matched'] = results_df['predicted_top3_matched'].astype(float)
+    else:
+        features['predicted_top3_matched'] = 1.0
+
+    # Chimeric deconvolution confidence (higher = less ambiguity)
+    if 'deconv_confidence' in results_df.columns:
+        features['deconv_confidence'] = results_df['deconv_confidence']
+    else:
+        features['deconv_confidence'] = 1.0
+
+    # Calculate fragment ratio using the already-computed _max_theo
+    features['fragments_ratio'] = results_df['matched_fragments'] / _max_theo
+    
+    # Add interaction terms
+    features['mass_rt_interaction'] = features['mass_accuracy'] * features['rt_accuracy']
+    features['continuity_fragment_interaction'] = features['continuity_score'] * features['fragments_ratio']
+    features['complementarity_fragment_interaction'] = features['complementarity_score'] * features['fragments_ratio']
+    features['sa_fragment_interaction'] = features['spectral_angle'] * features['fragments_ratio']
+
+    # NOTE: norm_rt_accuracy is intentionally NOT included here.  It is a
+    # monotonic transformation of rt_accuracy (Gaussian kernel) and therefore
+    # perfectly correlated — adding it would introduce multicollinearity
+    # without new discriminative information.  The raw rt_accuracy already
+    # carries the drift-corrected signal when drift correction is enabled.
+
+    # Mokapot / Percolator uses its own SVM-based learning so raw features
+    # are preferred — the SVM learns optimal decision boundaries in the
+    # original feature space.  Pre-normalization (MinMaxScaler) can compress
+    # useful variance and clip outliers that are informative to the SVM.
+    # We therefore return the features as-is (no MinMaxScaler).
+
+    return features
+
+def rescore_with_mokapot(results_df, features, fdr_threshold=0.01):
+    """
+    Rescore PSMs using Mokapot with improved error handling.
+    Falls back to a simpler method when mokapot is not available or encounters errors.
+    Memory-efficient: uses vectorized PIN construction and merge-based score transfer.
+    
+    Parameters
+    ----------
+    fdr_threshold : float
+        FDR level passed to mokapot.brew(test_fdr=...). Defaults to 0.01 (1%).
+    """
+    if not HAS_MOKAPOT:
+        logging.info("Mokapot not available. Using simple FDR calculation.")
+        return calculate_simple_fdr(results_df)
+    
+    logging.info("Starting Mokapot rescoring...")
+    n_records = len(results_df)
+    logging.info(f"Processing {n_records:,} records for Mokapot rescoring")
+    
+    try:
+        # ---- Build PIN DataFrame using vectorized operations (memory-efficient) ----
+        logging.info("Building PIN data (vectorized)...")
+        
+        # Build SpecId column vectorized
+        file_col = results_df['file'].fillna('unknown').astype(str)
+        scan_col = results_df['scan_number'].astype(str) if 'scan_number' in results_df.columns else pd.Series(range(n_records), dtype=str)
+        spec_ids = file_col + '_' + scan_col
+        
+        pin_df = pd.DataFrame({
+            'SpecId': spec_ids.values,
+            'Label': results_df['Label'].values,
+            'ScanNr': results_df['scan_number'].values if 'scan_number' in results_df.columns else np.arange(n_records),
+            'ExpMass': (pd.to_numeric(results_df['m_z'], errors='coerce').fillna(0) * 
+                       pd.to_numeric(results_df['charge'], errors='coerce').fillna(1) -
+                       pd.to_numeric(results_df['charge'], errors='coerce').fillna(1) * PROTON_MASS).astype(np.float64).values,
+            'Peptide': results_df['peptide'].values,
+            'Proteins': np.where(results_df['Label'].values == -1, 'DECOY_', 'TARGET'),
+        })
+        
+        # Add feature columns directly from the features DataFrame (already computed)
+        feature_cols = ['mass_accuracy', 'rt_accuracy', 'charge_consistency', 'psm_score',
+                       'fragments_ratio', 'mass_rt_interaction', 'continuity_score',
+                       'complementarity_score', 'continuity_fragment_interaction',
+                       'complementarity_fragment_interaction',
+                       'spectral_angle', 'matched_predicted_peaks_ratio',
+                       'predicted_base_peak_matched', 'predicted_top3_matched',
+                       'deconv_confidence', 'sa_fragment_interaction']
+        for i, col in enumerate(feature_cols, 1):
+            if col in features.columns:
+                pin_df[f'Feature_{i}'] = features[col].astype(np.float64).values
+            else:
+                pin_df[f'Feature_{i}'] = np.float64(0.0)
+        
+        logging.info(f"PIN DataFrame built: {pin_df.shape[0]:,} rows, {pin_df.shape[1]} columns")
+        gc.collect()
+        
+        # ---- Run Mokapot ----
+        logging.info("Reading PIN data into Mokapot...")
+        psms = mokapot.read_pin(pin_df)
+        
+        logging.info("Running Mokapot confidence estimation (brew)...")
+        try:
+            # Build a model with n_jobs=1 to prevent GridSearchCV from
+            # spawning worker processes (which duplicate the GUI on Windows).
+            _ensure_mokapot()
+            _brew_model = None
+            if _PercolatorModel is not None:
+                _brew_model = _PercolatorModel(n_jobs=1)
+            confidence_results = mokapot.brew(
+                psms,
+                model=_brew_model,
+                test_fdr=np.float64(fdr_threshold),
+                max_workers=1  # Use single worker to control memory with large datasets
+            )
+        except Exception as brew_error:
+            logging.error(f"Error during Mokapot brew(): {str(brew_error)}")
+            del pin_df
+            gc.collect()
+            return calculate_simple_fdr(results_df)
+        
+        # Free PIN data now that brewing is done
+        del pin_df
+        gc.collect()
+        
+        # ---- Extract PSM results ----
+        psm_df = None
+        try:
+            if hasattr(confidence_results, 'psms'):
+                psm_df = confidence_results.psms
+                logging.info("Retrieved PSM results from ConfidenceResults object")
+            elif isinstance(confidence_results, tuple) and len(confidence_results) > 0:
+                item = confidence_results[0]
+                if hasattr(item, 'psms'):
+                    psm_df = item.psms
+                elif isinstance(item, pd.DataFrame):
+                    psm_df = item
+                logging.info("Retrieved PSM results from tuple")
+            
+            # Handle LinearConfidence wrapper
+            if psm_df is not None and hasattr(psm_df, 'psms'):
+                psm_df = psm_df.psms
+        except Exception as access_error:
+            logging.error(f"Error accessing Mokapot results: {str(access_error)}")
+            return calculate_simple_fdr(results_df)
+        
+        if psm_df is None or not isinstance(psm_df, pd.DataFrame):
+            logging.warning(f"No valid PSM DataFrame from Mokapot (type: {type(psm_df)})")
+            return calculate_simple_fdr(results_df)
+        
+        logging.info(f"Mokapot returned {len(psm_df):,} scored PSMs")
+        logging.info(f"Mokapot result columns: {psm_df.columns.tolist()}")
+        
+        # ---- Merge scores back using vectorized join (NOT row-by-row iterrows) ----
+        logging.info("Merging Mokapot scores back to results (vectorized)...")
+        
+        # Build spec_id for results_df
+        results_df['_spec_id'] = file_col.values + '_' + scan_col.values
+        
+        # Initialize default columns
+        results_df['mokapot_score'] = np.float64(0.0)
+        results_df['mokapot_qvalue'] = np.float64(1.0)
+        results_df['mokapot_PEP'] = np.float64(1.0)
+        
+        # Detect which column naming convention mokapot used
+        standard_cols = ['score', 'q-value', 'posterior_error_prob']
+        alt_cols = ['mokapot score', 'mokapot q-value', 'mokapot PEP']
+        
+        score_col = qval_col = pep_col = None
+        if all(col in psm_df.columns for col in standard_cols):
+            score_col, qval_col, pep_col = standard_cols
+        elif all(col in psm_df.columns for col in alt_cols):
+            score_col, qval_col, pep_col = alt_cols
+        else:
+            logging.warning(f"Missing expected columns in Mokapot results. Found: {psm_df.columns.tolist()}")
+            results_df.drop(columns=['_spec_id'], inplace=True)
+            return calculate_simple_fdr(results_df)
+        
+        # Prepare mokapot results for merge
+        # If SpecId is the index, reset it; otherwise use the column
+        if psm_df.index.name == 'SpecId' or 'SpecId' not in psm_df.columns:
+            psm_df = psm_df.reset_index()
+        
+        mokapot_scores = psm_df[['SpecId', score_col, qval_col, pep_col]].copy()
+        mokapot_scores.columns = ['_spec_id', '_mk_score', '_mk_qvalue', '_mk_pep']
+        mokapot_scores = mokapot_scores.drop_duplicates(subset='_spec_id', keep='first')
+        
+        # Vectorized merge
+        results_df = results_df.merge(mokapot_scores, on='_spec_id', how='left')
+        
+        # Fill in mokapot columns from merge
+        mask = results_df['_mk_score'].notna()
+        results_df.loc[mask, 'mokapot_score'] = results_df.loc[mask, '_mk_score'].astype(np.float64)
+        results_df.loc[mask, 'mokapot_qvalue'] = results_df.loc[mask, '_mk_qvalue'].astype(np.float64)
+        results_df.loc[mask, 'mokapot_PEP'] = results_df.loc[mask, '_mk_pep'].astype(np.float64)
+        
+        # Clean up temporary columns
+        results_df.drop(columns=['_spec_id', '_mk_score', '_mk_qvalue', '_mk_pep'], inplace=True, errors='ignore')
+        
+        matched = mask.sum()
+        logging.info(f"Mokapot rescoring completed: {matched:,}/{n_records:,} PSMs scored")
+        
+        # ---- Detect mokapot failure: all q-values still at default 1.0 ----
+        # When mokapot cannot discriminate targets from decoys, every PSM
+        # keeps mokapot_qvalue = 1.0 / mokapot_PEP = 1.0.  This makes the
+        # downstream FDR filter reject everything.  Fall back to the simple
+        # target-decoy FDR so the user still gets usable results.
+        if (results_df['mokapot_qvalue'] == 1.0).all():
+            logging.warning(
+                "Mokapot rescoring failed to discriminate targets from decoys "
+                "(all q-values = 1.0).  Falling back to naive target-decoy FDR."
+            )
+            results_df.drop(columns=['mokapot_score', 'mokapot_qvalue', 'mokapot_PEP'],
+                            inplace=True, errors='ignore')
+            gc.collect()
+            return calculate_simple_fdr(results_df)
+        
+        # Mark that mokapot scoring succeeded
+        results_df.attrs['scoring_method'] = 'mokapot'
+        gc.collect()
+        return results_df
+        
+    except Exception as e:
+        logging.error(f"Error during Mokapot rescoring: {str(e)}")
+        # Clean up temp column if it exists
+        if '_spec_id' in results_df.columns:
+            results_df.drop(columns=['_spec_id'], inplace=True, errors='ignore')
+        # Fall back to simple FDR calculation
+        return calculate_simple_fdr(results_df)
+                
+def calculate_simple_fdr(results_df):
+    """
+    A simpler FDR calculation method that doesn't rely on mokapot.
+    Used as a fallback when mokapot is not available or when mokapot
+    fails to discriminate targets from decoys.
+    Operates IN-PLACE to avoid duplicating the entire DataFrame.
+    
+    Columns produced:
+        score    – the raw psm_score (used for ranking)
+        qvalue   – monotonised FDR (q-value) from target-decoy competition
+        PEP      – NaN (PEP requires mixture-model estimation)
+    
+    These are intentionally NOT named mokapot_* so the user can
+    distinguish which method produced the confidence estimates.
+    """
+    logging.info("Calculating FDR using target-decoy approach (in-place)")
+    
+    if 'Label' not in results_df.columns:
+        results_df['Label'] = np.where(results_df['peptide'].str.startswith('DECOY_'), -1, 1)
+    
+    # Sort in-place — avoids a full copy (~2 GB for 8M+ rows)
+    results_df.sort_values(by='psm_score', ascending=False, inplace=True)
+    results_df.reset_index(drop=True, inplace=True)
+    
+    is_target = results_df['Label'] == 1
+    results_df['cum_targets'] = is_target.cumsum()
+    results_df['cum_decoys'] = (~is_target).cumsum()
+    
+    # (D + 1) / T  — the +1 correction prevents FDR = 0 and reduces
+    # anti-conservative bias inherent in the naive D/T estimator.
+    raw_fdr = (results_df['cum_decoys'] + 1) / results_df['cum_targets'].clip(lower=1)
+    
+    results_df['qvalue'] = raw_fdr[::-1].cummin()[::-1].astype(np.float64)
+    results_df['score'] = results_df['psm_score'].astype(np.float64)
+    results_df['PEP'] = np.nan  # PEP requires mixture model estimation; cannot equate to q-value
+    
+    # Mark that simple TD-FDR was used (checked downstream)
+    results_df.attrs['scoring_method'] = 'target-decoy'
+    
+    results_df.drop(['cum_targets', 'cum_decoys'], axis=1, inplace=True)
+    
+    return results_df
+
+def save_combined_results(combined_df, output_folder):
+    """Save the combined results to a CSV file."""
+    try:
+        combined_path = _output_path(output_folder, 'Combined')
+        # Remove the _row_color column before saving
+        if '_row_color' in combined_df.columns:
+            combined_df_no_color = combined_df.drop('_row_color', axis=1, errors='ignore')
+        else:
+            combined_df_no_color = combined_df.copy()
+        combined_df_no_color.to_csv(combined_path, index=False)
+        logging.info(f"Combined results successfully saved to {combined_path}.")
+    except Exception as e:
+        logging.error(f"Error saving combined results to {output_folder}: {str(e)}")
+        raise
+
+def log_memory_usage(label):
+    """Log current process and system memory usage for debugging memory issues."""
+    try:
+        import psutil
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        sys_mem = psutil.virtual_memory()
+        logging.info(
+            f"[MEMORY] {label}: Process={mem_info.rss / (1024**3):.2f} GB, "
+            f"System={sys_mem.used / (1024**3):.1f}/{sys_mem.total / (1024**3):.1f} GB "
+            f"({sys_mem.percent}%)"
+        )
+    except Exception:
+        pass
+
+def calculate_delta_cn(results_df):
+    """
+    Calculate delta Cn for each spectrum using IN-PLACE vectorized operations.
+    Avoids copying the entire DataFrame (saves ~2 GB for 8M+ records).
+    
+    Parameters:
+    -----------
+    results_df : pd.DataFrame
+        DataFrame containing PSM results with columns 'file', 'scan_number', and 'psm_score'.
+    
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with an additional column 'delta_cn'.
+    """
+    logging.info("Calculating delta Cn scores (in-place)...")
+    
+    # In-place delta Cn: NO .copy() — saves ~2 GB for 8M+ rows
+    results_df['delta_cn'] = 0.0
+    
+    logging.info("  Computing best and second-best scores per spectrum...")
+    grouped = results_df.groupby(['file', 'scan_number'])['psm_score']
+    best_scores = grouped.transform('max')
+    
+    results_df['_rank'] = grouped.rank(method='first', ascending=False)
+    
+    second_best_df = results_df.loc[results_df['_rank'] == 2, ['file', 'scan_number', 'psm_score']].copy()
+    second_best_df = second_best_df.set_index(['file', 'scan_number'])['psm_score']
+    second_best_df.name = '_second_best'
+    
+    results_df = results_df.join(second_best_df, on=['file', 'scan_number'])
+    results_df['_second_best'] = results_df['_second_best'].fillna(0.0)
+    
+    is_best = results_df['_rank'] == 1
+    has_positive_score = best_scores > 0
+    mask = is_best & has_positive_score
+    results_df.loc[mask, 'delta_cn'] = (
+        (best_scores[mask] - results_df.loc[mask, '_second_best']) /
+        best_scores[mask]
+    )
+    
+    results_df.drop(columns=['_rank', '_second_best'], inplace=True)
+    del second_best_df, best_scores
+    gc.collect()
+    
+    logging.info("Delta Cn calculation completed")
+    return results_df
+
+def build_qc_metrics_table(results_df):
+    """Build QC summary metrics for export to an optional workbook sheet."""
+    if results_df is None or results_df.empty:
+        return pd.DataFrame()
+
+    # Use target PSMs only for QC summaries
+    if 'Label' in results_df.columns:
+        target_df = results_df[results_df['Label'] == 1]
+    else:
+        target_df = results_df[~results_df['peptide'].astype(str).str.startswith('DECOY_')]
+
+    if target_df.empty:
+        return pd.DataFrame()
+
+    def _safe_mean(series):
+        return float(series.mean()) if len(series) else np.nan
+
+    def _safe_median(series):
+        return float(series.median()) if len(series) else np.nan
+
+    def _safe_std(series):
+        return float(series.std()) if len(series) else np.nan
+
+    def _build_row(df_slice, scope_label):
+        mass_error = pd.to_numeric(df_slice.get('mass_accuracy', pd.Series(dtype=float)), errors='coerce').dropna()
+        fragment_coverage_pct = (
+            pd.to_numeric(df_slice.get('norm_fragment_count', pd.Series(dtype=float)), errors='coerce').dropna() * 100.0
+        )
+
+        rt_values = pd.to_numeric(df_slice.get('rt', pd.Series(dtype=float)), errors='coerce')
+        known_rt_values = pd.to_numeric(df_slice.get('known_rt', pd.Series(dtype=float)), errors='coerce')
+        valid_rt_mask = known_rt_values.notna() & (known_rt_values != 0) & rt_values.notna()
+        rt_deviation = (rt_values[valid_rt_mask] - known_rt_values[valid_rt_mask]).abs()
+
+        rt_rmse = np.sqrt(np.mean(np.square(rt_deviation))) if len(rt_deviation) else np.nan
+
+        return {
+            'scope': scope_label,
+            'target_psms': int(len(df_slice)),
+            'rt_pairs_used': int(valid_rt_mask.sum()),
+            'rt_mae_min': _safe_mean(rt_deviation),
+            'rt_rmse_min': float(rt_rmse) if not pd.isna(rt_rmse) else np.nan,
+            'mass_error_mean_ppm': _safe_mean(mass_error),
+            'mass_error_median_ppm': _safe_median(mass_error),
+            'mass_error_sd_ppm': _safe_std(mass_error),
+            'fragment_coverage_mean_pct': _safe_mean(fragment_coverage_pct),
+            'fragment_coverage_median_pct': _safe_median(fragment_coverage_pct),
+            **_rt_drift_metrics(df_slice),
+        }
+
+    def _rt_drift_metrics(df_slice):
+        """Return RT drift correction summary columns (empty if correction was not applied)."""
+        if 'rt_drift_correction' not in df_slice.columns:
+            return {}
+        drift_vals = pd.to_numeric(df_slice['rt_drift_correction'], errors='coerce').dropna()
+        if drift_vals.empty or (drift_vals == 0).all():
+            return {}
+        return {
+            'rt_drift_mean_min': float(drift_vals.mean()),
+            'rt_drift_median_min': float(drift_vals.median()),
+            'rt_drift_sd_min': float(drift_vals.std()),
+            'rt_drift_max_abs_min': float(drift_vals.abs().max()),
+        }
+
+    rows = [_build_row(target_df, 'OVERALL')]
+
+    if 'file' in target_df.columns:
+        for file_name, file_df in target_df.groupby('file'):
+            rows.append(_build_row(file_df, str(file_name)))
+
+    qc_metrics_df = pd.DataFrame(rows)
+    # Keep OVERALL first, then files alphabetically
+    qc_metrics_df['scope_sort'] = qc_metrics_df['scope'].apply(lambda x: (0, '') if x == 'OVERALL' else (1, str(x)))
+    qc_metrics_df = qc_metrics_df.sort_values('scope_sort').drop(columns=['scope_sort']).reset_index(drop=True)
+    return qc_metrics_df
+
+
+def _safe_set_progress(value):
+    """Thread-safe helper to update the main progress bar."""
+    try:
+        progress_bar['value'] = value
+        update_progress_percent_label()
+    except Exception:
+        pass
+
+
+def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, thread_capacity, 
+                         precursor_tolerance, fragment_tolerance, precursor_unit, 
+                         fragment_unit, fragmentation_type, fdr_threshold, quant_method="Both", generate_eics=False, selected_neutral_losses=None,
+                         fragment_mz_lower=None, fragment_mz_upper=None):
+    """Modified function to collect all PSMs once and track execution time"""
+    start_time = time.time()
+    _ensure_gpu_detected()   # lazy GPU detection on first processing run
+    logging.info(f"Starting peptide diagnosis with {fragmentation_type} fragmentation")
+    logging.info(f"Quantification method: {quant_method}")
+    
+    # Log system resources (RAM and GPU)
+    try:
+        import psutil
+        ram_info = psutil.virtual_memory()
+        logging.info(f"System RAM: {ram_info.total / (1024**3):.1f} GB total, {ram_info.available / (1024**3):.1f} GB available")
+    except:
+        pass
+    if GPU_AVAILABLE:
+        logging.info(f"GPU Status: {get_gpu_status()}")
+    else:
+        logging.debug(f"GPU Status: {get_gpu_status()}")
+    
+    global active_executor
+    normalized_neutral_losses = normalize_neutral_losses(selected_neutral_losses)
+    
+    try:
+        # Create output folder if needed (output_file is now a folder path)
+        output_dir = output_file
+        if not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                logging.info(f"Created output directory: {output_dir}")
+            except Exception as e:
+                logging.error(f"Error creating output directory: {str(e)}")
+                raise  # Re-raise the exception to stop execution
+            
+        # Load target peptides
+        logging.info(f"Loading peptides from {prm_input_file}")
+        if prm_input_file.lower().endswith(('.xlsx', '.xls')):
+            data = pd.read_excel(prm_input_file)
+        elif prm_input_file.lower().endswith('.csv'):
+            data = pd.read_csv(prm_input_file)
+        elif prm_input_file.lower().endswith('.tsv'):
+            data = pd.read_csv(prm_input_file, sep='\t')
+        else:
+            raise ValueError(f"Unsupported file format: {prm_input_file}. Supported formats: .xlsx, .xls, .csv, .tsv")
+        
+        # Strict positional column ordering (column names are ignored):
+        # Column 0: Peptide sequence
+        # Column 1: Modifications
+        # Column 2: Precursor m/z
+        # Column 3: Precursor charge
+        # Column 4: Start RT
+        # Column 5: Stop RT
+        # Column 6: Known RT (optional)
+        
+        # Validate minimum required columns
+        if len(data.columns) < 6:
+            raise ValueError(f"PRM input file must have at least 6 columns. Found {len(data.columns)} columns.\n"
+                           f"Expected order: Peptide, Modifications, m/z, Charge, Start RT, Stop RT, [Known RT]")
+        
+        # Extract data using strict positional indices
+        peptides = data.iloc[:, 0].tolist()  # Column 0: Peptide sequence
+        modifications = data.iloc[:, 1].tolist()  # Column 1: Modifications
+        precursor_mzs = data.iloc[:, 2].tolist()  # Column 2: Precursor m/z
+        charges = data.iloc[:, 3].tolist()  # Column 3: Precursor charge
+        start_rts = data.iloc[:, 4].tolist()  # Column 4: Start RT
+        stop_rts = data.iloc[:, 5].tolist()  # Column 5: Stop RT
+        known_rts = data.iloc[:, 6].tolist() if len(data.columns) > 6 else [None] * len(peptides)  # Column 6: Known RT (optional)
+        
+        # --- RT width override logic ---
+        try:
+            rt_width = float(rt_width_var.get())
+        except Exception:
+            rt_width = None
+
+        if rt_width and not np.isnan(rt_width):
+            # Override start/stop RT using Top Apex RT (known_rts)
+            start_rts = [float(rt) - rt_width/2 if pd.notna(rt) else srt
+                        for rt, srt in zip(known_rts, start_rts)]
+            stop_rts = [float(rt) + rt_width/2 if pd.notna(rt) else srt
+                        for rt, srt in zip(known_rts, stop_rts)]
+        
+        # Prepare peptide info tuples (no theoretical ions yet)
+        peptides_info = []
+        for peptide, precursor_mz, charge, modification, start_rt, stop_rt, known_rt in zip(peptides, precursor_mzs, 
+                                                                                charges, modifications, 
+                                                                                start_rts, stop_rts, known_rts):
+            peptides_info.append((peptide, precursor_mz, charge, modification, start_rt, stop_rt, known_rt))
+        
+        # Generate and process decoy peptides with remapped modification positions
+        logging.info("Generating decoy peptides")
+        decoy_peptides = generate_decoy_peptides(peptides)
+        decoy_info = []
+        for decoy, orig_pep, precursor_mz, charge, modification, start_rt, stop_rt, known_rt in zip(
+                decoy_peptides, peptides, precursor_mzs, charges, modifications, start_rts, stop_rts, known_rts):
+            remapped_mod = remap_modification_for_decoy(modification, len(orig_pep))
+            decoy_info.append((decoy, precursor_mz, charge, remapped_mod, start_rt, stop_rt, known_rt))
+        
+        # Process mzML files (and .raw files when fisher_py is available) ONCE and collect ALL PSMs
+        mzml_files = [f for f in os.listdir(mzml_folder) if f.lower().endswith('.mzml')]
+        # Also include .raw files that can be read directly via fisher_py (no conversion needed)
+        if _check_fisher_available():
+            raw_files_direct = [f for f in os.listdir(mzml_folder)
+                                if f.lower().endswith('.raw')
+                                and (os.path.splitext(f)[0] + '.mzml').lower() not in
+                                    set(m.lower() for m in mzml_files)]
+            mzml_files.extend(raw_files_direct)
+        logging.info(f"Found {len(mzml_files)} data files to process")
+        logging.info("Processing raw files concurrently")
+        
+        # Dynamic batch processing configuration based on available system RAM
+        # Automatically adjusts batch size to prevent memory overflow while maximizing performance
+        def calculate_optimal_batch_size():
+            """
+            Calculate optimal batch size based on available system RAM.
+            
+            Memory guidelines (conservative estimates):
+            - Each file generates ~40-100 MB of results in memory
+            - We reserve 50% of available RAM for batch processing
+            - Minimum batch size: 5 files (for very low RAM systems)
+            - Maximum batch size: 100 files (diminishing returns beyond this)
+            
+            RAM -> Batch Size mapping:
+            - 4 GB  -> 10 files
+            - 8 GB  -> 20 files  
+            - 16 GB -> 40 files
+            - 32 GB -> 60 files
+            - 64 GB -> 80 files
+            - 128 GB+ -> 100 files
+            """
+            try:
+                # Get available RAM in GB
+                import psutil
+                available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+                total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+                
+                # Use 40% of available RAM for batch processing (conservative)
+                usable_ram_gb = available_ram_gb * 0.4
+                
+                # Estimate ~80 MB per file of results (conservative estimate)
+                estimated_mb_per_file = 80
+                
+                # Calculate batch size
+                batch_size = int((usable_ram_gb * 1024) / estimated_mb_per_file)
+                
+                # Clamp to reasonable bounds
+                batch_size = max(5, min(100, batch_size))
+                
+                logging.info(f"System RAM: {total_ram_gb:.1f} GB total, {available_ram_gb:.1f} GB available")
+                logging.info(f"Auto-configured batch size: {batch_size} files (using ~{usable_ram_gb:.1f} GB for batching)")
+                
+                return batch_size
+                
+            except Exception as e:
+                logging.warning(f"Could not detect system RAM: {e}. Using default batch size of 20.")
+                return 20  # Safe default
+        
+        BATCH_SIZE = calculate_optimal_batch_size()
+        
+        # IMPORTANT: Limit concurrent file processing to prevent:
+        # 1. File handle exhaustion (Windows ~512-8192 handles)
+        # 2. I/O starvation where concurrent disk reads cause massive slowdowns
+        # Testing shows files process in ~3 min solo but timeout at 60 min with 12 concurrent
+        MAX_CONCURRENT_FILES = min(thread_capacity, BATCH_SIZE)  # Controlled by user setting
+        logging.info(f"Processing with max {MAX_CONCURRENT_FILES} concurrent files (thread capacity: {thread_capacity})")
+        
+        temp_results_files = []  # Track temporary parquet files
+        temp_dir = os.path.join(output_dir if output_dir else os.path.dirname(output_file), '.temp_results')
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+        
+        all_results = []
+        eic_records = [] if generate_eics else None  # Initialize EIC records list if needed
+        
+        # ── progress: peptides & decoys loaded ──
+        try:
+            root.after(0, lambda: _safe_set_progress(5))
+        except Exception:
+            pass
+
+        # Precompute theoretical ions and fragment indices ONCE (same for every file)
+        all_peptides = [p[0] for p in peptides_info + decoy_info]
+        all_mods = [p[3] for p in peptides_info + decoy_info]
+        precomputed_frag_index, precomputed_theo_ions = build_fragment_index(
+            all_peptides, all_mods, fragmentation_type, fragment_tolerance,
+            selected_neutral_losses=normalized_neutral_losses,
+            tolerance_unit=fragment_unit
+        )
+        logging.info(f"Fragment index precomputed for {len(all_peptides)} peptides (targets + decoys)")
+        
+        # ── progress: fragment index built ──
+        try:
+            root.after(0, lambda: _safe_set_progress(8))
+        except Exception:
+            pass
+
+        # ---- Pre-compute predicted intensities ONCE before spawning threads ----
+        _frag_usage = fragment_usage_var.get()
+        precomputed_predictions = None
+        _pred_engine = pred_engine_var.get() if _frag_usage == "probabilistic" else None
+
+        if _frag_usage == "probabilistic":
+            _all_pep_info = peptides_info + decoy_info
+
+            if _pred_engine == "alphapeptdeep":
+                # ── AlphaPeptDeep pathway ──
+                if not _ALPHAPEPTDEEP_AVAILABLE:
+                    logging.warning(
+                        "AlphaPeptDeep (peptdeep) is not installed. "
+                        "Install with: pip install peptdeep\n"
+                        "Falling back to MS2PIP if available, otherwise disabling "
+                        "probabilistic deconvolution."
+                    )
+                    # Fall through to MS2PIP fallback below
+                    _pred_engine = "ms2pip" if HAS_MS2PIP else None
+                elif fragmentation_type not in _APD_SUPPORTED_FRAG_TYPES:
+                    logging.warning(
+                        f"AlphaPeptDeep does not support '{fragmentation_type}' fragmentation. "
+                        f"Probabilistic deconvolution disabled for this run — "
+                        f"using unique fragments only.  Supported types: "
+                        f"{', '.join(sorted(_APD_SUPPORTED_FRAG_TYPES))}."
+                    )
+                else:
+                    _apd_inst = apd_instrument_var.get()
+                    try:
+                        _apd_nce = float(apd_nce_var.get())
+                    except (ValueError, TypeError):
+                        _apd_nce = 30.0
+                    _apd_mgf = apd_mgf_var.get() if apd_calibrate_var.get() else None
+                    _apd_psm = apd_psm_var.get() if (apd_calibrate_var.get() and apd_psm_var.get().strip()) else None
+                    _apd_cal_nce = None
+                    if _apd_mgf and apd_cal_nce_var.get().strip():
+                        try:
+                            _apd_cal_nce = float(apd_cal_nce_var.get())
+                        except (ValueError, TypeError):
+                            _apd_cal_nce = None
+
+                    # Calibrated model folder (takes precedence over inline MGF calibration)
+                    _apd_cal_model_folder = None
+                    if apd_calibrate_var.get():
+                        _apd_cal_model_folder = _get_selected_apd_model_folder()
+                        if _apd_cal_model_folder:
+                            # When a saved model is used, skip inline calibration
+                            _apd_mgf = None
+                            _apd_psm = None
+                            _apd_cal_nce = None
+
+                    # --- Auto-detect instrument from the first data file ---
+                    if mzml_files:
+                        _detected_inst = _detect_instrument_from_file(mzml_files[0])
+                        if _detected_inst and _detected_inst != _apd_inst:
+                            logging.warning(
+                                f"AlphaPeptDeep: auto-detected instrument '{_detected_inst}' "
+                                f"from {os.path.basename(mzml_files[0])} differs from "
+                                f"selected '{_apd_inst}'.  Consider changing the Instrument "
+                                f"setting for best prediction accuracy."
+                            )
+                        elif _detected_inst:
+                            logging.info(f"AlphaPeptDeep: auto-detected instrument "
+                                         f"'{_detected_inst}' matches selection.")
+
+                    # --- Validate calibration MGF ---
+                    if _apd_mgf:
+                        _target_charges = [int(p[2]) for p in _all_pep_info]
+                        _val_ok, _val_warns = _validate_calibration_mgf(
+                            _apd_mgf,
+                            expected_frag_type=fragmentation_type,
+                            expected_nce=_apd_cal_nce if _apd_cal_nce else _apd_nce,
+                            expected_instrument=_apd_inst,
+                            target_charges=_target_charges,
+                        )
+                        for _w in _val_warns:
+                            logging.warning(f"Calibration MGF: {_w}")
+
+                    logging.info("=== AlphaPeptDeep Global Pre-computation Phase ===")
+                    logging.info(f"  Instrument: {_apd_inst}, NCE: {_apd_nce}, "
+                                 f"Device: auto, Fragmentation: {fragmentation_type}")
+                    if _apd_mgf:
+                        logging.info(f"  Calibration MGF: {_apd_mgf}")
+                        if _apd_psm:
+                            logging.info(f"  Calibration PSM: {_apd_psm}")
+                        if _apd_cal_nce:
+                            logging.info(f"  Calibration NCE: {_apd_cal_nce}")
+
+                    if _apd_cal_model_folder:
+                        logging.info(f"  Using calibrated model: {_apd_cal_model_folder}")
+
+                    precomputed_predictions = alphapeptdeep_predict_all_peptides(
+                        _all_pep_info,
+                        fragmentation_type=fragmentation_type,
+                        instrument=_apd_inst,
+                        nce=_apd_nce,
+                        calibration_mgf=_apd_mgf,
+                        calibration_nce=_apd_cal_nce,
+                        calibration_psm=_apd_psm,
+                        calibrated_model_folder=_apd_cal_model_folder,
+                    )
+                    if precomputed_predictions:
+                        _n_ok = sum(1 for v in precomputed_predictions.values() if v)
+                        logging.debug(f"AlphaPeptDeep pre-computation done: "
+                                     f"{_n_ok}/{len(_all_pep_info)} peptides have predictions")
+                    else:
+                        logging.warning("AlphaPeptDeep returned no predictions. "
+                                        "Falling back to MS2PIP if available.")
+                        _pred_engine = "ms2pip" if HAS_MS2PIP else None
+
+            if _pred_engine == "ms2pip":
+                # ── MS2PIP pathway (original or fallback) ──
+                if not HAS_MS2PIP:
+                    logging.warning("MS2PIP unavailable — probabilistic deconvolution disabled. "
+                                    "Quantification will use unique fragments only.")
+                elif fragmentation_type not in _MS2PIP_SUPPORTED_FRAG_TYPES:
+                    logging.warning(
+                        f"MS2PIP does not support '{fragmentation_type}' fragmentation. "
+                        f"Probabilistic deconvolution disabled for this run — "
+                        f"using unique fragments only.  Supported types: "
+                        f"{', '.join(sorted(_MS2PIP_SUPPORTED_FRAG_TYPES))}."
+                    )
+                else:
+                    logging.info("=== MS2PIP Global Pre-computation Phase ===")
+                    precomputed_predictions = ms2pip_predict_all_peptides(
+                        _all_pep_info, fragmentation_type
+                    )
+                    if precomputed_predictions:
+                        _n_ok = sum(1 for v in precomputed_predictions.values() if v)
+                        logging.debug(f"MS2PIP pre-computation done: {_n_ok}/{len(_all_pep_info)} "
+                                     f"peptides have predictions")
+
+            if _pred_engine is None and _frag_usage == "probabilistic":
+                logging.warning("No prediction engine available (ms2pip / peptdeep). "
+                                "Probabilistic deconvolution disabled — using unique fragments only.")
+
+        # ── progress: precomputation done ──
+        try:
+            root.after(0, lambda: _safe_set_progress(12))
+        except Exception:
+            pass
+
+        # ---- Dynamic timeout: scales with workload size ----
+        # Base 5 min + 3 sec per peptide + 3 min if probabilistic
+        _n_peps = len(peptides_info) + len(decoy_info)
+        _per_file_timeout = 300 + (3 * _n_peps)
+        if _frag_usage == "probabilistic":
+            _per_file_timeout += 180  # extra headroom for deconvolution math
+        _per_file_timeout = max(300, min(_per_file_timeout, 900))  # clamp 5-15 min
+        logging.info(f"Dynamic per-file timeout: {_per_file_timeout}s "
+                     f"({_per_file_timeout / 60:.1f} min) for {_n_peps} peptides")
+
+        # Process files in controlled batches to prevent file handle exhaustion
+        total_files = len(mzml_files)
+        files_processed = 0
+        batch_number = 0
+        failed_files = []  # Track failed files for retry
+        
+        try:
+            with TqdmToTk(total=total_files, desc="Processing raw files",
+                          progress_bar=progress_bar, root=root,
+                          start_pct=12, end_pct=95) as pbar:
+                
+                # Process files in batches of MAX_CONCURRENT_FILES
+                for batch_start in range(0, total_files, MAX_CONCURRENT_FILES):
+                    if stop_event.is_set():
+                        logging.info("Stop requested before processing batch.")
+                        break
+                    
+                    batch_end = min(batch_start + MAX_CONCURRENT_FILES, total_files)
+                    batch_files = mzml_files[batch_start:batch_end]
+                    
+                    # Create executor for this batch only
+                    executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FILES)
+                    with executor_lock:
+                        active_executor = executor
+                    
+                    futures = {}
+                    try:
+                        # Submit only this batch of files
+                        for mzml_file in batch_files:
+                            if stop_event.is_set():
+                                break
+
+                            future = executor.submit(
+                                process_raw_file, mzml_file, mzml_folder,
+                                peptides_info + decoy_info,
+                                precursor_tolerance, fragment_tolerance,
+                                precursor_unit, fragment_unit, stop_event, eic_records,
+                                fragmentation_type, normalized_neutral_losses,
+                                unique_frag_option=_frag_usage,
+                                flag_ambiguous=flag_ambiguous_var.get(),
+                                frag_index=precomputed_frag_index,
+                                all_theoretical_ions=precomputed_theo_ions,
+                                peptides=all_peptides,
+                                modifications=all_mods,
+                                min_intensity_threshold=min_intensity_var.get(),
+                                fragment_mz_lower=float(fragment_mz_lower_entry.get()) if fragment_mz_lower_entry.get() else None,
+                                fragment_mz_upper=float(fragment_mz_upper_entry.get()) if fragment_mz_upper_entry.get() else None,
+                                precomputed_predictions=precomputed_predictions
+                            )
+                            futures[future] = mzml_file
+                        
+                        # Wait for all files in this batch to complete
+                        for future in futures:
+                            if stop_event.is_set():
+                                break
+                            try:
+                                results = future.result(timeout=_per_file_timeout)
+                                if results:
+                                    all_results.extend(results)
+                                files_processed += 1
+                            except TimeoutError:
+                                logging.error(f"Timeout processing file {futures[future]} "
+                                              f"(exceeded {_per_file_timeout / 60:.0f} min)")
+                                failed_files.append(futures[future])
+                            except CancelledError:
+                                logging.info("A raw-file task was cancelled after stop was requested.")
+                            except Exception as e:
+                                error_msg = str(e)
+                                logging.error(f"Error processing file {futures[future]}: {error_msg}")
+                                # Track for retry only if it's a recoverable error
+                                if "Invalid argument" in error_msg or "Errno 22" in error_msg:
+                                    failed_files.append(futures[future])
+                            finally:
+                                pbar.update()
+                        
+                    finally:
+                        # Properly shutdown executor after each batch
+                        with executor_lock:
+                            if active_executor is executor:
+                                active_executor = None
+                        try:
+                            executor.shutdown(wait=True, cancel_futures=stop_event.is_set())
+                        except Exception as exc:
+                            logging.error(f"Error during batch executor shutdown: {exc}")
+                        
+                        # Force garbage collection after each batch
+                        gc.collect()
+                    
+                    # Save intermediate results to disk after each batch to prevent memory overflow
+                    if all_results and len(all_results) >= BATCH_SIZE * 50:  # Save when we have substantial data
+                        batch_number += 1
+                        temp_file = os.path.join(temp_dir, f'batch_{batch_number}.parquet')
+                        batch_df = pd.DataFrame(all_results)
+                        batch_df.to_parquet(temp_file, index=False)
+                        temp_results_files.append(temp_file)
+                        logging.info(f"Saved batch {batch_number} with {len(all_results)} records to disk (freeing memory)")
+                        all_results = []  # Clear memory
+                        gc.collect()
+                    
+                    # Small delay between batches to allow file handles to be released
+                    if batch_end < total_files and not stop_event.is_set():
+                        time.sleep(0.5)
+            
+            # Retry failed files with single-threaded processing
+            if failed_files and not stop_event.is_set():
+                logging.info(f"Retrying {len(failed_files)} failed files with single-threaded processing...")
+                for mzml_file in failed_files:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        # Reuse already-precomputed fragment index (computed once above)
+                        results = process_raw_file(
+                            mzml_file, mzml_folder,
+                            peptides_info + decoy_info,
+                            precursor_tolerance, fragment_tolerance,
+                            precursor_unit, fragment_unit, stop_event, eic_records,
+                            fragmentation_type, normalized_neutral_losses,
+                            unique_frag_option=fragment_usage_var.get(),
+                            flag_ambiguous=flag_ambiguous_var.get(),
+                            frag_index=precomputed_frag_index,
+                            all_theoretical_ions=precomputed_theo_ions,
+                            peptides=all_peptides,
+                            modifications=all_mods,
+                            min_intensity_threshold=min_intensity_var.get(),
+                            fragment_mz_lower=float(fragment_mz_lower_entry.get()) if fragment_mz_lower_entry.get() else None,
+                            fragment_mz_upper=float(fragment_mz_upper_entry.get()) if fragment_mz_upper_entry.get() else None
+                        )
+                        if results:
+                            all_results.extend(results)
+                        logging.info(f"Retry successful for {mzml_file}")
+                    except Exception as e:
+                        logging.error(f"Retry failed for {mzml_file}: {str(e)}")
+                    
+                    gc.collect()
+            
+            # Save any remaining results from the last partial batch
+            if all_results:
+                batch_number += 1
+                temp_file = os.path.join(temp_dir, f'batch_{batch_number}.parquet')
+                batch_df = pd.DataFrame(all_results)
+                batch_df.to_parquet(temp_file, index=False)
+                temp_results_files.append(temp_file)
+                logging.info(f"Saved final batch {batch_number} with {len(all_results)} records to disk")
+                all_results = []
+                gc.collect()
+
+            if stop_event.is_set():
+                logging.info("Processing halted by user.")
+                return
+                
+        except Exception as e:
+            logging.error(f"Error during batch processing: {str(e)}")
+            raise
+
+        # Convert results to DataFrame for processing
+        # Load and combine all batch files if batch processing was used
+        if temp_results_files:
+            logging.info(f"Loading and combining {len(temp_results_files)} batch files...")
+            batch_dfs = []
+            for temp_file in temp_results_files:
+                try:
+                    batch_df = pd.read_parquet(temp_file)
+                    batch_dfs.append(batch_df)
+                except Exception as e:
+                    logging.error(f"Error reading batch file {temp_file}: {str(e)}")
+            
+            if batch_dfs:
+                results_df = pd.concat(batch_dfs, ignore_index=True)
+                logging.info(f"Combined {len(temp_results_files)} batches into {len(results_df)} total records")
+                # Clean up temporary files
+                for temp_file in temp_results_files:
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        logging.warning(f"Could not remove temp file {temp_file}: {e}")
+                try:
+                    os.rmdir(temp_dir)
+                except Exception:
+                    pass  # Directory may not be empty or may not exist
+                # Free memory from batch dataframes
+                del batch_dfs
+                gc.collect()
+            else:
+                results_df = pd.DataFrame()
+        else:
+            results_df = pd.DataFrame(all_results)
+        end_time = time.time()
+        execution_time = end_time - start_time
+        hours, remainder = divmod(execution_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        time_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+        
+        if stop_event.is_set():
+            logging.info("Diagnosis cancelled by user before result aggregation.")
+            return
+
+        if not results_df.empty:
+            logging.info(f"Post-processing {len(results_df)} total records...")
+            logging.debug(f"results_df columns ({len(results_df.columns)}): {list(results_df.columns)}")
+            log_memory_usage("Start of post-processing")
+            
+            # Add 'Label' column: 1 for target peptides, -1 for decoy peptides (vectorized)
+            results_df['Label'] = np.where(results_df['peptide'].str.startswith('DECOY_'), -1, 1)
+            
+            # mass_accuracy and charge_consistency are already computed numerically
+            # in process_raw_file() from matched_ions_quant — no string re-parsing needed.
+            logging.info("Numeric mass_accuracy and charge_consistency already populated.")
+            
+            # --- rt_accuracy: vectorized ---
+            logging.info("Calculating RT accuracy (vectorized)...")
+            if 'known_rt' in results_df.columns:
+                known_rt_numeric = pd.to_numeric(results_df['known_rt'], errors='coerce')
+                rt_numeric = pd.to_numeric(results_df['rt'], errors='coerce').fillna(0)
+                # Only compute rt_accuracy where known_rt is available; use 0 (neutral) otherwise
+                results_df['rt_accuracy'] = np.where(
+                    known_rt_numeric.isna(),
+                    0.0,
+                    np.abs(rt_numeric - known_rt_numeric.fillna(0))
+                )
+            else:
+                results_df['rt_accuracy'] = 0.0
+            
+            # charge_consistency already populated numerically — no string re-parsing needed.
+            logging.info("Feature calculation complete.")
+            
+            # ── RT Drift Correction (optional) ──────────────────────────────
+            try:
+                _rt_drift_on = rt_drift_enabled_var.get()
+            except Exception:
+                _rt_drift_on = False
+
+            if _rt_drift_on:
+                _ref_raw = rt_ref_peptides_var.get().strip()
+                # Parse reference peptides (comma or semicolon separated)
+                _ref_peps = [s.strip() for s in re.split(r'[;,\s]+', _ref_raw) if s.strip()]
+                if _ref_peps:
+                    _drift_mode_raw = rt_drift_model_var.get()  # 'Direct Offset' or 'Trend Model'
+                    _drift_model = 'trend_model' if 'trend' in _drift_mode_raw.lower() else 'direct_offset'
+                    logging.info(f"Applying inter-file RT drift correction with "
+                                 f"{len(_ref_peps)} reference peptide(s), "
+                                 f"mode={_drift_model}...")
+                    try:
+                        _frag_tol_val = float(fragment_tolerance)
+                    except Exception:
+                        _frag_tol_val = 20.0
+                    results_df = apply_rt_drift_correction(
+                        results_df, _ref_peps,
+                        model_type=_drift_model,
+                        fragment_tolerance=_frag_tol_val,
+                        mzml_folder=mzml_folder
+                    )
+                    logging.info("RT drift correction complete.")
+                else:
+                    logging.warning("RT Drift Correction enabled but no reference peptides provided. Skipping.")
+
+            # ── Mass Accuracy Drift Correction (optional) ────────────────────
+            try:
+                _mass_drift_on = mass_drift_enabled_var.get()
+            except Exception:
+                _mass_drift_on = False
+
+            if _mass_drift_on:
+                _mass_ref_raw = rt_ref_peptides_var.get().strip()
+                _mass_ref_peps = [s.strip() for s in re.split(r'[;,\s]+', _mass_ref_raw) if s.strip()]
+                if _mass_ref_peps:
+                    _mass_drift_mode_raw = rt_drift_model_var.get()
+                    _mass_drift_model = 'trend_model' if 'trend' in _mass_drift_mode_raw.lower() else 'direct_offset'
+                    logging.info(f"Applying inter-file mass accuracy drift correction with "
+                                 f"{len(_mass_ref_peps)} reference peptide(s), "
+                                 f"mode={_mass_drift_model}...")
+                    try:
+                        _frag_tol_mass = float(fragment_tolerance)
+                    except Exception:
+                        _frag_tol_mass = 20.0
+                    results_df = apply_mass_drift_correction(
+                        results_df, _mass_ref_peps,
+                        model_type=_mass_drift_model,
+                        fragment_tolerance=_frag_tol_mass,
+                        mzml_folder=mzml_folder
+                    )
+                    logging.info("Mass accuracy drift correction complete.")
+                else:
+                    logging.warning("Mass Drift Correction enabled but no reference peptides provided. Skipping.")
+
+            # ── Spurious PSM pre-filter ─────────────────────────────────────
+            # Remove clearly unreliable PSMs before Mokapot rescoring,
+            # inspired by CHIMERYS cutoff criteria:
+            #   1. Minimum 3 matched fragment ions
+            #   2. At least one matched fragment must be the predicted base
+            #      peak (most intense predicted fragment)
+            #   3. At least one matched fragment must be among the top-3
+            #      most-intense predicted fragments
+            # These hard cutoffs remove noise PSMs that would otherwise
+            # dilute the SVM training set.
+            _n_before_filter = len(results_df)
+            _min_frag_mask = results_df['matched_fragments'] >= 3
+
+            # For criteria 2 & 3, check per-PSM boolean fields computed
+            # during scan processing (compare matched ions against the FULL
+            # predicted spectrum, not just matched-ion intensities).
+            # Only apply when probabilistic deconv is active (predictions available).
+            _base_peak_mask = pd.Series(True, index=results_df.index)
+            _top3_mask = pd.Series(True, index=results_df.index)
+            if _frag_usage == "probabilistic":
+                if 'predicted_base_peak_matched' in results_df.columns:
+                    _base_peak_mask = results_df['predicted_base_peak_matched'].astype(bool)
+                if 'predicted_top3_matched' in results_df.columns:
+                    _top3_mask = results_df['predicted_top3_matched'].astype(bool)
+
+            _spurious_mask = _min_frag_mask & _base_peak_mask & _top3_mask
+            _n_spurious = (~_spurious_mask).sum()
+            if _n_spurious > 0:
+                results_df = results_df[_spurious_mask].copy()
+                logging.info(
+                    f"Spurious PSM pre-filter: removed {_n_spurious:,} of "
+                    f"{_n_before_filter:,} PSMs (min 3 fragments + predicted "
+                    f"peak coverage). {len(results_df):,} PSMs remain."
+                )
+            else:
+                logging.info("Spurious PSM pre-filter: all PSMs passed quality checks.")
+            gc.collect()
+
+            # Prepare features and run Mokapot rescoring
+            log_memory_usage("Before Mokapot")
+            logging.info("Preparing features for Mokapot...")
+            features = prepare_mokapot_features(results_df, rt_drift_applied=_rt_drift_on)
+            
+            logging.info(f"Running Mokapot rescoring with test_fdr={fdr_threshold}...")
+            results_df = rescore_with_mokapot(results_df, features, fdr_threshold=fdr_threshold)
+            
+            # Free features immediately — ~680 MB for 8M+ records
+            del features
+            gc.collect()
+            log_memory_usage("After Mokapot (features freed)")
+            
+            # Determine which scoring method was used
+            used_simple_fdr = results_df.attrs.get('scoring_method') == 'target-decoy'
+            qvalue_col = 'qvalue' if used_simple_fdr else 'mokapot_qvalue'
+            
+            if used_simple_fdr:
+                # Simple FDR already computed q-values — skip redundant compute_fdr_qvalue
+                logging.info("Using target-decoy FDR (Mokapot was unavailable or failed).")
+            else:
+                # Mokapot succeeded: use mokapot_qvalue as the canonical confidence metric.
+                # Do not compute auxiliary naive FDR/q_value/cumulative columns.
+                logging.debug("Using Mokapot q-values only (skipping auxiliary naive FDR columns).")
+            
+            # Calculate delta Cn (in-place, no copy)
+            results_df = calculate_delta_cn(results_df)
+            gc.collect()
+            log_memory_usage("After Delta Cn")
+            
+            # Apply FDR threshold using whichever q-value column is present
+            logging.info(f"Applying FDR threshold of {fdr_threshold} on '{qvalue_col}'...")
+            filtered_results_df = results_df[results_df[qvalue_col] <= fdr_threshold]
+            logging.info(f"PSMs passing FDR threshold: {len(filtered_results_df)} out of {len(results_df)}")
+            
+            # Prepare data for Peptide Quantification sheet with selected quantification method
+            logging.info("Aggregating peptide quantification (memory-safe)...")
+            if quant_method == "Intensity":
+                agg_cols = ['total_intensity']
+                logging.info("Using intensity-based quantification only")
+            elif quant_method == "Area":
+                agg_cols = ['eic_area']
+                logging.info("Using area-based quantification only")
+            else:  # "Both"
+                agg_cols = ['total_intensity', 'eic_area']
+                logging.info("Using both intensity and area-based quantification")
+
+            # Build aggregation dict: sum intensity (per-scan), but take first/max for eic_area
+            # (eic_area is computed once per peptide/file, then copied to every scan — summing inflates it N-fold)
+            agg_dict = {}
+            if 'total_intensity' in agg_cols:
+                agg_dict['total_intensity'] = 'sum'
+            if 'eic_area' in agg_cols:
+                agg_dict['eic_area'] = 'last'  # take the last (post-deconvolution) copy
+
+            peptide_quant_long = filtered_results_df.groupby(
+                ['peptide', 'modification', 'm_z', 'charge', 'file'], as_index=False
+            ).agg(agg_dict)
+
+            peptide_quant_data = None
+            if 'total_intensity' in agg_cols:
+                intensity_pivot = peptide_quant_long.pivot_table(
+                    index=['peptide', 'modification', 'm_z', 'charge'],
+                    columns='file',
+                    values='total_intensity',
+                    aggfunc='sum',
+                    fill_value=0
+                )
+                intensity_pivot.columns = [f"{col}_intensity" for col in intensity_pivot.columns]
+                peptide_quant_data = intensity_pivot
+
+            if 'eic_area' in agg_cols:
+                area_pivot = peptide_quant_long.pivot_table(
+                    index=['peptide', 'modification', 'm_z', 'charge'],
+                    columns='file',
+                    values='eic_area',
+                    aggfunc='sum',
+                    fill_value=0
+                )
+                area_pivot.columns = [f"{col}_eic_area" for col in area_pivot.columns]
+                peptide_quant_data = area_pivot if peptide_quant_data is None else peptide_quant_data.join(area_pivot, how='outer')
+
+            peptide_quant_data = peptide_quant_data.reset_index() if peptide_quant_data is not None else pd.DataFrame()
+            
+            # Filter out decoy peptides from peptide_quant_data
+            peptide_quant_data = peptide_quant_data[~peptide_quant_data['peptide'].str.startswith('DECOY_')]
+            
+            # Parse FASTA once and share across protein-quant and combined-results (Fix P6)
+            _fasta_proteins = parse_fasta_file(fasta_file_entry.get())
+
+            # Prepare data for Protein Quantification sheet based on selected method
+            protein_quantities = calculate_protein_quantities_with_method(
+                peptide_quant_data, fasta_file_entry.get(), mzml_files, quant_method,
+                proteins=_fasta_proteins)
+            
+            # Prepare data for Combined sheet based on selected method
+            combined_results = prepare_combined_results_with_method(
+                peptide_quant_data, protein_quantities, mzml_files, quant_method,
+                proteins=_fasta_proteins)
+            
+            # ...after preparing combined_results...
+            logging.debug(f"filtered_results_df shape: {filtered_results_df.shape}")
+            logging.debug(f"peptide_quant_data shape: {peptide_quant_data.shape}")
+            logging.debug(f"protein_quantities shape: {protein_quantities.shape}")
+            logging.debug(f"combined_results shape: {combined_results.shape}")
+
+            if filtered_results_df.empty:
+                logging.error("No PSMs passed the FDR threshold. Nothing to save.")
+                return
+            if peptide_quant_data.empty:
+                logging.error("No peptide quantification data. Nothing to save.")
+                return
+            if protein_quantities.empty:
+                logging.error("No protein quantification data. Nothing to save.")
+                return
+            if combined_results.empty:
+                logging.error("No combined results data. Nothing to save.")
+                return
+
+            # Save results with proper error handling
+            try:
+                logging.info(f"Saving results to {output_file}")
+
+                filtered_results_df = reorder_columns(
+                    filtered_results_df,
+                    frag_usage=_frag_usage,
+                    mass_drift_on=_mass_drift_on,
+                    rt_drift_on=_rt_drift_on,
+                )
+                logging.debug(f"Filtered PSM DataFrame shape before saving: {filtered_results_df.shape}")
+                
+                # Prepare PSM data for display (respect FDR threshold)
+                results_df_for_display = reorder_columns(
+                    filtered_results_df,
+                    filter_intensity_columns=True,
+                    frag_usage=_frag_usage,
+                    mass_drift_on=_mass_drift_on,
+                    rt_drift_on=_rt_drift_on,
+                )
+
+                # Export-friendly decoy column: TRUE for decoy, FALSE for target
+                if 'Label' in results_df_for_display.columns:
+                    results_df_for_display['Label'] = (results_df_for_display['Label'] == -1)
+                    results_df_for_display.rename(columns={'Label': 'Decoy'}, inplace=True)
+
+                # ── Write each result as a separate CSV in the output folder ──
+                # Invalidate in-memory sheet cache so plots read fresh data
+                _invalidate_excel_cache(output_file)
+
+                # --- PSM ---
+                if include_psm_sheet_var.get():
+                    _psm_path = _output_path(output_file, 'PSM')
+                    results_df_for_display.to_csv(_psm_path, index=False)
+                    logging.info(f"Saved PSM data ({len(results_df_for_display):,} rows) to {_psm_path}")
+                else:
+                    logging.info("PSM file excluded from output (disabled in Preferences)")
+
+                # --- Peptide Quantification ---
+                peptide_quant_data.to_csv(
+                    _output_path(output_file, 'Peptide Quantification'), index=False)
+
+                # --- Protein Quantification ---
+                protein_quantities.to_csv(
+                    _output_path(output_file, 'Protein Quantification'), index=False)
+
+                # --- Combined ---
+                combined_results.to_csv(
+                    _output_path(output_file, 'Combined'), index=False)
+
+                # --- QC Metrics (optional) ---
+                if include_qc_metrics_var.get():
+                    qc_metrics_df = build_qc_metrics_table(filtered_results_df)
+                    _qc_path = _output_path(output_file, 'QC Metrics')
+                    if not qc_metrics_df.empty:
+                        qc_metrics_df.to_csv(_qc_path, index=False)
+                    else:
+                        pd.DataFrame([{'note': 'No target PSMs available for QC metrics.'}]).to_csv(
+                            _qc_path, index=False)
+                else:
+                    logging.info("QC Metrics file excluded from output (disabled in Preferences)")
+
+                # --- EICs (optional) ---
+                if eic_records and include_eic_sheet_var.get():
+                    eic_df = pd.DataFrame(eic_records)
+                    if 'scan_number' in eic_df.columns:
+                        _scan_ext = eic_df['scan_number'].astype(str).str.extract(r'scan=(\d+)', expand=False)
+                        eic_df['scan_number'] = _scan_ext.fillna(eic_df['scan_number'])
+                    _eic_path = _output_path(output_file, 'EICs')
+                    logging.info(f"Writing {len(eic_records)} EIC data points to {_eic_path}")
+                    eic_df.to_csv(_eic_path, index=False)
+
+                logging.info(f"Results successfully saved to folder: {output_file}")
+
+                # ── Now set progress to 100% — analysis fully complete ──
+                try:
+                    def _set_complete():
+                        progress_bar['value'] = 100
+                        update_progress_percent_label()
+                    root.after(0, _set_complete)
+                except Exception:
+                    pass
+                
+                # --- Pre-populate in-memory caches from DataFrames still in memory ---
+                # This avoids slow pd.read_excel() on first plot view.
+                try:
+                    _excel_sheet_cache[(output_file, 'PSM')] = results_df_for_display.copy()
+                    _excel_sheet_cache[(output_file, 'Peptide Quantification')] = peptide_quant_data.copy()
+                    _excel_sheet_cache[(output_file, 'Protein Quantification')] = protein_quantities.copy()
+                    _excel_sheet_cache[(output_file, 'Combined')] = combined_results.copy()
+                    if eic_records:
+                        eic_df_cache = pd.DataFrame(eic_records)
+                        _excel_sheet_cache[(output_file, 'EICs')] = eic_df_cache
+                        # Also populate cached_eic_data dict for fast per-peptide lookups
+                        cached_eic_data = {}
+                        for key, group_df in eic_df_cache.groupby(
+                            [eic_df_cache['peptide'].astype(str) + '_' + eic_df_cache['file'].astype(str)]
+                        ):
+                            cached_eic_data[key] = [row for row in group_df.itertuples(index=False)]
+                        logging.debug(f"Pre-cached EIC data for {len(cached_eic_data)} peptide-file combinations")
+                except Exception as e:
+                    logging.debug(f"Could not pre-populate in-memory caches: {e}")
+                
+            except Exception as e:
+                logging.error(f"Error saving results to {output_file}: {str(e)}")
+                raise
+            
+            # Calculate and log execution time
+            logging.info(f"Total execution time: {time_str}")
+            
+            # NOTE: update_visualization_options (viewer launch) is handled by
+            # the caller (run_diagnosis) to avoid launching the viewer twice.
+            
+        else:
+            logging.warning("No results found to process")
+            logging.info(f"Total execution time: {time_str}")
+            
+    except Exception as e:
+        logging.error(f"Error in diagnose_all_peptides: {str(e)}")
+        raise
+
+def run_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file, log_widget, 
+                 stop_event, thread_capacity, show_logs, precursor_tolerance, 
+                 fragment_tolerance, precursor_unit, fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics, selected_neutral_losses=None,
+                 fragment_mz_lower=None, fragment_mz_upper=None, cleanup_mzml_paths=None):
+    global diagnosis_thread
+    try:
+        start_time = time.time()  # Start timing
+        
+        # Logging handler is managed globally by initialize_logging() /
+        # toggle_logs().  No per-run handler setup or teardown is needed.
+
+        # Run peptide quantification with instrument parameters
+        # Mirror stdout/stderr into app logs so third-party console output
+        # (e.g., mokapot/tqdm/library status lines) is visible in the UI log panel.
+        with _redirect_stdio_to_logger(level=logging.INFO):
+            diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
+                                  thread_capacity, precursor_tolerance, fragment_tolerance,
+                                  precursor_unit, fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics,
+                                  selected_neutral_losses=selected_neutral_losses,
+                                  fragment_mz_lower=fragment_mz_lower, fragment_mz_upper=fragment_mz_upper)
+                
+        # Get FASTA file path
+        if fasta_file:
+            # Get mzML files
+            mzml_files = [f for f in os.listdir(mzml_folder) if f.lower().endswith(('.mzml', '.raw'))]
+            
+            # Calculate protein quantities and add to output
+            #protein_results = calculate_protein_quantities(output_file, fasta_file, mzml_files)
+            #logging.info(f"Protein quantification complete. Found {len(protein_results)} proteins.")
+            pass
+        
+        # Calculate and log total execution time
+        end_time = time.time()
+        execution_time = end_time - start_time
+        hours, remainder = divmod(execution_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        time_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+        logging.info(f"\nTotal Analysis Time: {time_str}")
+        
+        # Clean up converted mzML files if requested
+        if cleanup_mzml_paths:
+            cleaned = 0
+            for mzml_path in cleanup_mzml_paths:
+                try:
+                    if os.path.isfile(mzml_path):
+                        os.remove(mzml_path)
+                        cleaned += 1
+                except Exception as e:
+                    logging.warning(f"Could not remove {mzml_path}: {e}")
+            if cleaned:
+                logging.info(f"Cleaned up {cleaned} converted mzML file(s)")
+        
+        # Update the peptide and file dropdown menus after run completes
+        root.after(100, update_visualization_options)
+        
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+    finally:
+        diagnosis_thread = None
+
+def start_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file, 
+                   log_widget, stop_event, thread_capacity, show_logs, 
+                   precursor_tolerance, fragment_tolerance, precursor_unit, 
+                   fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics, selected_neutral_losses=None,
+                   fragment_mz_lower=None, fragment_mz_upper=None, clear_log=True,
+                   cleanup_mzml_paths=None):
+    """Start the diagnosis process with specified parameters"""
+    global diagnosis_thread, cached_eic_data
+    cached_eic_data = None  # Clear stale EIC data
+    _invalidate_plot_figure_cache()  # Clear stale in-memory plot renders
+    stop_event.clear()
+    show_progress_bar()  # Show progress bar
+    progress_bar['mode'] = 'determinate'
+    progress_bar['maximum'] = 100  # Ensure maximum is reset (may have been changed by conversion)
+    progress_bar['value'] = 2
+    update_progress_percent_label()
+    if clear_log:
+        log_widget.configure(state='normal')  
+        log_widget.delete('1.0', tk.END)
+        log_widget.configure(state='disabled')
+    diagnosis_thread = threading.Thread(
+        target=run_diagnosis,
+        args=(
+            prm_input_file, mzml_folder, output_file, fasta_file,
+            log_widget, stop_event, thread_capacity, show_logs,
+            precursor_tolerance, fragment_tolerance, precursor_unit,
+            fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics, selected_neutral_losses,
+            fragment_mz_lower, fragment_mz_upper, cleanup_mzml_paths
+        ),
+        daemon=True
+    )
+    diagnosis_thread.start()
+    
+def stop_diagnosis(stop_event):
+    global active_executor, diagnosis_thread
+    stop_event.set()
+    with executor_lock:
+        executor = active_executor
+    if executor is not None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:
+            logging.error(f"Error shutting down executor: {exc}")
+    if diagnosis_thread and diagnosis_thread.is_alive():
+        # Avoid blocking the UI thread; allow it to wind down asynchronously
+        logging.info("Stop requested; analysis thread signalled to exit.")
+    try:
+        progress_bar.stop()
+        hide_progress_bar()
+    except Exception:
+        pass
+
+def browse_file(entry, file_type=None):
+    global prm_file_valid
+    
+    if file_type == "fasta":
+        filename = filedialog.askopenfilename(filetypes=[("FASTA files", "*.fasta *.fa")])
+    elif file_type == "prm":
+        filename = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv"), ("TSV files", "*.tsv"), ("All files", "*.*")])
+    else:
+        filename = filedialog.askopenfilename()
+        
+    if filename:
+        entry.config(state='normal')  # Temporarily enable
+        entry.delete(0, tk.END)
+        entry.insert(0, filename)
+        entry.config(state='readonly')  # Make readonly again
+        
+        # Validate modifications if this is a PRM input file
+        if file_type == "prm" and filename.lower().endswith(('.xlsx', '.xls', '.csv', '.tsv')):
+            if not validate_modifications_from_file(filename):
+                entry.delete(0, tk.END)  # Clear the entry if validation fails
+                return
+                        
+def browse_folder(entry):
+    folder = filedialog.askdirectory()
+    if folder:
+        entry.config(state='normal')  # Temporarily enable
+        entry.delete(0, tk.END)
+        entry.insert(0, folder)
+        entry.config(state='readonly')  # Make readonly again
+
+def save_file(entry):
+    filename = filedialog.asksaveasfilename(defaultextension=".xlsx")
+    if filename:
+        entry.config(state='normal')  # Temporarily enable
+        entry.delete(0, tk.END)
+        entry.insert(0, filename)
+        entry.config(state='readonly')  # Make readonly again
+
+def get_thread_capacity(selection):
+    if selection == "Light":
+        return 4  
+    elif selection == "Normal":
+        return 8  
+    elif selection == "Medium":
+        return 12
+    return 8
+
+def convert_raw_to_mzml(raw_path, output_folder, progress_bar=None, root=None):
+    """
+    Convert a Thermo .raw file to .mzML using msconvert.
+    Returns the path to the converted mzML file, or None if conversion failed.
+    
+    Automatically locates msconvert from common ProteoWizard install paths,
+    the Windows registry, or the system PATH.
+    
+    Note: progress_bar and root parameters are kept for backwards compatibility
+    but are not used in the parallel conversion implementation.
+    """
+    try:
+        conversion_start = time.perf_counter()
+        # Auto-detect msconvert location
+        msconvert_exe = find_msconvert()
+        if not msconvert_exe:
+            logging.error(
+                "msconvert.exe not found. Install ProteoWizard from "
+                "https://proteowizard.sourceforge.io/download.html"
+            )
+            return None
+
+        raw_filename = os.path.basename(raw_path)
+        mzml_filename = os.path.splitext(raw_filename)[0] + ".mzML"
+        mzml_path = os.path.join(output_folder, mzml_filename)
+
+        # Build msconvert command using detected path
+        msconvert_cmd = [
+            msconvert_exe,
+            raw_path,
+            "--mzML",
+            "--outfile", mzml_filename,
+            "--outdir", output_folder
+        ]
+
+        try:
+            raw_size_mb = os.path.getsize(raw_path) / (1024 * 1024)
+            logging.info(f"[CONVERT] Start: {raw_filename} ({raw_size_mb:.1f} MB)")
+        except Exception:
+            logging.info(f"[CONVERT] Start: {raw_filename}")
+
+        # Run msconvert (suppress console window on Windows)
+        result = subprocess.run(
+            msconvert_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_subprocess_no_window()
+        )
+
+        if result.returncode != 0:
+            logging.error(f"msconvert failed for {raw_path}: {result.stderr}")
+            return None
+
+        if os.path.exists(mzml_path):
+            elapsed = time.perf_counter() - conversion_start
+            try:
+                mzml_size_mb = os.path.getsize(mzml_path) / (1024 * 1024)
+                logging.info(f"[CONVERT] Done: {raw_filename} -> {mzml_filename} in {elapsed:.1f}s ({mzml_size_mb:.1f} MB)")
+            except Exception:
+                logging.info(f"[CONVERT] Done: {raw_filename} in {elapsed:.1f}s")
+            return mzml_path
+        else:
+            logging.error(f"msconvert did not produce expected mzML file: {mzml_path}")
+            return None
+    except Exception as e:
+        logging.error(f"Error converting {raw_path} to mzML: {e}")
+        return None
+
+def generate_decoy_peptides(peptides):
+    """Generate decoy peptides using sequence reversal (standard target-decoy approach).
+    Returns list of (decoy_peptide, remapped_modification) tuples when called with modifications,
+    or list of decoy_peptide strings for backwards compatibility.
+    """
+    decoy_peptides = []
+    for peptide in peptides:
+        # Reverse the peptide sequence (standard method used by Comet, MaxQuant, Percolator)
+        # Keep first and last amino acids fixed (pseudo-reverse) to preserve tryptic termini
+        if len(peptide) > 2:
+            decoy_seq = peptide[0] + peptide[-2:0:-1] + peptide[-1]
+        else:
+            decoy_seq = peptide[::-1]
+        decoy_peptide = 'DECOY_' + decoy_seq
+        decoy_peptides.append(decoy_peptide)
+    return decoy_peptides
+
+
+def remap_modification_for_decoy(modification, peptide_length):
+    """Remap modification positions after pseudo-reversal.
+    
+    Pseudo-reversal keeps the first and last residues fixed, and reverses
+    positions 2..(n-1).
+    
+    Modification strings use **1-based** positions in brackets (e.g.
+    ``1xOxidation [M5]`` means residue 5, the 5th amino acid).  The
+    ``parse_modifications`` function converts these to 0-based internally.
+    
+    1-based mapping:
+      - p=1         -> 1           (first residue kept)
+      - p=n         -> n           (last residue kept)
+      - 2<=p<=n-1   -> n+1-p       (middle reversed)
+    
+    Handles both single-position (``[M5]``) and multi-position
+    (``[C4; C10]``) bracket entries by remapping every ``[A-Z]\\d+``
+    token found inside each bracket group.
+    """
+    if not modification or (isinstance(modification, float) and np.isnan(modification)):
+        return modification
+    
+    import re
+    
+    def _remap_pos_in_bracket(bracket_match):
+        """Remap every residue-position token inside a ``[…]`` group."""
+        bracket_content = bracket_match.group(0)  # e.g. "[C4; C10]"
+        
+        def _remap_single(pos_match):
+            residue = pos_match.group(1)  # e.g. "C"
+            pos = int(pos_match.group(2))  # e.g. 4
+            # Apply pseudo-reversal mapping (1-based positions)
+            if pos == 1 or pos == peptide_length:
+                new_pos = pos  # endpoints stay fixed
+            elif 2 <= pos <= peptide_length - 1:
+                new_pos = peptide_length + 1 - pos  # middle is reversed
+            else:
+                new_pos = pos  # out of range, keep as-is
+            return f"{residue}{new_pos}"
+        
+        # Match each [A-Z]\d+ token inside the bracket (e.g. C4, C10, M5)
+        return re.sub(r'([A-Z])(\d+)', _remap_single, bracket_content)
+    
+    # Match every bracket group [...] and remap positions inside each one
+    remapped = re.sub(r'\[[^\]]+\]', _remap_pos_in_bracket, str(modification))
+    return remapped
+
+def parse_fasta_file(fasta_file):
+    """Parse FASTA file and return dictionary of sequences and protein names.
+    Supports UniProt (>db|accession|name), NCBI (>gi|...), and generic (>id description) formats.
+    """
+    proteins = {}
+    current_id = None
+    current_seq = []
+    current_name = None
+    
+    with open(fasta_file) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('>'):
+                if current_id:
+                    proteins[current_id] = {
+                        'sequence': ''.join(current_seq),
+                        'name': current_name
+                    }
+                header = line[1:]
+                # Try UniProt format: >db|accession|name ...
+                header_parts = header.split('|')
+                if len(header_parts) >= 3:
+                    current_id = header_parts[1].strip()
+                    # Extract protein name and remove anything from "OS=" till the end
+                    remaining = header_parts[2].strip()
+                    name_parts = remaining.split()
+                    current_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else remaining
+                    if "OS=" in current_name:
+                        current_name = current_name.split("OS=")[0].strip()
+                else:
+                    # Generic format: >id description
+                    parts = header.split(None, 1)
+                    current_id = parts[0]
+                    current_name = parts[1] if len(parts) > 1 else current_id
+                current_seq = []
+            elif line:
+                current_seq.append(line)
+    
+    if current_id:
+        proteins[current_id] = {
+            'sequence': ''.join(current_seq),
+            'name': current_name
+        }
+    return proteins
+
+def quantify_proteins(peptides, output_folder):
+    """Legacy protein quantification stub.
+
+    .. deprecated::
+        This function is superseded by ``calculate_protein_quantities_with_method``
+        which is used by the main pipeline.  It is retained only for backward
+        compatibility.  Calling it will raise ``NotImplementedError``.
+    """
+    raise NotImplementedError(
+        "quantify_proteins() is deprecated.  Use "
+        "calculate_protein_quantities_with_method() instead."
+    )
+
+def match_peptide_to_protein(peptide, fasta_file=None, proteins=None):
+    """Match a peptide sequence to its source protein(s).
+
+    Returns a list of ``(accession, protein_name)`` tuples for every
+    protein whose sequence contains *peptide*.  Strips the ``DECOY_``
+    prefix before searching so that decoy peptides can also be mapped
+    back to their originating protein.
+
+    Parameters
+    ----------
+    peptide : str
+        Peptide sequence (may include ``DECOY_`` prefix).
+    fasta_file : str or None
+        Path to FASTA file.  Ignored when *proteins* is provided.
+        Falls back to ``fasta_file_entry`` (GUI) when both are *None*.
+    proteins : dict or None
+        Pre-parsed proteins dict from :func:`parse_fasta_file`.  When
+        supplied the FASTA file is **not** re-parsed, avoiding redundant
+        I/O in hot loops.
+    """
+    if proteins is None:
+        # Lazy-load & cache when no pre-parsed dict is provided
+        if not hasattr(match_peptide_to_protein, '_proteins') or match_peptide_to_protein._proteins is None:
+            _fasta = fasta_file if fasta_file else fasta_file_entry.get()
+            match_peptide_to_protein._proteins = parse_fasta_file(_fasta)
+        proteins = match_peptide_to_protein._proteins
+
+    # Strip DECOY_ prefix for matching
+    search_seq = peptide
+    if search_seq.startswith('DECOY_'):
+        search_seq = search_seq[len('DECOY_'):]
+
+    # Collect ALL matching proteins (handles shared / degenerate peptides)
+    matched = []
+    for protein_id, pdata in proteins.items():
+        if search_seq in pdata['sequence']:
+            matched.append((protein_id, pdata['name']))
+
+    return matched
+
+class TextHandler(logging.Handler):
+    """Logging handler that displays messages in a Tk Text widget.
+
+    Messages are accumulated in a thread-safe queue and flushed to the
+    widget periodically (every ``_FLUSH_MS`` milliseconds) in a single
+    bulk insert.  This prevents the Tk event-loop from being overwhelmed
+    by thousands of individual ``after(0, …)`` callbacks when libraries
+    like tqdm generate rapid-fire progress output.
+    """
+    _FLUSH_MS = 150          # flush interval in milliseconds
+    _MAX_BATCH = 200         # max messages per flush (safety cap)
+
+    def __init__(self, widget):
+        logging.Handler.__init__(self)
+        self.widget = widget
+        self._queue = collections.deque()
+        self._flush_scheduled = False
+
+    def emit(self, record):
+        msg = self.format(record)
+        self._queue.append(msg)
+        if not self._flush_scheduled:
+            self._flush_scheduled = True
+            try:
+                self.widget.after(self._FLUSH_MS, self._flush)
+            except Exception:
+                self._flush_scheduled = False
+
+    def _flush(self):
+        """Drain the queue and insert all pending messages in one shot."""
+        self._flush_scheduled = False
+        messages = []
+        try:
+            while messages.__len__() < self._MAX_BATCH:
+                messages.append(self._queue.popleft())
+        except IndexError:
+            pass
+        if not messages:
+            return
+        try:
+            self.widget.configure(state='normal')
+            self.widget.insert(tk.END, '\n'.join(messages) + '\n')
+            self.widget.configure(state='disabled')
+            self.widget.see(tk.END)
+        except Exception:
+            pass
+        # If there are still messages left, schedule another flush
+        if self._queue:
+            self._flush_scheduled = True
+            try:
+                self.widget.after(self._FLUSH_MS, self._flush)
+            except Exception:
+                self._flush_scheduled = False
+
+class LogBuffer(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.log_buffer = []
+        
+    def emit(self, record):
+        msg = self.format(record)
+        self.log_buffer.append(msg)
+        
+def initialize_logging(log_widget):
+    """Initialize logging configuration"""
+    global buffer_handler, widget_handler
+    
+    # Configure root logger first
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Create and configure handlers
+    buffer_handler = LogBuffer()
+    widget_handler = TextHandler(log_widget)
+    
+    # Set formatter with correct field names
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')  # Fixed: levelname not levellevel
+    buffer_handler.setFormatter(formatter)
+    widget_handler.setFormatter(formatter)
+    
+    # Add handlers
+    logger.addHandler(buffer_handler)
+    if show_logs:
+        logger.addHandler(widget_handler)
+    
+    return buffer_handler, widget_handler
+
+def toggle_logs(log_widget, show_logs_var, buffer_handler, widget_handler):
+    global show_logs
+    show_logs = show_logs_var
+
+    logger = logging.getLogger()
+    if show_logs:
+        log_widget.pack(fill='both', expand=True)
+        try:
+            log_widget.see(tk.END)
+        except Exception:
+            pass
+        if widget_handler not in logger.handlers:
+            logger.addHandler(widget_handler)
+    else:
+        log_widget.pack_forget()
+        if widget_handler in logger.handlers:
+            logger.removeHandler(widget_handler)
+
+buffer_handler = None
+widget_handler = None
+show_logs = True
+
+# Initialize logging before GUI setup
+def setup_gui():
+    global buffer_handler, widget_handler
+
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self._bind_widget = getattr(widget, 'canvas', widget)
+        self.text = text
+        self.tooltip = None
+        self._bind_widget.bind("<Enter>", self.show_tooltip)
+        self._bind_widget.bind("<Leave>", self.hide_tooltip)
+        self._bind_widget.bind("<ButtonPress>", self.hide_tooltip)
+
+    def show_tooltip(self, event=None):
+        # Use mouse position for all widgets
+        x = event.x_root + 20 if event else self._bind_widget.winfo_rootx() + 20
+        y = event.y_root + 10 if event else self._bind_widget.winfo_rooty() + 10
+
+        # Prevent multiple tooltips
+        self.hide_tooltip()
+
+        self.tooltip = tk.Toplevel(self._bind_widget)
+        self.tooltip.wm_overrideredirect(True)
+        self.tooltip.wm_geometry(f"+{x}+{y}")
+
+        label = tk.Label(self.tooltip, text=self.text, justify='left',
+                         background="#ffffdc", relief="solid", borderwidth=1,
+                         wraplength=300, padx=4, pady=4)
+        label.pack()
+
+        # Optional: auto-hide after 5 seconds
+        self.tooltip.after(5000, self.hide_tooltip)
+
+    def hide_tooltip(self, event=None):
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+
+# ============================================================================
+# GUARD AGAINST WORKER PROCESSES CREATING DUPLICATE GUI WINDOWS
+# ============================================================================
+# On Windows, joblib/multiprocessing spawn child processes that re-execute
+# this module. Without this guard, each child creates a separate Tk window.
+# mokapot's GridSearchCV (n_jobs=-1 default) spawns one process per CPU core.
+if multiprocessing.current_process().name != 'MainProcess':
+    # Worker process — provide function/class definitions above but stop
+    # before GUI creation.  The worker runtime will keep this process alive.
+    import sys as _sys
+    _sys.exit(0)
+
+# GUI setup
+root = tk.Tk()
+root.resizable(True, True)
+root.title("ProteoPRM - Peptide PRM Quantification Tool v1.0")
+sv_ttk.set_theme("light")  # Sun Valley theme — use "dark" for dark mode
+
+def _tk_callback_exception_handler(exc, val, tb):
+    try:
+        logging.error("Unhandled Tk callback exception", exc_info=(exc, val, tb))
+    except Exception:
+        pass
+
+    tb_text = ''.join(traceback.format_exception(exc, val, tb))
+    err_msg = (
+        "An unexpected UI error occurred.\n\n"
+        "Details were written to:\n"
+        f"{temp_log_file}\n\n"
+        f"{tb_text[-1500:]}"
+    )
+    try:
+        messagebox.showerror("ProteoPRM Error", err_msg, parent=root)
+    except Exception:
+        pass
+
+root.report_callback_exception = _tk_callback_exception_handler
+
+# Make action buttons consistently blue across the app (including Browse / Save As).
+try:
+    _style = ttk.Style(root)
+    _style.layout("TButton", _style.layout("Accent.TButton"))
+    _style.configure("TButton", **_style.configure("Accent.TButton"))
+    _style.map("TButton", **_style.map("Accent.TButton"))
+    _style.configure(
+        "Green.Horizontal.TProgressbar",
+        thickness=36,
+        background="#2e7d32",
+        troughcolor="#e0e0e0",
+        lightcolor="#2e7d32",
+        darkcolor="#2e7d32",
+        borderwidth=0,
+        bordercolor="#e0e0e0"
+    )
+except Exception:
+    # Fallback: keep theme defaults if Accent style is unavailable.
+    pass
+
+# ---- Main layout ----
+frame = ttk.Frame(root, padding="10 10 10 10")
+frame.pack(fill='both', expand=True)
+frame.grid_columnconfigure(1, weight=1)
+# Rows 0-4: input fields / checkboxes — fixed height
+for i in range(5):
+    frame.grid_rowconfigure(i, weight=0)
+# Row 5: parameter notebook — expands
+frame.grid_rowconfigure(5, weight=3)
+# Row 6: log area — expands
+frame.grid_rowconfigure(6, weight=2)
+# Rows 7-8: progress bar + buttons — fixed height
+frame.grid_rowconfigure(7, weight=0)
+frame.grid_rowconfigure(8, weight=0)
+
+ttk.Label(frame, text="Select PRM Input File:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+prm_input_entry = ttk.Entry(frame, width=50, state='readonly')
+prm_input_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+ToolTip(prm_input_entry,
+        "CSV, TSV, or Excel file with target peptides.\n\n"
+        "Columns are read by POSITION (index), not by name.\n"
+        "Required order (6 columns minimum):\n\n"
+        "  Col 0 — Peptide Sequence  (plain amino acids, e.g. PEPTIDEK)\n"
+        "  Col 1 — Modifications  (e.g. 'C4(Carbamidomethyl)', or blank)\n"
+        "  Col 2 — Precursor m/z  (numeric, e.g. 523.7891)\n"
+        "  Col 3 — Charge  (integer, e.g. 2)\n"
+        "  Col 4 — Start RT [min]  (numeric)\n"
+        "  Col 5 — Stop RT [min]  (numeric)\n\n"
+        "Optional:\n"
+        "  Col 6 — Known RT [min]  (Top Apex RT; used for RT window override)\n\n"
+        "A header row is expected but column names are ignored.")
+ttk.Button(frame, text="Browse", command=lambda: browse_file(prm_input_entry, "prm")).grid(row=0, column=2, padx=5, pady=5, sticky='ew')
+
+ttk.Label(frame, text="Select Raw Files/mzML Folder:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+mzml_folder_entry = ttk.Entry(frame, width=50, state='readonly')
+mzml_folder_entry.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+ttk.Button(frame, text="Browse", command=lambda: browse_folder(mzml_folder_entry)).grid(row=1, column=2, padx=5, pady=5, sticky='ew')
+
+ttk.Label(frame, text="Select Output Folder Location:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+output_file_entry = ttk.Entry(frame, width=50, state='readonly')
+output_file_entry.grid(row=2, column=1, padx=5, pady=5, sticky='ew')
+ttk.Button(frame, text="Browse", command=lambda: browse_folder(output_file_entry)).grid(row=2, column=2, padx=5, pady=5, sticky='ew')
+
+ttk.Label(frame, text="Select Protein FASTA File:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+fasta_file_entry = ttk.Entry(frame, width=50, state='readonly')
+fasta_file_entry.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
+ttk.Button(frame, text="Browse", command=lambda: browse_file(fasta_file_entry, "fasta")).grid(row=3, column=2, padx=5, pady=5, sticky='ew')
+
+show_logs_var = tk.BooleanVar(value=True)
+show_logs_checkbox = ttk.Checkbutton(
+    frame, 
+    text="Show logs", 
+    variable=show_logs_var,
+    command=lambda: toggle_logs(log_widget, show_logs_var.get(), buffer_handler, widget_handler)
+)
+show_logs_checkbox.grid(row=4, column=2, padx=5, pady=5, sticky='ew')
+
+eic_options_frame = ttk.Frame(frame)
+eic_options_frame.grid(row=4, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+
+generate_eics_var = tk.BooleanVar(value=False)
+generate_eics_checkbox = ttk.Checkbutton(
+    eic_options_frame,
+    text="Generate EIC plots",
+    variable=generate_eics_var
+)
+generate_eics_checkbox.pack(side='left', padx=(0, 15))
+
+generate_ms2_var = tk.BooleanVar(value=False)
+generate_ms2_checkbox = ttk.Checkbutton(
+    eic_options_frame,
+    text="Generate MS2 plots",
+    variable=generate_ms2_var
+)
+generate_ms2_checkbox.pack(side='left')
+
+# Define thread_capacity_var to store thread capacity selection
+thread_capacity_var = tk.StringVar(value="Normal")
+
+notebook = ttk.Notebook(frame)
+notebook.grid(row=5, column=0, columnspan=3, pady=10, sticky='nsew')
+
+params_container = ttk.Frame(notebook)
+notebook.add(params_container, text="Instrument Parameters")
+
+instrument_frame = ttk.LabelFrame(params_container, text="Instrument Parameters")
+
+params_container.grid_columnconfigure(0, weight=1)
+params_container.grid_rowconfigure(0, weight=1)
+
+instrument_frame.grid(row=0, column=0, padx=10, pady=5, sticky='nsew')
+
+instrument_frame.grid_columnconfigure(1, weight=1)
+
+ttk.Label(instrument_frame, text='Precursor mass tolerance:').grid(row=0, column=0, sticky='w', padx=5, pady=2)
+precursor_tolerance_frame = ttk.Frame(instrument_frame)
+precursor_tolerance_frame.grid(row=0, column=1, sticky='ew', padx=5, pady=2)
+precursor_tolerance_entry = ttk.Entry(precursor_tolerance_frame, width=10)
+precursor_tolerance_entry.insert(0, '10')
+precursor_tolerance_entry.grid(row=0, column=0, padx=(0, 5))
+precursor_unit_var = tk.StringVar(value='ppm')
+precursor_unit_combo = ttk.Combobox(precursor_tolerance_frame, textvariable=precursor_unit_var, 
+                                   values=['ppm', 'Da'], width=5, state='readonly')
+precursor_unit_combo.grid(row=0, column=1)
+
+
+# --- Fragment mass tolerance and m/z bounds ---
+ttk.Label(instrument_frame, text='Fragment mass tolerance:').grid(row=1, column=0, sticky='w', padx=5, pady=2)
+fragment_tolerance_frame = ttk.Frame(instrument_frame)
+fragment_tolerance_frame.grid(row=1, column=1, sticky='ew', padx=5, pady=2)
+fragment_tolerance_entry = ttk.Entry(fragment_tolerance_frame, width=10)
+fragment_tolerance_entry.insert(0, '20')
+fragment_tolerance_entry.grid(row=0, column=0, padx=(0, 5))
+fragment_unit_var = tk.StringVar(value='ppm')
+fragment_unit_combo = ttk.Combobox(fragment_tolerance_frame, textvariable=fragment_unit_var, 
+                                  values=['ppm', 'Da'], width=5, state='readonly')
+fragment_unit_combo.grid(row=0, column=1)
+
+ttk.Label(instrument_frame, text='Fragmentation type:').grid(row=2, column=0, sticky='w', padx=5, pady=2)
+fragmentation_types = [
+    'HCD', 'CID', 'ETD', 'EThcD', 'UVPD',
+    'HCD+ETD', 'CID+ETD', 'HCD+UVPD'
+]
+fragmentation_var = tk.StringVar(value='HCD')
+fragmentation_combo = ttk.Combobox(instrument_frame, textvariable=fragmentation_var,
+                                 values=fragmentation_types, state='readonly')
+fragmentation_combo.grid(row=2, column=1, sticky='ew', padx=5, pady=2)
+
+filters_frame = ttk.Frame(notebook)
+notebook.add(filters_frame, text="Filters")
+filters_frame.grid_columnconfigure(0, weight=0)  # labels
+filters_frame.grid_columnconfigure(1, weight=1)  # left-side entries expand
+filters_frame.grid_columnconfigure(2, weight=0)  # spare
+filters_frame.grid_columnconfigure(3, weight=0)  # vertical separator
+filters_frame.grid_columnconfigure(4, weight=0)  # drift labels
+filters_frame.grid_columnconfigure(5, weight=1)  # drift entries expand
+
+# Add RT width override option to Filters tab
+ttk.Label(filters_frame, text="RT Width (min):").grid(row=0, column=0, sticky='w', padx=5, pady=5)
+rt_width_var = tk.StringVar()
+rt_width_entry = ttk.Entry(filters_frame, textvariable=rt_width_var, width=8)
+rt_width_entry.insert(0, '2')
+rt_width_entry.grid(row=0, column=1, sticky='w', padx=5, pady=5)
+ToolTip(rt_width_entry, "If specified, overrides the Start/Stop RT in the PRM input file. "
+                        "Search will be performed in a window centered on the Top Apex RT (column 7) "
+                        "with this width in minutes. ")
+
+ttk.Label(filters_frame, text="FDR Threshold (%):").grid(row=1, column=0, sticky='w', padx=5, pady=5)
+fdr_threshold_var = tk.IntVar(value=1)
+fdr_threshold_entry = ttk.Entry(filters_frame, textvariable=fdr_threshold_var, width=5)
+fdr_threshold_entry.grid(row=1, column=1, sticky='w', padx=5, pady=5)
+
+# Add lower and upper fragment m/z bound fields
+ttk.Label(filters_frame, text='Fragment m/z lower bound:').grid(row=2, column=0, sticky='w', padx=5, pady=5)
+fragment_mz_lower_entry = ttk.Entry(filters_frame, width=10)
+fragment_mz_lower_entry.insert(0, '50')
+fragment_mz_lower_entry.grid(row=2, column=1, sticky='w', padx=5, pady=5)
+ToolTip(fragment_mz_lower_entry, "Minimum fragment m/z to consider during matching (inclusive)")
+
+ttk.Label(filters_frame, text='Fragment m/z upper bound:').grid(row=3, column=0, sticky='w', padx=5, pady=5)
+fragment_mz_upper_entry = ttk.Entry(filters_frame, width=10)
+fragment_mz_upper_entry.insert(0, '5000')
+fragment_mz_upper_entry.grid(row=3, column=1, sticky='w', padx=5, pady=5)
+ToolTip(fragment_mz_upper_entry, "Maximum fragment m/z to consider during matching (inclusive)")
+
+# Add neutral loss checkboxes to Filters tab
+ttk.Label(filters_frame, text="Neutral Loss Ions:").grid(row=4, column=0, sticky='w', padx=5, pady=5)
+
+main_nl_vars = {}
+# Define the main ions and all others
+main_ions = [("H2O", "H2O"), ("NH3", "NH3")]
+other_ions = [
+    ("H3PO4", "H3PO4"),
+    ("CH3SOH", "CH3SOH"),
+    ("CH3SOH-H2O", "CH3SOH-H2O"),
+    ("2CH3SOH", "2CH3SOH"),
+    ("2CH3SOH-H2O", "2CH3SOH-H2O"),
+    ("3CH3SOH", "3CH3SOH"),
+    ("3CH3SOH-H2O", "3CH3SOH-H2O"),
+    ("2H2O", "2H2O"),
+    ("2NH3", "2NH3"),
+    ("H2O+NH3", "H2O+NH3"),
+    ("NH2-CO-CH2SH", "NH2-CO-CH2SH"),
+    ("2NH2-CO-CH2SH", "2NH2-CO-CH2SH"),
+    ("3NH2-CO-CH2SH", "3NH2-CO-CH2SH"),
+    ("4NH2-CO-CH2SH", "4NH2-CO-CH2SH"),
+    ("5NH2-CO-CH2SH", "5NH2-CO-CH2SH"),
+    ("6NH2-CO-CH2SH", "6NH2-CO-CH2SH"),
+    ("7NH2-CO-CH2SH", "7NH2-CO-CH2SH"),
+]
+
+# Variables for main ions
+main_nl_vars["H2O"] = tk.BooleanVar(value=True)
+main_nl_vars["NH3"] = tk.BooleanVar(value=True)
+main_nl_vars["SelectAll"] = tk.BooleanVar(value=False)
+main_nl_vars["Others"] = tk.BooleanVar(value=False)
+# Variables for other ions (in dialog)
+other_nl_vars = {key: tk.BooleanVar(value=False) for label, key in other_ions}
+
+def update_select_all(*args):
+    """When Select all is checked, check all ions (main and others)."""
+    if main_nl_vars["SelectAll"].get():
+        main_nl_vars["H2O"].set(True)
+        main_nl_vars["NH3"].set(True)
+        main_nl_vars["Others"].set(True)
+        for var in other_nl_vars.values():
+            var.set(True)
+    else:
+        # Uncheck all except main ions (leave H2O/NH3 as user set)
+        main_nl_vars["Others"].set(False)
+        for var in other_nl_vars.values():
+            var.set(False)
+
+def update_main_from_others(*args):
+    """If all others are checked, check Select all. If any unchecked, uncheck Select all."""
+    if all(var.get() for var in other_nl_vars.values()) and main_nl_vars["H2O"].get() and main_nl_vars["NH3"].get():
+        main_nl_vars["SelectAll"].set(True)
+    else:
+        main_nl_vars["SelectAll"].set(False)
+
+def show_others_dialog():
+    """Show dialog for selecting other neutral loss ions."""
+    dialog = tk.Toplevel(root)
+    dialog.title("Select Other Neutral Loss Ions")
+    dialog.grab_set()
+    dialog.resizable(False, False)
+    ttk.Label(dialog, text="Select additional neutral loss ions:").grid(row=0, column=0, columnspan=4, pady=8)
+    # Arrange checkboxes in a grid (4 columns)
+    for idx, (label, key) in enumerate(other_ions):
+        cb = ttk.Checkbutton(dialog, text=label, variable=other_nl_vars[key])
+        cb.grid(row=1 + idx // 4, column=idx % 4, sticky='w', padx=5, pady=2)
+    def on_ok():
+        dialog.destroy()
+        # If any are checked, set Others checked, else uncheck
+        main_nl_vars["Others"].set(any(var.get() for var in other_nl_vars.values()))
+        update_main_from_others()
+    ttk.Button(dialog, text="OK", command=on_ok).grid(row=1 + len(other_ions) // 4 + 1, column=0, columnspan=4, pady=8)
+    dialog.wait_window()
+
+def on_others_checked(*args):
+    """Show dialog when Others is checked."""
+    if main_nl_vars["Others"].get():
+        show_others_dialog()
+    else:
+        # Uncheck all others if Others is unchecked
+        for var in other_nl_vars.values():
+            var.set(False)
+        update_main_from_others()
+
+# Place main checkboxes in a horizontal frame that sits in column 1
+nl_checkbox_frame = ttk.Frame(filters_frame)
+nl_checkbox_frame.grid(row=4, column=1, columnspan=2, sticky='w', padx=2)
+ttk.Checkbutton(nl_checkbox_frame, text="H2O", variable=main_nl_vars["H2O"], command=update_main_from_others).pack(side='left', padx=(0, 15))
+ttk.Checkbutton(nl_checkbox_frame, text="NH3", variable=main_nl_vars["NH3"], command=update_main_from_others).pack(side='left', padx=(0, 15))
+ttk.Checkbutton(nl_checkbox_frame, text="Others", variable=main_nl_vars["Others"], command=on_others_checked).pack(side='left', padx=(0, 15))
+
+# Keep Select all in sync with others
+for var in other_nl_vars.values():
+    var.trace_add("write", lambda *a: update_main_from_others())
+main_nl_vars["H2O"].trace_add("write", lambda *a: update_main_from_others())
+main_nl_vars["NH3"].trace_add("write", lambda *a: update_main_from_others())
+
+# Add minimum intensity threshold option
+ttk.Label(filters_frame, text="Minimum Fragment Intensity (%):").grid(row=5, column=0, sticky='w', padx=5, pady=5)
+min_intensity_var = tk.DoubleVar(value=2.0)
+min_intensity_entry = ttk.Entry(filters_frame, textvariable=min_intensity_var, width=8)
+min_intensity_entry.grid(row=5, column=1, sticky='w', padx=5, pady=5)
+ToolTip(min_intensity_entry, "Minimum fragment intensity as percentage of base peak (most intense peak in spectrum). "
+                             "Fragments below this threshold will be excluded from matching and quantification. "
+                             "Default: 2% (recommended to filter noise)")
+
+# ── Inter-File Drift Correction section ──────────────────────────────
+# Layout: vertical separator | single Drift Correction column
+_drift_sep = ttk.Separator(filters_frame, orient='vertical')
+_drift_sep.grid(row=0, column=3, rowspan=6, sticky='ns', padx=(12, 4), pady=2)
+
+_drift_container = ttk.Frame(filters_frame)
+_drift_container.grid(row=0, column=4, rowspan=6, columnspan=2, sticky='nsew', padx=(4, 5), pady=2)
+_drift_container.grid_columnconfigure(0, weight=1)
+_drift_container.grid_rowconfigure(0, weight=1)
+
+_drift_frame = ttk.LabelFrame(_drift_container, text="Drift Correction")
+_drift_frame.grid(row=0, column=0, sticky='nsew', padx=0, pady=0)
+_drift_frame.grid_columnconfigure(0, weight=1)
+_drift_frame.grid_columnconfigure(1, weight=1)
+
+rt_drift_enabled_var = tk.BooleanVar(value=False)
+rt_drift_check = ttk.Checkbutton(
+    _drift_frame, text="Enable RT Drift Correction",
+    variable=rt_drift_enabled_var,
+    command=lambda: _toggle_drift_widgets()
+)
+rt_drift_check.grid(row=0, column=0, columnspan=2, sticky='w', padx=5, pady=(4, 2))
+ToolTip(rt_drift_check,
+        "Correct for progressive retention-time drift across the run queue\n"
+        "using reference (iRT / IC) peptides.  For each file the mean RT\n"
+        "offset of the reference peptides is measured and applied as a\n"
+        "uniform shift to all peptides' expected RT before scoring.\n\n"
+        "Requirements: ≥3 data files, ≥1 reference peptide detected in\n"
+        "≥70 % of files (or ≥3 files, whichever is larger).")
+
+mass_drift_enabled_var = tk.BooleanVar(value=False)
+mass_drift_check = ttk.Checkbutton(
+    _drift_frame, text="Enable Mass Accuracy Drift Correction",
+    variable=mass_drift_enabled_var,
+    command=lambda: _toggle_drift_widgets()
+)
+mass_drift_check.grid(row=1, column=0, columnspan=2, sticky='w', padx=5, pady=(2, 4))
+ToolTip(mass_drift_check,
+        "Correct for systematic mass-accuracy drift across the run queue.\n"
+        "For each file, the mean signed fragment mass error (ppm) of the\n"
+        "reference peptides is measured and subtracted from all PSMs,\n"
+        "then mass_accuracy and psm_score are recalculated.\n\n"
+        "Requirements: ≥3 data files, ≥1 reference peptide detected in\n"
+        "≥70 %% of files (or ≥3 files, whichever is larger).")
+
+ttk.Label(_drift_frame, text="Reference Peptides:").grid(
+    row=2, column=0, sticky='nw', padx=5, pady=2)
+rt_ref_peptides_var = tk.StringVar(value='')
+rt_ref_peptides_entry = ttk.Entry(_drift_frame, textvariable=rt_ref_peptides_var, width=30)
+rt_ref_peptides_entry.grid(row=2, column=1, sticky='ew', padx=5, pady=2)
+ToolTip(rt_ref_peptides_entry,
+        "Enter one or more reference peptide sequences separated by commas\n"
+        "or semicolons.  These must be present in the PRM input file.\n"
+        "Example: LGGNEQVTR, GAGSSEPVTGLDAK, VEATFGVDESNAK\n\n"
+        "This reference list is shared by both RT drift and mass drift\n"
+        "when their respective enable checkboxes are selected.\n\n"
+        "Each reference peptide must be detected in ≥70% of files\n"
+        "(or ≥3 files, whichever is larger).")
+
+ttk.Label(_drift_frame, text="Correction Mode:").grid(
+    row=3, column=0, sticky='w', padx=5, pady=2)
+rt_drift_model_var = tk.StringVar(value='Direct Offset')
+rt_drift_model_combo = ttk.Combobox(
+    _drift_frame, textvariable=rt_drift_model_var,
+    values=['Direct Offset', 'Trend Model'], state='readonly', width=14)
+rt_drift_model_combo.grid(row=3, column=1, sticky='w', padx=5, pady=(2, 6))
+ToolTip(rt_drift_model_combo,
+        "Shared mode for both RT and Mass drift corrections.\n\n"
+        "Direct Offset: apply each file's measured mean offset directly.\n"
+        "  Simple, transparent, no assumptions about drift shape.\n\n"
+        "Trend Model: fit a linear regression of offset vs. run order and\n"
+        "  use the smoothed prediction.  More robust against noisy single-\n"
+        "  file measurements and gradual systematic drift.")
+
+_shared_drift_widgets = [rt_ref_peptides_entry, rt_drift_model_combo]
+
+def _toggle_drift_widgets():
+    """Enable shared drift controls when either drift correction is enabled."""
+    enabled = rt_drift_enabled_var.get() or mass_drift_enabled_var.get()
+    for w in _shared_drift_widgets:
+        try:
+            if isinstance(w, ttk.Combobox):
+                w.configure(state='readonly' if enabled else 'disabled')
+            else:
+                w.configure(state='normal' if enabled else 'disabled')
+        except Exception:
+            pass
+
+# Start disabled
+_toggle_drift_widgets()
+rt_drift_enabled_var.set(False)
+mass_drift_enabled_var.set(False)
+_toggle_drift_widgets()
+
+quant_options_frame = ttk.Frame(notebook)
+notebook.add(quant_options_frame, text="Quantification")
+quant_options_frame.grid_columnconfigure(1, weight=1)
+
+ttk.Label(quant_options_frame, text="Method:").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+quant_method_var = tk.StringVar(value="Both")
+quant_method_frame = ttk.Frame(quant_options_frame)
+quant_method_frame.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+
+intensity_tooltip = "Sums up the intensity of every fragment. Faster calculation but may underestimate abundance."
+area_tooltip = "Sums up the area under each fragment's extracted ion chromatogram (EIC). More accurate for quantification but requires multiple MS2 scans."
+both_tooltip = "Calculates and reports both methods for comparison. Recommended for most analyses."
+
+intensity_radio = ttk.Radiobutton(quant_method_frame, text="Intensity", 
+                                  variable=quant_method_var, value="Intensity")
+intensity_radio.grid(row=0, column=0, sticky='w', padx=5, pady=2)
+intensity_tip = ToolTip(intensity_radio, intensity_tooltip)
+
+area_radio = ttk.Radiobutton(quant_method_frame, text="Area", 
+                            variable=quant_method_var, value="Area")
+area_radio.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+area_tip = ToolTip(area_radio, area_tooltip)
+
+both_radio = ttk.Radiobutton(quant_method_frame, text="Both", 
+                            variable=quant_method_var, value="Both")
+both_radio.grid(row=0, column=2, sticky='w', padx=5, pady=2)
+both_tip = ToolTip(both_radio, both_tooltip)
+
+ttk.Label(quant_options_frame, text="Fragment Usage:").grid(row=1, column=0, sticky='w', padx=5, pady=2)
+fragment_usage_var = tk.StringVar(value="quant_only")
+fragment_usage_frame = ttk.Frame(quant_options_frame)
+fragment_usage_frame.grid(row=1, column=1, sticky='w', padx=5, pady=2)
+
+frag_all_radio = ttk.Radiobutton(
+    fragment_usage_frame, text="All",
+    variable=fragment_usage_var, value="all"
+)
+frag_all_radio.pack(side='left', padx=5, pady=2)
+ToolTip(frag_all_radio, "Use all matched fragments for both identification and quantification.")
+
+frag_quant_radio = ttk.Radiobutton(
+    fragment_usage_frame, text="Unique (Quant)",
+    variable=fragment_usage_var, value="quant_only"
+)
+frag_quant_radio.pack(side='left', padx=5, pady=2)
+ToolTip(frag_quant_radio, "Use all matched fragments for identification and only unique fragments belonging to the peptide for quantification (recommended).")
+
+frag_both_radio = ttk.Radiobutton(
+    fragment_usage_frame, text="Unique (ID and Quant)",
+    variable=fragment_usage_var, value="both"
+)
+frag_both_radio.pack(side='left', padx=5, pady=2)
+ToolTip(frag_both_radio, "Use only unique fragments for both identification and quantification (may reduce sensitivity/confidence).")
+
+frag_prob_radio = ttk.Radiobutton(
+    fragment_usage_frame, text="Probabilistic (Deconv)",
+    variable=fragment_usage_var, value="probabilistic"
+)
+frag_prob_radio.pack(side='left', padx=5, pady=2)
+ToolTip(frag_prob_radio,
+    "Use predicted spectra to probabilistically split shared fragment "
+    "intensities between competing peptides. Requires ms2pip or peptdeep.\n"
+    "Falls back to 'Unique (Quant)' if no prediction engine is available."
+)
+
+# --- Prediction Engine selector (visible only when Probabilistic is selected) ---
+pred_engine_frame = ttk.LabelFrame(quant_options_frame, text="Spectrum Prediction Engine")
+pred_engine_frame.grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=(5, 2))
+pred_engine_frame.grid_columnconfigure(1, weight=1)
+
+# Engine choice
+pred_engine_var = tk.StringVar(value="ms2pip")
+ttk.Label(pred_engine_frame, text="Engine:").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+pred_engine_choice_frame = ttk.Frame(pred_engine_frame)
+pred_engine_choice_frame.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+
+_ms2pip_label = "MS2PIP"
+_apd_label = "AlphaPeptDeep"
+
+ms2pip_engine_radio = ttk.Radiobutton(
+    pred_engine_choice_frame, text=_ms2pip_label,
+    variable=pred_engine_var, value="ms2pip"
+)
+ms2pip_engine_radio.pack(side='left', padx=5)
+ToolTip(ms2pip_engine_radio,
+    "MS2PIP: XGBoost-based fragment intensity prediction.\n"
+    "Supports HCD and CID fragmentation only.\n"
+    "Fast, no GPU required, good baseline accuracy.\n"
+    "Does NOT require calibration data."
+)
+
+apd_engine_radio = ttk.Radiobutton(
+    pred_engine_choice_frame, text=_apd_label,
+    variable=pred_engine_var, value="alphapeptdeep"
+)
+apd_engine_radio.pack(side='left', padx=5)
+ToolTip(apd_engine_radio,
+    "AlphaPeptDeep: Deep-learning (Transformer/LSTM) fragment intensity prediction.\n"
+    "Supports HCD and CID.  Instrument-aware and NCE-aware.\n"
+    "Can be calibrated with your own PSM spectra (MGF) for\n"
+    "significantly improved accuracy on your specific instrument setup.\n"
+    "GPU-accelerated when CUDA-capable PyTorch is available."
+)
+
+# AlphaPeptDeep-specific options (shown/hidden based on engine choice)
+apd_opts_frame = ttk.Frame(pred_engine_frame)
+apd_opts_frame.grid(row=1, column=0, columnspan=2, sticky='ew', padx=5, pady=2)
+
+ttk.Label(apd_opts_frame, text="Instrument:").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+apd_instrument_var = tk.StringVar(value="Lumos")
+apd_instrument_combo = ttk.Combobox(
+    apd_opts_frame, textvariable=apd_instrument_var,
+    values=_APD_INSTRUMENTS, state='readonly', width=14
+)
+apd_instrument_combo.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+ToolTip(apd_instrument_combo,
+    "Select the mass spectrometer type matching your experimental data.\n"
+    "This affects AlphaPeptDeep's instrument-specific prediction model.\n\n"
+    "  • QE — Thermo Q Exactive series (QE, QE-HF, QE-HFX, QE-Plus)\n"
+    "  • Lumos — Thermo Orbitrap Fusion Lumos / Eclipse / Astral\n"
+    "  • timsTOF — Bruker timsTOF Pro / HT / Ultra / SCP\n"
+    "  • SciexTOF — SCIEX TripleTOF series\n"
+    "  • ThermoTOF — Thermo Orbitrap Astral (TOF mode)\n\n"
+    "Mismatched instrument type will degrade prediction accuracy.\n"
+    "Default: Lumos (most common for Orbitrap-based PRM)."
+)
+
+ttk.Label(apd_opts_frame, text="NCE:").grid(row=0, column=2, sticky='w', padx=(15, 5), pady=2)
+apd_nce_var = tk.StringVar(value="30")
+apd_nce_entry = ttk.Entry(apd_opts_frame, textvariable=apd_nce_var, width=6)
+apd_nce_entry.grid(row=0, column=3, sticky='w', padx=5, pady=2)
+ToolTip(apd_nce_entry,
+    "Normalized Collision Energy used in your experiments.\n"
+    "Common values: 25, 27, 28, 30, 35.\n"
+    "Must match your instrument method for accurate predictions.\n"
+    "HCD typically uses 27-30 for Orbitrap instruments."
+)
+
+# Device is auto-detected (GPU when available, CPU fallback)
+
+# Calibrated model selector row
+apd_calibrate_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(
+    apd_opts_frame, text="Use calibrated model",
+    variable=apd_calibrate_var,
+    command=lambda: _toggle_apd_calibration()
+).grid(row=1, column=0, columnspan=2, sticky='w', padx=5, pady=2)
+ToolTip(apd_opts_frame,
+    "Use a previously calibrated (transfer-learned) AlphaPeptDeep model\n"
+    "for improved prediction accuracy on your instrument.\n\n"
+    "Calibrate a model first via Settings → Calibrate AlphaPeptDeep Model.\n"
+    "Then select it from the dropdown below."
+)
+
+ttk.Label(apd_opts_frame, text="Model:").grid(row=2, column=0, sticky='w', padx=5, pady=2)
+apd_model_var = tk.StringVar(value='(generic uncalibrated)')
+apd_model_combo = ttk.Combobox(apd_opts_frame, textvariable=apd_model_var,
+                               state='readonly', width=40)
+apd_model_combo.grid(row=2, column=1, columnspan=4, sticky='ew', padx=5, pady=2)
+ToolTip(apd_model_combo,
+    "Select a saved calibrated AlphaPeptDeep model.\n"
+    "Models are created via Settings → Calibrate AlphaPeptDeep Model.\n"
+    "Choose '(generic uncalibrated)' to use the default pretrained model."
+)
+
+def _get_apd_model_combo_values():
+    """Build the list of values for the model combobox."""
+    vals = ['(generic uncalibrated)']
+    for m in _list_apd_calibrated_models():
+        vals.append(f"{m['name']}  [{m['instrument']}, NCE {m['nce']}]")
+    return vals
+
+def _refresh_apd_model_combo():
+    """Refresh the calibrated model combobox options."""
+    vals = _get_apd_model_combo_values()
+    apd_model_combo['values'] = vals
+    if apd_model_var.get() not in vals:
+        apd_model_var.set(vals[0])
+
+_refresh_apd_model_combo()
+
+def _get_selected_apd_model_folder():
+    """
+    Return the folder name of the selected calibrated model, or None
+    if 'generic uncalibrated' is selected.
+    """
+    sel = apd_model_var.get()
+    if not sel or sel.startswith('(generic'):
+        return None
+    models = _list_apd_calibrated_models()
+    for m in models:
+        label = f"{m['name']}  [{m['instrument']}, NCE {m['nce']}]"
+        if label == sel:
+            return m['folder']
+    return None
+
+# Keep the inline MGF/PSM variables for backwards compatibility with
+# save_settings / load_settings, but hide the old widgets.
+apd_mgf_var = tk.StringVar(value='')
+apd_psm_var = tk.StringVar(value='')
+apd_cal_nce_var = tk.StringVar(value='')
+
+# Widgets to toggle
+_apd_cal_widgets = [apd_model_combo]
+
+def _toggle_apd_calibration():
+    """Enable/disable calibration-specific widgets."""
+    cal_on = apd_calibrate_var.get()
+    for w in _apd_cal_widgets:
+        w.configure(state='readonly' if cal_on else 'disabled')
+
+
+def _toggle_pred_engine_frame(*args):
+    """Show/hide prediction engine frame based on fragment usage selection."""
+    is_prob = fragment_usage_var.get() == "probabilistic"
+    if is_prob:
+        pred_engine_frame.grid()
+    else:
+        pred_engine_frame.grid_remove()
+    _toggle_apd_options()
+
+def _toggle_apd_options(*args):
+    """Show/hide AlphaPeptDeep options based on engine selection."""
+    is_apd = pred_engine_var.get() == "alphapeptdeep"
+    if is_apd and fragment_usage_var.get() == "probabilistic":
+        apd_opts_frame.grid()
+    else:
+        apd_opts_frame.grid_remove()
+    # Toggle calibration sub-widgets
+    if is_apd:
+        _toggle_apd_calibration()
+
+# Bind variable traces
+fragment_usage_var.trace_add('write', _toggle_pred_engine_frame)
+pred_engine_var.trace_add('write', _toggle_apd_options)
+
+# Initial state: hide prediction engine frame (not probabilistic by default)
+_toggle_pred_engine_frame()
+_toggle_apd_calibration()
+
+# --- 3. Add option to flag ambiguous peptides ---
+flag_ambiguous_var = tk.BooleanVar(value=True)
+ttk.Checkbutton(
+    quant_options_frame, text="Flag PSMs with all ambiguous fragments",
+    variable=flag_ambiguous_var
+).grid(row=3, column=0, columnspan=2, sticky='w', padx=5, pady=2)
+ToolTip(
+    quant_options_frame,
+    "If checked, PSMs for which all matched fragments are ambiguous (shared with more than one peptide) will be flagged and excluded from quantification and reported as ambiguous."
+)
+
+# Log panel — lives inside a container so show/hide doesn't resize the whole window
+log_container = ttk.LabelFrame(frame, text="Logs")
+log_container.grid(row=6, column=0, columnspan=3, pady=(5, 0), sticky='nsew')
+
+log_widget = scrolledtext.ScrolledText(log_container, width=80, height=12, state='normal', wrap='word',
+                                        font=("Segoe UI", 10))
+log_widget.pack(fill='both', expand=True)
+
+# Initialize logging
+buffer_handler, widget_handler = initialize_logging(log_widget)
+
+
+theoretical_ions_cache = {}
+
+def get_selected_neutral_losses():
+    selected = []
+    if main_nl_vars["H2O"].get():
+        selected.append("H2O")
+    if main_nl_vars["NH3"].get():
+        selected.append("NH3")
+    for key, var in other_nl_vars.items():
+        if var.get():
+            selected.append(key)
+    return selected
+
+def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file, log_widget, stop_event, thread_capacity, show_logs):
+    global prm_file_valid
+    
+    fdr_threshold = fdr_threshold_var.get() / 100.0
+    quant_method = quant_method_var.get()
+    generate_eics = generate_eics_var.get()
+
+    if not prm_input_file or not mzml_folder or not output_file or not fasta_file:
+        messagebox.showerror("Error", "All fields are required!")
+        return
+        
+    # Check if PRM file is valid
+    if not prm_file_valid:
+        messagebox.showerror("Error", "The PRM input file contains invalid modifications.\nPlease fix the issues before starting the analysis.")
+        return
+
+    # Re-validate the PRM file to ensure it's still valid
+    if not validate_modifications_from_excel(prm_input_file):
+        return
+
+    rt_width_str = rt_width_var.get().strip()
+    if rt_width_str:
+        try:
+            rt_width_val = float(rt_width_str)
+            if rt_width_val <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Error", "RT Width must be a positive number.")
+            return
+    
+    precursor_tolerance = float(precursor_tolerance_entry.get())
+    precursor_unit = precursor_unit_var.get()
+    fragment_tolerance = float(fragment_tolerance_entry.get())
+    fragment_unit = fragment_unit_var.get()
+    fragmentation_type = fragmentation_var.get()
+
+    # ── Validate reference peptides (when RT Drift Correction is enabled) ──
+    try:
+        _rt_drift_on = rt_drift_enabled_var.get()
+    except Exception:
+        _rt_drift_on = False
+
+    if _rt_drift_on:
+        _ref_raw = rt_ref_peptides_var.get().strip()
+        _ref_peps = [s.strip().upper() for s in re.split(r'[;,\s]+', _ref_raw) if s.strip()]
+        if not _ref_peps:
+            messagebox.showerror("RT Drift Error",
+                "RT Drift Correction is enabled but no reference peptides were provided.\n\n"
+                "Enter one or more reference peptide sequences (comma or semicolon separated)\n"
+                "in the Reference Peptides field, or disable RT Drift Correction.")
+            return
+        # Check that reference peptides exist in the PRM input file
+        try:
+            if prm_input_file.lower().endswith(('.xlsx', '.xls')):
+                _prm_df = pd.read_excel(prm_input_file)
+            elif prm_input_file.lower().endswith('.csv'):
+                _prm_df = pd.read_csv(prm_input_file)
+            elif prm_input_file.lower().endswith('.tsv'):
+                _prm_df = pd.read_csv(prm_input_file, sep='\t')
+            else:
+                _prm_df = pd.read_excel(prm_input_file)
+            _prm_peptides = set(_prm_df.iloc[:, 0].dropna().astype(str).str.strip().str.upper())
+            _missing = [p for p in _ref_peps if p not in _prm_peptides]
+            if _missing:
+                messagebox.showerror("RT Drift Error",
+                    f"The following reference peptide(s) were not found in the PRM input file:\n\n"
+                    f"{', '.join(_missing)}\n\n"
+                    f"Reference peptides must be present in the PRM input file.\n"
+                    f"Check spelling or add them to the input file.")
+                return
+        except Exception as _val_err:
+            logging.warning(f"Could not validate reference peptides against PRM file: {_val_err}")
+
+    # ── Validate reference peptides (when Mass Drift Correction is enabled) ──
+    try:
+        _mass_drift_on = mass_drift_enabled_var.get()
+    except Exception:
+        _mass_drift_on = False
+
+    if _mass_drift_on:
+        _mass_ref_raw = rt_ref_peptides_var.get().strip()
+        _mass_ref_peps = [s.strip().upper() for s in re.split(r'[;,\s]+', _mass_ref_raw) if s.strip()]
+        if not _mass_ref_peps:
+            messagebox.showerror("Mass Drift Error",
+                "Mass Accuracy Drift Correction is enabled but no reference peptides were provided.\n\n"
+                "Enter one or more reference peptide sequences (comma or semicolon separated)\n"
+                "in the Reference Peptides field, or disable Mass Drift Correction.")
+            return
+        # Check that reference peptides exist in the PRM input file
+        try:
+            if prm_input_file.lower().endswith(('.xlsx', '.xls')):
+                _prm_df = pd.read_excel(prm_input_file)
+            elif prm_input_file.lower().endswith('.csv'):
+                _prm_df = pd.read_csv(prm_input_file)
+            elif prm_input_file.lower().endswith('.tsv'):
+                _prm_df = pd.read_csv(prm_input_file, sep='\t')
+            else:
+                _prm_df = pd.read_excel(prm_input_file)
+            _prm_peptides = set(_prm_df.iloc[:, 0].dropna().astype(str).str.strip().str.upper())
+            _missing = [p for p in _mass_ref_peps if p not in _prm_peptides]
+            if _missing:
+                messagebox.showerror("Mass Drift Error",
+                    f"The following mass drift reference peptide(s) were not found in "
+                    f"the PRM input file:\n\n"
+                    f"{', '.join(_missing)}\n\n"
+                    f"Reference peptides must be present in the PRM input file.\n"
+                    f"Check spelling or add them to the input file.")
+                return
+        except Exception as _val_err:
+            logging.warning(f"Could not validate mass drift reference peptides against PRM file: {_val_err}")
+
+    # Block probabilistic mode for fragmentation types not supported by MS2PIP
+    if fragment_usage_var.get() == "probabilistic":
+        if not HAS_MS2PIP:
+            messagebox.showwarning(
+                "Probabilistic Deconvolution Disabled",
+                "'Probabilistic (Deconv)' was selected, but MS2PIP is unavailable.\n\n"
+                "For this run, shared-ion probabilistic deconvolution is disabled and quantification "
+                "will use unique fragments only.\n\n"
+                "Install/upgrade MS2PIP and restart the app to enable probabilistic deconvolution:\n"
+                "pip install -U ms2pip"
+            )
+        elif fragmentation_type not in _MS2PIP_SUPPORTED_FRAG_TYPES:
+            messagebox.showerror(
+                "Unsupported Fragmentation for Probabilistic Mode",
+                f"MS2PIP does not support '{fragmentation_type}' fragmentation.\n\n"
+                f"Supported types: {', '.join(sorted(_MS2PIP_SUPPORTED_FRAG_TYPES))}.\n\n"
+                "Please change the Fragment Usage setting to 'All Fragments', "
+                "'Unique Only (Quant)', or 'Unique + All (ID)', or select a supported "
+                "fragmentation type."
+            )
+            return
+
+    # Auto-convert vendor data files (e.g., .raw, .wiff, .d) to mzML, skipping already converted
+    # For .raw files: use fisher_py for direct reading when available (no conversion needed)
+    all_files = os.listdir(mzml_folder)
+    existing_mzmls = set(f.lower() for f in all_files if f.lower().endswith('.mzml'))
+    vendor_files = [f for f in all_files if os.path.splitext(f)[1].lower() in SUPPORTED_VENDOR_EXTS]
+    
+    # Separate .raw files that fisher_py can read directly from files needing msconvert
+    fisher_available = _check_fisher_available()
+    fisher_direct_files = []
+    to_convert = []
+    for f in vendor_files:
+        if (os.path.splitext(f)[0] + '.mzml').lower() in existing_mzmls:
+            continue  # Already converted, skip
+        if os.path.splitext(f)[1].lower() == '.raw' and fisher_available:
+            fisher_direct_files.append(f)  # Will be read directly, no conversion
+        else:
+            to_convert.append(f)
+    
+    if fisher_direct_files:
+        log_widget.configure(state='normal')
+        log_widget.insert(tk.END,
+            f"fisher_py available — {len(fisher_direct_files)} .raw file(s) will be read directly (no conversion).\n")
+        log_widget.configure(state='disabled'); log_widget.update_idletasks()
+    
+    if to_convert:
+        log_widget.configure(state='normal')
+        log_widget.insert(tk.END, f"Found {len(to_convert)} vendor file(s) to convert.\n")
+        log_widget.configure(state='disabled'); log_widget.update_idletasks()
+        
+        # Pre-check: verify msconvert is available before starting conversion
+        msconvert_path = find_msconvert()
+        if not msconvert_path:
+            msg = (
+                "MSConvert (ProteoWizard) is required to convert vendor raw files "
+                "but was not found in common locations.\n\n"
+                "Yes = Deep scan all drives to find it\n"
+                "No = Open the ProteoWizard download page\n"
+                "Cancel = Abort conversion"
+            )
+            choice = messagebox.askyesnocancel("MSConvert Required", msg)
+            if choice is True:
+                # Deep scan
+                _run_deep_scan_with_progress()
+                msconvert_path = find_msconvert()
+            elif choice is False:
+                download_and_install_proteowizard()
+            # If still not found after any choice, abort
+            if not msconvert_path:
+                log_widget.configure(state='normal')
+                log_widget.insert(tk.END, "ERROR: MSConvert not found. Install ProteoWizard and restart.\n")
+                log_widget.configure(state='disabled'); log_widget.update_idletasks()
+                return
+        
+        # Get the concurrency setting for file conversion
+        max_conversion_workers = file_conversion_concurrency.get()
+        log_widget.configure(state='normal')
+        log_widget.insert(tk.END, f"Converting {len(to_convert)} file(s) with {max_conversion_workers} parallel worker(s)...\n")
+        log_widget.configure(state='disabled'); log_widget.update_idletasks()
+        
+        # Setup progress bar in indeterminate (pacing) mode during conversion
+        progress_bar['mode'] = 'indeterminate'
+        show_progress_bar()
+        progress_bar.start(15)  # Start pacing animation
+        root.update_idletasks()
+
+        # Helper to safely update UI from background thread
+        def _safe_log(msg):
+            def _do():
+                log_widget.configure(state='normal')
+                log_widget.insert(tk.END, msg)
+                log_widget.see(tk.END)
+                log_widget.configure(state='disabled')
+            root.after(0, _do)
+
+        # Collect selected neutral losses from Filters tab (must read tk vars on main thread)
+        selected_neutral_losses = get_selected_neutral_losses()
+        # Read cleanup preference on main thread before spawning background work
+        _cleanup_mzml = cleanup_mzml_var.get()
+
+        # Run conversion in a background thread so the UI stays responsive
+        def _convert_and_start():
+            from concurrent.futures import as_completed
+            try:
+                conversion_batch_start = time.perf_counter()
+                converted_count = 0
+                failed_count = 0
+                # Track which mzML files were generated by conversion for optional cleanup
+                converted_mzml_paths = []
+                with ThreadPoolExecutor(max_workers=max_conversion_workers) as executor:
+                    # Map futures back to their vendor filenames
+                    future_to_file = {}
+                    for vendor_file in to_convert:
+                        raw_path = os.path.join(mzml_folder, vendor_file)
+                        fut = executor.submit(convert_raw_to_mzml, raw_path, mzml_folder, None, None)
+                        future_to_file[fut] = vendor_file
+
+                    # Process results as each conversion finishes (real-time feedback)
+                    for future in as_completed(future_to_file):
+                        vendor_file = future_to_file[future]
+                        try:
+                            mzml_path = future.result()
+                            if mzml_path:
+                                _safe_log(f"  Converted: {vendor_file} -> {os.path.basename(mzml_path)}\n")
+                                converted_count += 1
+                                converted_mzml_paths.append(mzml_path)
+                            else:
+                                _safe_log(f"  WARNING: Conversion returned no output for {vendor_file}\n")
+                                failed_count += 1
+                        except Exception as e:
+                            _safe_log(f"  Error converting {vendor_file}: {str(e)}\n")
+                            failed_count += 1
+
+                conversion_total = time.perf_counter() - conversion_batch_start
+                avg_per_file = (conversion_total / converted_count) if converted_count else 0.0
+                _safe_log(
+                    f"Conversion complete: {converted_count} succeeded, {failed_count} failed "
+                    f"in {conversion_total:.1f}s (avg {avg_per_file:.1f}s/file).\n"
+                )
+                _safe_log("Starting analysis...\n")
+
+                # Stop indeterminate progress and switch to determinate for analysis
+                def _reset_and_start():
+                    progress_bar.stop()
+                    progress_bar['mode'] = 'determinate'
+                    progress_bar['maximum'] = 100
+                    progress_bar['value'] = 0
+                    start_diagnosis(
+                        prm_input_file, mzml_folder, output_file, fasta_file,
+                        log_widget, stop_event, thread_capacity, show_logs,
+                        precursor_tolerance, fragment_tolerance, precursor_unit,
+                        fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics,
+                        selected_neutral_losses=selected_neutral_losses,
+                        clear_log=False,
+                        cleanup_mzml_paths=converted_mzml_paths if _cleanup_mzml else None
+                    )
+
+                # Schedule start_diagnosis on the main thread (it accesses tk widgets)
+                root.after(0, _reset_and_start)
+
+            except Exception as e:
+                error_msg = f"CRITICAL ERROR in conversion/start thread: {str(e)}\n"
+                logging.error(error_msg)
+                _safe_log(error_msg)
+                import traceback
+                tb = traceback.format_exc()
+                logging.error(tb)
+                _safe_log(tb + "\n")
+                # Stop the pacing progress bar on error
+                def _stop_progress():
+                    try:
+                        progress_bar.stop()
+                        progress_bar['mode'] = 'determinate'
+                        hide_progress_bar()
+                    except Exception:
+                        pass
+                root.after(0, _stop_progress)
+
+        threading.Thread(target=_convert_and_start, daemon=True).start()
+        return  # Return immediately so the main thread stays responsive
+
+    # No conversion needed — collect neutral losses and start directly
+    selected_neutral_losses = get_selected_neutral_losses()
+
+    start_diagnosis(
+        prm_input_file, mzml_folder, output_file, fasta_file,
+        log_widget, stop_event, thread_capacity, show_logs,
+        precursor_tolerance, fragment_tolerance, precursor_unit, 
+        fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics,
+        selected_neutral_losses=selected_neutral_losses
+    )
+
+progress_bar_height = 32
+
+
+def _resolve_parent_bg(parent):
+    """Get the background colour of a parent widget, handling ttk widgets
+    that don't expose 'bg' via cget and may return an empty string."""
+    for getter in (
+        lambda: parent.cget('bg'),
+        lambda: parent.cget('background'),
+        lambda: str(parent.tk.call('ttk::style', 'lookup',
+                                   parent.winfo_class(), '-background')),
+        lambda: str(parent.tk.call('ttk::style', 'lookup',
+                                   'TFrame', '-background')),
+    ):
+        try:
+            val = getter()
+            if val and str(val).strip():
+                return str(val)
+        except Exception:
+            continue
+    return '#f0f0f0'  # safe fallback
+
+
+class CanvasProgressBar:
+    """A custom progress bar drawn on a tk.Canvas — immune to ttk theme overrides.
+    Uses rounded rectangles for a modern look matching the app's button style."""
+    def __init__(self, parent, height=32, bg_color='#e0e0e0', fill_color='#2e7d32',
+                 font=('Segoe UI', 11, 'bold'), corner_radius=8):
+        self.bg_color = bg_color
+        self.fill_color = fill_color
+        self.corner_radius = corner_radius
+        self._value = 0
+        self._maximum = 100
+        self._mode = 'determinate'
+        _parent_bg = _resolve_parent_bg(parent)
+        self.canvas = tk.Canvas(parent, height=height, bg=_parent_bg,
+                                highlightthickness=0, bd=0)
+        # Items will be created on first redraw
+        self._bg_items = []
+        self._fill_items = []
+        self._text = self.canvas.create_text(0, height // 2, text='', font=font,
+                                             fill='white', anchor='center')
+        self.canvas.bind('<Configure>', self._on_resize)
+
+    def _draw_rounded_rect(self, x1, y1, x2, y2, r, fill, tag):
+        """Draw a rounded rectangle on the canvas using arcs and rectangles."""
+        self.canvas.delete(tag)
+        if x2 - x1 < 1:
+            return
+        # Clamp radius so it doesn't exceed half the width or height
+        r = min(r, (x2 - x1) // 2, (y2 - y1) // 2)
+        if r < 1:
+            self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline='', tags=tag)
+            return
+        # Four corner arcs
+        self.canvas.create_arc(x1, y1, x1 + 2*r, y1 + 2*r, start=90, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_arc(x2 - 2*r, y1, x2, y1 + 2*r, start=0, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_arc(x1, y2 - 2*r, x1 + 2*r, y2, start=180, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_arc(x2 - 2*r, y2 - 2*r, x2, y2, start=270, extent=90,
+                               fill=fill, outline='', tags=tag)
+        # Three rectangles to fill the body
+        self.canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline='', tags=tag)
+        self.canvas.create_rectangle(x1, y1 + r, x1 + r, y2 - r, fill=fill, outline='', tags=tag)
+        self.canvas.create_rectangle(x2 - r, y1 + r, x2, y2 - r, fill=fill, outline='', tags=tag)
+        # Raise text above fill
+        self.canvas.tag_raise(self._text)
+
+    def _draw_fill_rect(self, x1, y1, x2, y2, r, fill, tag, full_width):
+        """Draw the fill bar: rounded left corners, straight right edge
+        (unless the bar spans the full width, in which case all corners
+        are rounded to match the track)."""
+        self.canvas.delete(tag)
+        if x2 - x1 < 1:
+            return
+        if x2 >= full_width:
+            # Bar fills the entire track — use fully rounded rect
+            self._draw_rounded_rect(x1, y1, x2, y2, r, fill, tag)
+            return
+        r = min(r, (x2 - x1) // 2, (y2 - y1) // 2)
+        if r < 1:
+            self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline='', tags=tag)
+            self.canvas.tag_raise(self._text)
+            return
+        # Left-side arcs only (top-left and bottom-left)
+        self.canvas.create_arc(x1, y1, x1 + 2*r, y1 + 2*r, start=90, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_arc(x1, y2 - 2*r, x1 + 2*r, y2, start=180, extent=90,
+                               fill=fill, outline='', tags=tag)
+        # Body rectangles — rounded left, straight right
+        self.canvas.create_rectangle(x1 + r, y1, x2, y2, fill=fill, outline='', tags=tag)
+        self.canvas.create_rectangle(x1, y1 + r, x1 + r, y2 - r, fill=fill, outline='', tags=tag)
+        self.canvas.tag_raise(self._text)
+
+    def _on_resize(self, event=None):
+        self._redraw()
+
+    def _redraw(self):
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w <= 1:
+            return
+        r = self.corner_radius
+        # Draw the track (background rounded rect)
+        self._draw_rounded_rect(0, 0, w, h, r, self.bg_color, 'bg')
+        if self._mode == 'determinate' and self._maximum > 0:
+            frac = max(0.0, min(1.0, self._value / self._maximum))
+            fill_w = max(0, int(w * frac))
+            pct = int(round(frac * 100))
+            if fill_w > 0:
+                self._draw_fill_rect(0, 0, fill_w, h, r, self.fill_color, 'fill', w)
+            else:
+                self.canvas.delete('fill')
+            self.canvas.coords(self._text, w // 2, h // 2)
+            self.canvas.itemconfigure(self._text, text=f'{pct}%')
+            # Text color: white if bar covers center, dark otherwise
+            if fill_w >= w // 2:
+                self.canvas.itemconfigure(self._text, fill='white')
+            else:
+                self.canvas.itemconfigure(self._text, fill='#333333')
+        else:
+            # indeterminate: fill entirely
+            self._draw_rounded_rect(0, 0, w, h, r, self.fill_color, 'fill')
+            self.canvas.itemconfigure(self._text, text='')
+
+    # dict-style access to match ttk.Progressbar interface
+    def __setitem__(self, key, value):
+        if key == 'value':
+            self._value = float(value)
+            self._redraw()
+        elif key == 'maximum':
+            self._maximum = float(value)
+            self._redraw()
+        elif key == 'mode':
+            self._mode = str(value)
+            self._redraw()
+
+    def __getitem__(self, key):
+        if key == 'value':
+            return self._value
+        elif key == 'maximum':
+            return self._maximum
+        elif key == 'mode':
+            return self._mode
+        return None
+
+    def cget(self, key):
+        return self[key]
+
+    def grid(self, **kw):
+        self.canvas.grid(**kw)
+
+    def pack(self, **kw):
+        self.canvas.pack(**kw)
+
+    def pack_forget(self):
+        self.canvas.pack_forget()
+
+    def grid_remove(self):
+        self.canvas.grid_remove()
+
+    def start(self, interval=50):
+        self._mode = 'indeterminate'
+        self._redraw()
+
+    def stop(self):
+        self._mode = 'determinate'
+        self._redraw()
+
+
+class RoundedCanvasButton:
+    """A canvas-based button with rounded corners — immune to ttk theme overrides."""
+    def __init__(self, parent, text='', bg='#2e7d32', fg='white',
+                 hover_bg=None, font=('Segoe UI', 11, 'bold'),
+                 corner_radius=8, height=38, command=None, cursor='hand2',
+                 disabled_bg='#b0b0b0', disabled_fg='#f2f2f2'):
+        self.bg = bg
+        self.fg = fg
+        self.hover_bg = hover_bg or bg
+        self.disabled_bg = disabled_bg
+        self.disabled_fg = disabled_fg
+        self.corner_radius = corner_radius
+        self._command = command
+        self._text = text
+        self._font = font
+        self._pressed = False
+        self._enabled = True
+        self._active_cursor = cursor
+        self.canvas = tk.Canvas(parent, height=height,
+                                highlightthickness=0, bd=0, cursor=cursor)
+        self.canvas.configure(bg=_resolve_parent_bg(parent))
+        self._text_id = self.canvas.create_text(0, 0, text=text, font=font,
+                                                 fill=fg, anchor='center')
+        self.canvas.bind('<Configure>', self._on_resize)
+        self.canvas.bind('<Enter>', self._on_enter)
+        self.canvas.bind('<Leave>', self._on_leave)
+        self.canvas.bind('<ButtonPress-1>', self._on_press)
+        self.canvas.bind('<ButtonRelease-1>', self._on_release)
+
+    def _draw_rounded_rect(self, x1, y1, x2, y2, r, fill, tag):
+        self.canvas.delete(tag)
+        if x2 - x1 < 1:
+            return
+        r = min(r, (x2 - x1) // 2, (y2 - y1) // 2)
+        if r < 1:
+            self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline='', tags=tag)
+            return
+        self.canvas.create_arc(x1, y1, x1 + 2*r, y1 + 2*r, start=90, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_arc(x2 - 2*r, y1, x2, y1 + 2*r, start=0, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_arc(x1, y2 - 2*r, x1 + 2*r, y2, start=180, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_arc(x2 - 2*r, y2 - 2*r, x2, y2, start=270, extent=90,
+                               fill=fill, outline='', tags=tag)
+        self.canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline='', tags=tag)
+        self.canvas.create_rectangle(x1, y1 + r, x1 + r, y2 - r, fill=fill, outline='', tags=tag)
+        self.canvas.create_rectangle(x2 - r, y1 + r, x2, y2 - r, fill=fill, outline='', tags=tag)
+        self.canvas.tag_raise(self._text_id)
+
+    def _redraw(self, color=None):
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w <= 1:
+            return
+        fill = (self.disabled_bg if not self._enabled else (color or self.bg))
+        self._draw_rounded_rect(0, 0, w, h, self.corner_radius, fill, 'btn_bg')
+        self.canvas.itemconfigure(self._text_id, fill=(self.fg if self._enabled else self.disabled_fg))
+        self.canvas.coords(self._text_id, w // 2, h // 2)
+
+    def _on_resize(self, event=None):
+        self._redraw()
+
+    def _on_enter(self, event=None):
+        if not self._enabled:
+            return
+        self._redraw(self.hover_bg)
+
+    def _on_leave(self, event=None):
+        self._pressed = False
+        self._redraw(self.bg if self._enabled else self.disabled_bg)
+
+    def _on_press(self, event=None):
+        if not self._enabled:
+            return
+        self._pressed = True
+        # Darken the hover color slightly for press feedback
+        self._redraw(self.hover_bg)
+
+    def _on_release(self, event=None):
+        if not self._enabled:
+            return
+        if self._pressed and self._command:
+            self._pressed = False
+            self._redraw(self.hover_bg)
+            self._command()
+
+    def grid(self, **kw):
+        self.canvas.grid(**kw)
+
+    def pack(self, **kw):
+        self.canvas.pack(**kw)
+
+    def pack_forget(self):
+        self.canvas.pack_forget()
+
+    def grid_remove(self):
+        self.canvas.grid_remove()
+
+    def configure(self, **kw):
+        if 'state' in kw:
+            state = str(kw['state']).lower()
+            self.set_enabled(state not in ('disabled', '0', 'false'))
+        if 'text' in kw:
+            self._text = kw['text']
+            self.canvas.itemconfigure(self._text_id, text=kw['text'])
+        if 'bg' in kw:
+            self.bg = kw['bg']
+            self._redraw()
+        if 'fg' in kw:
+            self.fg = kw['fg']
+            self._redraw()
+        if 'hover_bg' in kw:
+            self.hover_bg = kw['hover_bg']
+            self._redraw()
+        if 'disabled_bg' in kw:
+            self.disabled_bg = kw['disabled_bg']
+            self._redraw()
+        if 'disabled_fg' in kw:
+            self.disabled_fg = kw['disabled_fg']
+            self._redraw()
+
+    def set_enabled(self, enabled=True):
+        self._enabled = bool(enabled)
+        self._pressed = False
+        self.canvas.configure(cursor=(self._active_cursor if self._enabled else 'arrow'))
+        self._redraw()
+
+    def bind(self, sequence=None, func=None, add=None):
+        return self.canvas.bind(sequence, func, add)
+
+    def unbind(self, sequence, funcid=None):
+        return self.canvas.unbind(sequence, funcid)
+
+
+progress_bar = CanvasProgressBar(frame, height=progress_bar_height)
+# place progress bar just above Start/Stop buttons at row 7
+progress_bar.grid(row=7, column=0, columnspan=3, pady=5, sticky='ew')
+
+def update_progress_percent_label():
+    """Trigger a redraw of the canvas progress bar (kept for call-site compat)."""
+    try:
+        progress_bar._redraw()
+    except Exception:
+        pass
+
+def show_progress_bar():
+    progress_bar.grid(row=7, column=0, columnspan=3, pady=5, sticky='ew')
+
+def hide_progress_bar():
+    progress_bar.grid_remove()
+
+hide_progress_bar()
+
+# shift buttons to row 8 below updated progress bar
+button_frame = ttk.Frame(frame)
+button_frame.grid(row=8, column=0, columnspan=3, pady=5, sticky='nsew')
+button_frame.grid_columnconfigure(0, weight=1)
+button_frame.grid_columnconfigure(1, weight=1)
+
+start_button = RoundedCanvasButton(button_frame, text="Start",
+                        bg='#2e7d32', fg='white', hover_bg='#388e3c',
+                        font=('Segoe UI', 11, 'bold'),
+                        command=lambda: validate_and_start_diagnosis(
+                            prm_input_entry.get(),
+                            mzml_folder_entry.get(),
+                            output_file_entry.get(),
+                            fasta_file_entry.get(),
+                            log_widget,
+                            stop_event,
+                            get_thread_capacity(thread_capacity_var_menu.get()),
+                            show_logs_var.get()
+                        ))
+start_button.grid(row=0, column=0, padx=10, pady=5, sticky='nsew')
+
+stop_button = RoundedCanvasButton(button_frame, text="Stop",
+                        bg='#c62828', fg='white', hover_bg='#d32f2f',
+                        font=('Segoe UI', 11, 'bold'),
+                        command=lambda: stop_diagnosis(stop_event))
+stop_button.grid(row=0, column=1, padx=10, pady=5, sticky='nsew')
+
+stop_event = threading.Event()
+diagnosis_thread = None
+active_executor = None
+executor_lock = threading.Lock()
+
+def on_app_close():
+    """Gracefully stop background work and close the application."""
+    try:
+        stop_diagnosis(stop_event)
+    except Exception as exc:
+        logging.error(f"Error during shutdown stop request: {exc}")
+
+    # Give worker threads/executor a brief moment to unwind, then close UI.
+    try:
+        root.after(150, root.destroy)
+    except Exception:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+root.protocol("WM_DELETE_WINDOW", on_app_close)
+
+def calculate_protein_quantities_with_method(peptide_quant_data, fasta_file, mzml_files, quant_method="Both", proteins=None):
+    """Calculate protein quantities with configurable quantification method.
+
+    Each peptide is reported under every protein it matches.
+
+    Parameters
+    ----------
+    proteins : dict or None
+        Pre-parsed FASTA dict from :func:`parse_fasta_file`.
+        Avoids redundant file I/O when the caller already has one.
+    """
+    if proteins is None:
+        proteins = parse_fasta_file(fasta_file)
+    protein_quantities = {}
+
+    # Pre-extract columns as numpy arrays for fast indexed access (Fix P3)
+    peptides_arr = peptide_quant_data['peptide'].values
+    n_rows = len(peptide_quant_data)
+    use_intensity = quant_method in ["Intensity", "Both"]
+    use_area = quant_method in ["Area", "Both"]
+    int_arrays, area_arrays = {}, {}
+    for f in mzml_files:
+        if use_intensity:
+            col = f'{f}_intensity'
+            int_arrays[f] = peptide_quant_data[col].values if col in peptide_quant_data.columns else np.zeros(n_rows)
+        if use_area:
+            col = f'{f}_eic_area'
+            area_arrays[f] = peptide_quant_data[col].values if col in peptide_quant_data.columns else np.zeros(n_rows)
+
+    # Build peptide->protein mapping once for all unique peptides
+    unique_peptides = set(peptides_arr)
+    pep_to_proteins = {}
+    for pep in unique_peptides:
+        pep_to_proteins[pep] = match_peptide_to_protein(pep, proteins=proteins)
+
+    for idx in range(n_rows):
+        peptide = peptides_arr[idx]
+        matching = pep_to_proteins.get(peptide, [])
+
+        for accession, protein_name in matching:
+            if accession not in protein_quantities:
+                protein_quantities[accession] = {
+                    'Accession': accession,
+                    'Protein_Name': protein_name,
+                    'Peptides_Used': 0
+                }
+                if use_intensity:
+                    for f in mzml_files:
+                        protein_quantities[accession][f'{f}_intensity'] = 0
+                if use_area:
+                    for f in mzml_files:
+                        protein_quantities[accession][f'{f}_eic_area'] = 0
+
+            protein_quantities[accession]['Peptides_Used'] += 1
+            for f in mzml_files:
+                if use_intensity:
+                    protein_quantities[accession][f'{f}_intensity'] += int_arrays[f][idx]
+                if use_area:
+                    protein_quantities[accession][f'{f}_eic_area'] += area_arrays[f][idx]
+
+    protein_df = pd.DataFrame(list(protein_quantities.values()))
+    
+    protein_df = protein_df.rename(columns={
+        'Protein_Name': 'Protein Name',
+        'Peptides_Used': 'Peptides Used'
+    })
+    
+    return protein_df
+
+def prepare_combined_results_with_method(peptide_results, protein_quantities, mzml_files, quant_method="Both", fasta_file=None, proteins=None):
+    """Prepare combined results for the 'Combined' sheet.
+
+    Parameters
+    ----------
+    fasta_file : str or None
+        Path to FASTA file.  Falls back to ``fasta_file_entry.get()``
+        when *None* (GUI context).
+    proteins : dict or None
+        Pre-parsed FASTA dict from :func:`parse_fasta_file`.
+        Avoids redundant file I/O when the caller already has one.
+    """
+    if proteins is None:
+        _fasta = fasta_file if fasta_file else fasta_file_entry.get()
+        proteins = parse_fasta_file(_fasta)
+
+    use_intensity = quant_method in ["Intensity", "Both"]
+    use_area = quant_method in ["Area", "Both"]
+    
+    combined_results = []
+    
+    # Build protein data dict from protein_quantities DataFrame
+    protein_data = {}
+    for row_dict in protein_quantities.to_dict('records'):
+        accession = row_dict['Accession']
+        pdata = {}
+        if use_intensity:
+            pdata.update({f'{f}_intensity': row_dict.get(f'{f}_intensity', 0) for f in mzml_files})
+        if use_area:
+            pdata.update({f'{f}_eic_area': row_dict.get(f'{f}_eic_area', 0) for f in mzml_files})
+        protein_data[accession] = pdata
+
+    # Pre-convert peptide rows to list-of-dicts (faster than repeated iterrows)
+    peptide_rows = peptide_results.to_dict('records')
+    
+    # Iterate only quantified proteins, not full FASTA (Fix #4)
+    for accession in protein_data:
+        protein_info = proteins.get(accession)
+        if protein_info is None:
+            continue
+        
+        protein_name = protein_info['name']
+        protein_seq = protein_info['sequence']
+        
+        # Track header index for O(1) peptide-count update (Fix #2)
+        protein_header_idx = len(combined_results)
+        
+        protein_row = {
+            'Accession': accession,
+            'Protein Name': protein_name,
+            'Peptides Used': 0,
+        }
+        
+        if use_intensity:
+            for f in mzml_files:
+                protein_row[f'{f}_intensity'] = protein_data[accession].get(f'{f}_intensity', 0)
+                
+        if use_area:
+            for f in mzml_files:
+                protein_row[f'{f}_eic_area'] = protein_data[accession].get(f'{f}_eic_area', 0)
+        
+        combined_results.append(protein_row)
+        
+        peptide_count = 0
+        for prow in peptide_rows:
+            peptide = prow['peptide']
+            if peptide in protein_seq:
+                peptide_data = {
+                    'Accession': '',
+                    'Protein Name': peptide,
+                    'Peptides Used': '',
+                }
+                
+                if use_intensity:
+                    for f in mzml_files:
+                        peptide_data[f'{f}_intensity'] = prow.get(f'{f}_intensity', 0)
+                        
+                if use_area:
+                    for f in mzml_files:
+                        peptide_data[f'{f}_eic_area'] = prow.get(f'{f}_eic_area', 0)
+                
+                combined_results.append(peptide_data)
+                peptide_count += 1
+        
+        # O(1) update instead of O(R) backward scan (Fix #2)
+        combined_results[protein_header_idx]['Peptides Used'] = peptide_count
+        
+        combined_results.append({})
+    
+    combined_df = pd.DataFrame(combined_results)
+    
+    return combined_df
+
+def plot_eic_for_peptide(peptide, mzml_file, mzml_folder, canvas_frame, theoretical_ions_cache, smooth_method="None", smooth_window=5):
+    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    # First clear the canvas
+    for widget in canvas_frame.winfo_children():
+        widget.destroy()
+
+    if not peptide or not mzml_file:
+        messagebox.showwarning("Input Error", "Please select both a peptide and a file.")
+        return
+    
+    # Parse peptide and modification from input (format: "PEPTIDE" or "PEPTIDE (modification)")
+    peptide_seq = peptide
+    modification_from_input = ""
+    if " (" in peptide and peptide.endswith(")"):
+        peptide_seq = peptide.split(" (")[0]
+        modification_from_input = peptide.split(" (")[1][:-1]  # Remove closing parenthesis
+    
+    # --- Check in-memory figure cache first (instant) ---
+    mem_cache_key = f"EIC_{peptide}_{mzml_file}_{smooth_method}_{smooth_window}"
+    cached_png = _get_cached_plot_figure(mem_cache_key)
+    if cached_png is not None:
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(cached_png))
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=100)
+            ax.imshow(img)
+            ax.axis('off')
+            fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            toolbar_frame = ttk.Frame(canvas_frame)
+            toolbar_frame.pack(fill=tk.X)
+            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+            toolbar.update()
+            return
+        except Exception:
+            pass  # Fall through to fresh render
+
+    # Show a progress indicator    
+    progress_indicator = ttk.Progressbar(canvas_frame, mode='indeterminate')
+    progress_indicator.pack(fill='x', expand=False, pady=10)
+    progress_indicator.start()
+    canvas_frame.update_idletasks()
+        
+    logging.debug(f"Plotting EIC for peptide {peptide} from file {mzml_file}")
+
+    try:
+        # Get modification for this peptide from the PRM input file or from parsed input
+        modification = modification_from_input
+        if not modification:
+            try:
+                prm_input_df = pd.read_excel(prm_input_entry.get())
+                peptide_row = prm_input_df[prm_input_df.iloc[:, 0] == peptide_seq]
+                if not peptide_row.empty and pd.notna(peptide_row.iloc[0, 1]):
+                    modification = str(peptide_row.iloc[0, 1])
+            except Exception as e:
+                logging.warning(f"Could not retrieve modification information: {str(e)}")
+        selected_neutral_losses = normalize_neutral_losses(get_selected_neutral_losses())
+        nl_cache_key = neutral_losses_cache_key(selected_neutral_losses)
+        # Create a unique cache key based on peptide sequence and modifications
+        cache_key = f"{peptide_seq}_{modification}_{fragmentation_var.get()}_{nl_cache_key}"
+        
+        # Check if theoretical ions are already cached
+        if cache_key not in theoretical_ions_cache:
+            logging.debug(f"Generating theoretical ions for {peptide_seq} with mods: {modification} (NL: {nl_cache_key})")
+            theoretical_ions = generate_theoretical_ions_cached(peptide_seq, modification, fragmentation_var.get(), selected_neutral_losses)
+            theoretical_ions_cache[cache_key] = theoretical_ions
+            logging.debug(f"Cached theoretical ions for {peptide_seq}")
+        else:
+            logging.debug(f"Using cached theoretical ions for {peptide_seq}")
+            theoretical_ions = theoretical_ions_cache[cache_key]
+        
+        # Check if we have cached EIC data globally
+        global cached_eic_data
+        use_saved_eics = False
+
+        if cached_eic_data is not None:
+            cache_key_eic = f"{peptide_seq}_{mzml_file}"
+            if cache_key_eic in cached_eic_data:
+                peptide_eic_data = cached_eic_data[cache_key_eic]
+                use_saved_eics = True
+                logging.debug(f"Using cached EIC data for {peptide_seq} in {mzml_file}")
+
+        # If no cached data available, check from output folder
+        _out_folder = output_file_entry.get()
+        if not use_saved_eics and _out_folder and os.path.isdir(_out_folder):
+            try:
+                _eic_file = _output_path(_out_folder, 'EICs')
+                if os.path.isfile(_eic_file):
+                    logging.debug("Using saved EIC data from output folder")
+                    eic_df = _get_cached_excel_sheet(_out_folder, 'EICs')
+                    peptide_eic = eic_df[(eic_df['peptide'] == peptide_seq) & (eic_df['file'] == mzml_file)]
+                    
+                    if not peptide_eic.empty:
+                        use_saved_eics = True
+                        
+                        psm_df = _get_cached_excel_sheet(_out_folder, 'PSM')
+                        peptide_data = psm_df[(psm_df['peptide'] == peptide_seq) & (psm_df['file'] == mzml_file)]
+                        
+                        prm_input_df = pd.read_excel(prm_input_entry.get())
+                        peptide_row = prm_input_df[prm_input_df.iloc[:, 0] == peptide_seq]
+                        
+                        if peptide_row.empty:
+                            messagebox.showwarning("Input Error", f"Peptide {peptide_seq} not found in PRM input file.")
+                            return
+                        
+                        try:
+                            rt_width_override = float(rt_width_var.get())
+                            if rt_width_override <= 0:
+                                rt_width_override = None
+                        except Exception:
+                            rt_width_override = None 
+   
+                        start_rt = float(peptide_row.iloc[0, 4])
+                        stop_rt = float(peptide_row.iloc[0, 5])
+                        known_rt = peptide_data['known_rt'].values[0] if not peptide_data.empty else None
+                        
+                        if rt_width_override and known_rt is not None:
+                            start_rt = float(known_rt) - rt_width_override / 2
+                            stop_rt = float(known_rt) + rt_width_override / 2
+
+                        fig = Figure(figsize=(10, 6), dpi=100)
+                        ax = fig.add_subplot(111)
+                        
+                        tol_val = float(fragment_tolerance_entry.get())
+                        tol_unit = fragment_unit_var.get()
+                        
+                        # Only keep rows with valid ion_type and fragment_charge
+                        peptide_eic_filtered = peptide_eic.dropna(subset=['ion_type', 'fragment_charge'])
+
+                        if peptide_eic_filtered.empty:
+                            messagebox.showinfo("No Matched Fragments", "No matched fragment ions were found in the data.")
+                            return
+
+                        # Only keep main ions (no neutral loss)
+                        main_ions_eic = peptide_eic_filtered[peptide_eic_filtered['neutral_loss'].isnull() | (peptide_eic_filtered['neutral_loss'] == '')]
+
+                        group_cols = ['ion_type', 'fragment_charge']
+                        groups = main_ions_eic.groupby(group_cols)
+                        colors = plt.cm.tab10(np.linspace(0, 1, len(groups)))
+                        
+                        # Rank fragments by intensity within the RT window.
+                        # Only fragments with >= 3 scans (matching the quantification
+                        # threshold) are candidates for display and normalisation.
+                        fragment_max_intensities = []  # (ion_type, charge, max_intensity, group_data, theoretical_mz)
+                        
+                        for (ion_type, frag_charge), group in groups:
+                            df_rt = group.groupby('rt').agg({'intensity': 'max'}).reset_index()
+                            df_rt_filtered = df_rt[(df_rt['rt'] >= start_rt) & (df_rt['rt'] <= stop_rt)]
+                            
+                            # Require minimum of 3 scans within RT window (matches quantification threshold)
+                            if len(df_rt_filtered) >= 3:
+                                max_group_intensity = df_rt_filtered['intensity'].max()
+                                theo_mz = group['fragment_theoretical_mz'].iloc[0] if 'fragment_theoretical_mz' in group.columns else 0.0
+                                fragment_max_intensities.append((ion_type, frag_charge, max_group_intensity, group, theo_mz))
+                        
+                        # Sort fragments by max intensity within RT window (descending) and take top 20
+                        fragment_max_intensities.sort(key=lambda x: x[2], reverse=True)
+                        top_fragments = fragment_max_intensities[:20]
+                        top_fragment_keys = {(ion_type, frag_charge): theo_mz for ion_type, frag_charge, _, _, theo_mz in top_fragments}
+                        
+                        # Normalise against the brightest fragment that will actually
+                        # be drawn so the tallest visible trace always reaches 1.0.
+                        global_max = max((mi for _, _, mi, _, _ in top_fragments), default=0)
+
+                        # Reset groups iterator and plot
+                        groups = main_ions_eic.groupby(group_cols)
+                        max_intensity = 0
+                        
+                        # Check if we should shade area integration regions
+                        quant_method = quant_method_var.get()
+                        shade_area_integration = quant_method in ["Area", "Both"]
+                        
+                        for idx, ((ion_type, frag_charge), group) in enumerate(groups):
+                            # Only process and plot if this fragment is in top 20
+                            if (ion_type, frag_charge) not in top_fragment_keys:
+                                continue
+                                
+                            df_rt = group.groupby('rt').agg({'intensity': 'max'}).reset_index()
+                            
+                            # Filter to only the RT window BEFORE normalization
+                            df_rt_filtered = df_rt[(df_rt['rt'] >= start_rt) & (df_rt['rt'] <= stop_rt)]
+                            
+                            # Skip this fragment if it has fewer than 3 scans in the RT window
+                            if len(df_rt_filtered) < 3:
+                                continue
+                            
+                            rts = df_rt_filtered['rt'].values
+                            intensities = df_rt_filtered['intensity'].values / global_max if global_max > 0 else df_rt_filtered['intensity'].values
+
+                            # Smoothing (optional)
+                            if smooth_method != "None" and len(intensities) >= smooth_window:
+                                if smooth_method == "Gaussian":
+                                    sigma = max(1, smooth_window/6)
+                                    intensities = gaussian_filter1d(intensities, sigma=sigma)
+                                else:  # Savitzky-Golay
+                                    w = max(3, smooth_window if smooth_window % 2 else smooth_window + 1)
+                                    intensities = savgol_filter(intensities, w, polyorder=min(2, w-1))
+
+                            # Downsample if too many points
+                            MAX_POINTS = 1000
+                            if len(rts) > MAX_POINTS:
+                                step = len(rts) // MAX_POINTS
+                                rts = rts[::step]
+                                intensities = intensities[::step]
+
+                            if rts.size == 0:
+                                continue
+
+                            max_intensity = max(max_intensity, intensities.max())
+
+                            # Get theoretical m/z for this fragment and add to legend
+                            theo_mz = top_fragment_keys[(ion_type, frag_charge)]
+                            label = f"{ion_type} ({frag_charge}+) m/z {theo_mz:.4f}"
+                            ax.plot(rts, intensities, label=label, color=colors[idx], linestyle='-', alpha=0.7)
+                            
+                            # Shade the area integration region for this fragment
+                            if shade_area_integration:
+                                # All data is already within the integration window
+                                ax.fill_between(rts, 0, intensities, color=colors[idx], alpha=0.15)
+
+                        ax.axvspan(start_rt, stop_rt, alpha=0.2, color='gray')
+                        if known_rt:
+                            ax.axvline(x=known_rt, color='r', linestyle='--', linewidth=1, label='Expected RT')
+
+                        ax.set_xlabel('Retention Time (min)')
+                        ax.set_ylabel('Normalized Intensity')
+                        ax.set_title(f'Extracted Ion Chromatograms for {peptide} in {mzml_file}')
+                        
+                        # Create legend with only top 20 fragments, arranged vertically
+                        handles, labels = ax.get_legend_handles_labels()
+                        if handles:
+                            # Sort legend entries by the order they appear (already sorted by intensity from top_fragments)
+                            ax.legend(handles, labels, loc='upper right', fontsize='small', 
+                                     ncol=1, framealpha=0.9, bbox_to_anchor=(1.0, 0.98))
+                        
+                        ax.set_ylim(bottom=0, top=max_intensity * 1.1 if max_intensity > 0 else 1)
+                        
+                        # Add buffer time (5 minutes on each side) for better visualization
+                        # but keep the shaded region at the user-specified RT width
+                        buffer_time = 5.0  # minutes
+                        ax.set_xlim(start_rt - buffer_time, stop_rt + buffer_time)
+
+                        canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+                        canvas.draw()
+                        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+                        toolbar_frame = ttk.Frame(canvas_frame)
+                        toolbar_frame.pack(fill=tk.X)
+                        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+                        toolbar.update()
+                        
+                        # Cache the rendered figure for instant future access
+                        try:
+                            _cache_plot_figure(mem_cache_key, fig)
+                        except Exception:
+                            pass
+                        return
+
+                    else:
+                        logging.warning(f"No EIC data found for peptide {peptide_seq} in file {mzml_file}")
+                        messagebox.showinfo("No EIC Data", 
+                                          f"No EIC data found for peptide {peptide_seq} in file {mzml_file}.\n\n"
+                                          f"To generate EIC data, run the analysis with the "
+                                          f"'Generate EICs for all peptides' option checked.")
+                        return
+                else:
+                    logging.warning("No EICs sheet found in output file")
+                    messagebox.showinfo("No EIC Data", 
+                                      "No EIC data was collected during analysis.\n\n"
+                                      "To generate EIC data, run the analysis with the "
+                                      "'Generate EICs for all peptides' option checked.")
+                    return
+            except Exception as e:
+                logging.warning(f"Error reading saved EIC data: {str(e)}.")
+                messagebox.showinfo("No EIC Data", 
+                                  f"Could not find EIC data. Error: {str(e)}.\n\n"
+                                  f"To generate EIC data, run the analysis with the "
+                                  f"'Generate EICs for all peptides' option checked.")
+                return
+        else:
+            messagebox.showinfo("No Results File", 
+                             "No output file available or analysis not yet run.\n\n"
+                             "Run the analysis with the 'Generate EICs for all peptides' option checked.")
+            return
+    except Exception as e:
+        logging.error(f"Error plotting EIC: {str(e)}")
+        traceback.print_exc()
+        messagebox.showerror("Error", f"Failed to plot EIC: {str(e)}")
+
+def extract_eic_data(ms2_spectra, theoretical_ions, tolerance, unit='ppm'):
+    fragment_intensities = {}
+    
+    for spectrum in ms2_spectra:
+        rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
+        exp_mz = np.array(spectrum['m/z array'])
+        exp_intensity = np.array(spectrum['intensity array'])
+        
+        for ion_type in theoretical_ions.keys():
+            for charge in range(1, 4):
+                if charge in theoretical_ions[ion_type]:
+                    for theoretical_mz in theoretical_ions[ion_type][charge]:
+                        if theoretical_mz is None:  # NL placeholder — skip
+                            continue
+                        if unit == 'ppm':
+                            mass_tolerance = theoretical_mz * tolerance / 1e6
+                        else:
+                            mass_tolerance = tolerance
+                        
+                        indices = np.where(abs(exp_mz - theoretical_mz) <= mass_tolerance)[0]
+                        
+                        fragment_key = (ion_type, theoretical_mz, charge)
+                        
+                        if fragment_key not in fragment_intensities:
+                            fragment_intensities[fragment_key] = {}
+                        
+                        if indices.size > 0:
+                            max_intensity = np.max(exp_intensity[indices])
+                            fragment_intensities[fragment_key][rt] = max_intensity
+    
+    return fragment_intensities
+
+def generate_qc_plot(metric_type, canvas_frame):
+    import seaborn as sns
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    for widget in canvas_frame.winfo_children():
+        widget.destroy()
+    
+    _out_folder = output_file_entry.get()
+    if not _out_folder or not os.path.isdir(_out_folder):
+        messagebox.showwarning("No Data", "No results folder available. Run analysis first.")
+        return
+    
+    try:
+        results_df = _get_cached_excel_sheet(_out_folder, 'PSM')
+        
+        target_df = results_df[~results_df['peptide'].str.startswith('DECOY_')]
+        
+        if target_df.empty:
+            messagebox.showwarning("No Data", "No target PSMs found in results.")
+            return
+        
+        fig = Figure(figsize=(10, 6), dpi=100)
+        
+        if metric_type == "Mass Accuracy":
+            # Vectorized fragment m/z expansion (no iterrows)
+            _frag_series = target_df['fragment_mzs'].dropna()
+            _file_for_frag = target_df.loc[_frag_series.index, 'file']
+            _split = _frag_series.str.split(', ')
+            _exploded = _split.explode()
+            _with_colon = _exploded[_exploded.str.contains(':', na=False)]
+            _accuracies = _with_colon.str.split(':').str[1].astype(float)
+            _files = _file_for_frag.reindex(_accuracies.index)
+            mass_accuracies = _accuracies.tolist()
+            file_names = _files.tolist()
+            
+            mass_df = pd.DataFrame({'File': file_names, 'Mass Accuracy (ppm)': mass_accuracies})
+            
+            fig = Figure(figsize=(12, 8), dpi=100)
+            gs = fig.add_gridspec(2, 2, width_ratios=[3, 1], height_ratios=[1, 3])
+            
+            ax_hist = fig.add_subplot(gs[0, 0])
+            ax_hist.hist(mass_accuracies, bins=50, color='skyblue', edgecolor='black')
+            ax_hist.set_title('Mass Accuracy Distribution')
+            ax_hist.set_xlabel('Mass Accuracy (ppm)')
+            ax_hist.set_ylabel('Count')
+            
+            ax_box = fig.add_subplot(gs[1, 0])
+            sns.boxplot(x='File', y='Mass Accuracy (ppm)', data=mass_df, ax=ax_box)
+            ax_box.set_title('Mass Accuracy by File')
+            ax_box.set_xticklabels(ax_box.get_xticklabels(), rotation=45, ha='right')
+            
+            ax_density = fig.add_subplot(gs[1, 1])
+            sns.kdeplot(y=mass_accuracies, ax=ax_density, fill=True)
+            ax_density.set_ylabel('Mass Accuracy (ppm)')
+            ax_density.set_title('Density')
+            
+            ax_stats = fig.add_subplot(gs[0, 1])
+            ax_stats.axis('off')
+            stats_text = (
+                f"Mean: {np.mean(mass_accuracies):.4f} ppm\n"
+                f"Median: {np.median(mass_accuracies):.4f} ppm\n"
+                f"Std Dev: {np.std(mass_accuracies):.4f} ppm\n"
+                f"Min: {np.min(mass_accuracies):.4f} ppm\n"
+                f"Max: {np.max(mass_accuracies):.4f} ppm\n"
+                f"Total Points: {len(mass_accuracies)}"
+            )
+            ax_stats.text(0.5, 0.5, stats_text, ha='center', va='center', fontsize=10)
+            
+        elif metric_type == "Retention Time Deviation":
+            rt_data = target_df[pd.notna(target_df['known_rt'])]
+            
+            if rt_data.empty:
+                messagebox.showwarning("No Data", "No retention time data with expected values found.")
+                return
+                
+            rt_data['rt_deviation'] = rt_data['rt'] - rt_data['known_rt']
+            
+            fig = Figure(figsize=(12, 8), dpi=100)
+            gs = fig.add_gridspec(2, 2, width_ratios=[3, 1], height_ratios=[1, 3])
+            
+            ax_hist = fig.add_subplot(gs[0, 0])
+            ax_hist.hist(rt_data['rt_deviation'], bins=30, color='lightgreen', edgecolor='black')
+            ax_hist.set_title('RT Deviation Distribution')
+            ax_hist.set_xlabel('RT Deviation (min)')
+            ax_hist.set_ylabel('Count')
+            
+            ax_scatter = fig.add_subplot(gs[1, 0])
+            ax_scatter.scatter(rt_data['known_rt'], rt_data['rt'], alpha=0.6)
+            
+            min_rt = min(rt_data['known_rt'].min(), rt_data['rt'].min())
+            max_rt = max(rt_data['known_rt'].max(), rt_data['rt'].max())
+            ax_scatter.plot([min_rt, max_rt], [min_rt, max_rt], 'r--')
+            
+            ax_scatter.set_title('Observed vs Expected RT')
+            ax_scatter.set_xlabel('Expected RT (min)')
+            ax_scatter.set_ylabel('Observed RT (min)')
+            
+            ax_density = fig.add_subplot(gs[1, 1])
+            sns.kdeplot(y=rt_data['rt_deviation'], ax=ax_density, fill=True)
+            ax_density.set_ylabel('RT Deviation (min)')
+            ax_density.set_title('Density')
+            
+            ax_stats = fig.add_subplot(gs[0, 1])
+            ax_stats.axis('off')
+            stats_text = (
+                f"Mean Deviation: {rt_data['rt_deviation'].mean():.3f} min\n"
+                f"Median Deviation: {rt_data['rt_deviation'].median():.3f} min\n"
+                f"Std Dev: {rt_data['rt_deviation'].std():.3f} min\n"
+                f"Mean Absolute Error: {np.abs(rt_data['rt_deviation']).mean():.3f} min\n"
+                f"Total Peptides: {len(rt_data)}"
+            )
+            ax_stats.text(0.5, 0.5, stats_text, ha='center', va='center', fontsize=10)
+            
+        elif metric_type == "PSM Score":
+            fig = Figure(figsize=(12, 8), dpi=100)
+            gs = fig.add_gridspec(2, 2, width_ratios=[3, 1], height_ratios=[1, 3])
+            
+            ax_hist = fig.add_subplot(gs[0, 0])
+            ax_hist.hist(target_df['psm_score'], bins=30, alpha=0.7, label='Target', color='skyblue')
+            
+            decoy_df = results_df[results_df['peptide'].str.startswith('DECOY_')]
+            if not decoy_df.empty:
+                ax_hist.hist(decoy_df['psm_score'], bins=30, alpha=0.7, label='Decoy', color='salmon')
+                
+            ax_hist.set_title('PSM Score Distribution')
+            ax_hist.set_xlabel('PSM Score')
+            ax_hist.set_ylabel('Count')
+            ax_hist.legend()
+            
+            ax_box = fig.add_subplot(gs[1, 0])
+            sns.boxplot(x='file', y='psm_score', data=target_df, ax=ax_box)
+            ax_box.set_title('PSM Scores by File')
+            ax_box.set_xticklabels(ax_box.get_xticklabels(), rotation=45, ha='right')
+            
+            ax_density = fig.add_subplot(gs[1, 1])
+            sns.kdeplot(y=target_df['psm_score'], ax=ax_density, fill=True, color='skyblue', label='Target')
+            if not decoy_df.empty:
+                sns.kdeplot(y=decoy_df['psm_score'], ax=ax_density, fill=True, color='salmon', alpha=0.5, label='Decoy')
+            ax_density.set_ylabel('PSM Score')
+            ax_density.set_title('Density')
+            ax_density.legend()
+            
+            ax_stats = fig.add_subplot(gs[0, 1])
+            ax_stats.axis('off')
+            
+            target_stats = (
+                f"Target PSMs:\n"
+                f"  Count: {len(target_df)}\n"
+                f"  Mean Score: {target_df['psm_score'].mean():.4f}\n"
+                f"  Median Score: {target_df['psm_score'].median():.4f}\n"
+                f"  Std Dev: {target_df['psm_score'].std():.4f}\n"
+            )
+            
+            decoy_stats = ""
+            if not decoy_df.empty:
+                decoy_stats = (
+                    f"\nDecoy PSMs:\n"
+                    f"  Count: {len(decoy_df)}\n"
+                    f"  Mean Score: {decoy_df['psm_score'].mean():.4f}\n"
+                    f"  Median Score: {decoy_df['psm_score'].median():.4f}\n"
+                )
+                
+            sep_stats = ""
+            if not decoy_df.empty:
+                ks_stat, p_val = stats.ks_2samp(target_df['psm_score'], decoy_df['psm_score'])
+                sep_stats = (
+                    f"\nSeparation:\n"
+                    f"  KS-Test: {ks_stat:.4f} (p={p_val:.4e})\n"
+                )
+                
+            ax_stats.text(0.5, 0.5, target_stats + decoy_stats + sep_stats, 
+                         ha='center', va='center', fontsize=9)
+
+        elif metric_type == "RT Drift":
+            # --- RT Drift visualization --------------------------------
+            if 'rt_drift_correction' not in target_df.columns or 'run_order' not in target_df.columns:
+                messagebox.showinfo("No Data",
+                    "RT drift correction was not applied for this analysis.\n"
+                    "Enable it in Filters \u2192 RT Drift Correction and re-run.")
+                return
+            drift_df = target_df.copy()
+            drift_df['rt_drift_correction'] = pd.to_numeric(
+                drift_df['rt_drift_correction'], errors='coerce')
+            drift_df['run_order'] = pd.to_numeric(
+                drift_df['run_order'], errors='coerce')
+            drift_nonzero = drift_df[drift_df['rt_drift_correction'] != 0.0]
+            if drift_nonzero.empty:
+                messagebox.showinfo("No Data",
+                    "RT drift correction values are all zero \u2014 no drift was modeled.")
+                return
+
+            file_offsets = (
+                drift_nonzero.groupby(['file', 'run_order'])
+                ['rt_drift_correction'].first()
+                .reset_index()
+                .sort_values('run_order')
+            )
+
+            fig = Figure(figsize=(12, 8), dpi=100)
+            gs = fig.add_gridspec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1])
+
+            # Top-left: offset vs run order
+            ax1 = fig.add_subplot(gs[0, 0])
+            ax1.bar(file_offsets['run_order'], file_offsets['rt_drift_correction'],
+                    color='steelblue', alpha=0.8, edgecolor='black', linewidth=0.5)
+            ax1.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+            ax1.set_xlabel('Run Order')
+            ax1.set_ylabel('RT Offset (min)')
+            ax1.set_title('Per-File RT Drift Offset vs. Run Order')
+
+            # Top-right: statistics
+            offsets = file_offsets['rt_drift_correction'].values
+            ax_s = fig.add_subplot(gs[0, 1]); ax_s.axis('off')
+            slope_txt = ''
+            if len(offsets) >= 3:
+                try:
+                    _sl, _ic = np.polyfit(file_offsets['run_order'].values, offsets, 1)
+                    slope_txt = f'\nTrend: {_sl:+.4f} min/run'
+                    x_fit = file_offsets['run_order'].values
+                    ax1.plot(x_fit, _sl * x_fit + _ic, 'r-', linewidth=1.5,
+                             label=f'Trend ({_sl:+.4f} min/run)')
+                    ax1.legend(fontsize=8)
+                except Exception:
+                    pass
+            ax_s.text(0.5, 0.5,
+                      f"Files: {len(offsets)}\n"
+                      f"Mean offset: {np.mean(offsets):+.3f} min\n"
+                      f"Median: {np.median(offsets):+.3f} min\n"
+                      f"Std: {np.std(offsets):.3f} min\n"
+                      f"Range: {np.ptp(offsets):.3f} min"
+                      f"{slope_txt}",
+                      ha='center', va='center', fontsize=10)
+
+            # Bottom-left: before vs after RT accuracy
+            ax2 = fig.add_subplot(gs[1, 0])
+            if 'known_rt' in drift_df.columns and 'known_rt_corrected' in drift_df.columns:
+                rt_obs = pd.to_numeric(drift_df['rt'], errors='coerce')
+                known_orig = pd.to_numeric(drift_df['known_rt'], errors='coerce')
+                known_corr = pd.to_numeric(drift_df['known_rt_corrected'], errors='coerce')
+                err_before = (rt_obs - known_orig).dropna().abs()
+                err_after = (rt_obs - known_corr).dropna().abs()
+                bins = np.linspace(0, max(err_before.quantile(0.99),
+                                          err_after.quantile(0.99)), 40)
+                ax2.hist(err_before, bins=bins, alpha=0.6, color='salmon',
+                         edgecolor='black', linewidth=0.3, label='Before correction')
+                ax2.hist(err_after, bins=bins, alpha=0.6, color='mediumseagreen',
+                         edgecolor='black', linewidth=0.3, label='After correction')
+                ax2.set_xlabel('|RT error| (min)')
+                ax2.set_ylabel('Count')
+                ax2.set_title('RT Accuracy: Before vs After Drift Correction')
+                ax2.legend(fontsize=8)
+            else:
+                ax2.text(0.5, 0.5, 'known_rt / known_rt_corrected\ncolumns not available',
+                         ha='center', va='center')
+
+            # Bottom-right: post-correction RT accuracy histogram
+            ax3 = fig.add_subplot(gs[1, 1])
+            rt_acc_data = pd.to_numeric(drift_nonzero['rt_accuracy'], errors='coerce').dropna()
+            if not rt_acc_data.empty:
+                ax3.hist(rt_acc_data, bins=30, color='steelblue', alpha=0.7,
+                         edgecolor='black', linewidth=0.3)
+                ax3.set_xlabel('RT Accuracy (min)')
+                ax3.set_ylabel('Count')
+                ax3.set_title('Post-Correction RT Accuracy')
+            else:
+                ax3.text(0.5, 0.5, 'No data', ha='center', va='center')
+
+        fig.tight_layout()
+        
+        canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        toolbar_frame = ttk.Frame(canvas_frame)
+        toolbar_frame.pack(fill=tk.X)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+        
+    except Exception as e:
+        logging.error(f"Error generating QC plot: {str(e)}")
+        messagebox.showerror("Error", f"Failed to generate QC plot: {str(e)}")
+
+def run_multivariate_analysis(analysis_type, normalize, canvas_frame):
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    for widget in canvas_frame.winfo_children():
+        widget.destroy()
+    
+    if not output_file_entry.get() or not os.path.isdir(output_file_entry.get()):
+        messagebox.showwarning("No Data", "No results folder available. Run analysis first.")
+        return
+    
+    try:
+        peptide_df = _get_cached_excel_sheet(output_file_entry.get(), 'Peptide Quantification')
+        
+        if peptide_df.empty:
+            messagebox.showwarning("No Data", "No peptide quantification data found.")
+            return
+            
+        intensity_cols = [col for col in peptide_df.columns if '_intensity' in col]
+        area_cols = [col for col in peptide_df.columns if '_eic_area' in col]
+        
+        if intensity_cols:
+            data_cols = intensity_cols
+            data_type = "Intensity"
+        elif area_cols:
+            data_cols = area_cols
+            data_type = "EIC Area"
+        else:
+            messagebox.showwarning("No Data", "No quantification data columns found.")
+            return
+            
+        sample_names = [col.split('_')[0] for col in data_cols]
+        
+        data_matrix = peptide_df[data_cols].values
+        
+        if data_matrix.shape[0] < 2 or data_matrix.shape[1] < 2:
+            messagebox.showwarning("Insufficient Data", 
+                                 f"Need at least 2 peptides and 2 samples. Got {data_matrix.shape[0]} peptides and {data_matrix.shape[1]} samples.")
+            return
+            
+        data_matrix = np.nan_to_num(data_matrix)
+        
+        if normalize:
+            data_matrix = np.log1p(data_matrix)
+            
+            scaler = StandardScaler()
+            data_matrix = scaler.fit_transform(data_matrix)
+            
+        peptide_names = peptide_df['peptide'].values
+            
+        fig = Figure(figsize=(10, 8), dpi=100)
+        
+        if analysis_type == "PCA":
+            pca = PCA(n_components=min(3, data_matrix.shape[1], data_matrix.shape[0]))
+            pca_result = pca.fit_transform(data_matrix)
+            
+            ax = fig.add_subplot(111)
+            scatter = ax.scatter(pca_result[:, 0], pca_result[:, 1], s=50, alpha=0.7)
+            
+            for i, peptide in enumerate(peptide_names):
+                ax.annotate(peptide, (pca_result[i, 0], pca_result[i, 1]), 
+                           fontsize=8, alpha=0.7, ha='center', va='bottom')
+            
+            explained_var = pca.explained_variance_ratio_
+            ax.set_xlabel(f'PC1 ({explained_var[0]:.1%} explained variance)')
+            ax.set_ylabel(f'PC2 ({explained_var[1]:.1%} explained variance)')
+            ax.set_title(f'PCA of {data_type} Values' + (" (Normalized)" if normalize else ""))
+            
+            ax.grid(True, alpha=0.3)
+            
+            info_text = (
+                f"Total explained variance: {sum(explained_var):.1%}\n"
+                f"Number of peptides: {len(peptide_names)}\n"
+                f"Number of samples: {len(sample_names)}"
+            )
+            props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            ax.text(0.05, 0.95, info_text, transform=ax.transAxes, fontsize=9,
+                   verticalalignment='top', bbox=props)
+            
+        elif analysis_type == "Hierarchical Clustering":
+            linkage_method = 'ward'
+            
+            Z = hierarchy.linkage(data_matrix, method=linkage_method)
+            
+            ax = fig.add_subplot(111)
+            dendrogram = hierarchy.dendrogram(
+                Z,
+                orientation='top',
+                labels=peptide_names,
+                color_threshold=0.7 * max(Z[:, 2]),
+                leaf_font_size=8,
+                ax=ax
+            )
+            
+            ax.set_title(f'Hierarchical Clustering of Peptides by {data_type}' + 
+                       (" (Normalized)" if normalize else ""))
+            ax.set_xlabel('Peptides')
+            ax.set_ylabel('Distance')
+            
+            plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+            
+        elif analysis_type == "Heatmap":
+            heatmap_df = pd.DataFrame(data_matrix, index=peptide_names, columns=sample_names)
+            
+            ax = fig.add_subplot(111)
+            
+            g = sns.heatmap(
+                heatmap_df, 
+                cmap='viridis',
+                ax=ax,
+                cbar_kws={'label': f'{data_type}' + (" (Normalized)" if normalize else "")},
+                xticklabels=True,
+                yticklabels=True
+            )
+            
+            ax.set_title(f'Heatmap of {data_type} Values' + (" (Normalized)" if normalize else ""))
+            
+            plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+            if len(peptide_names) > 20:
+                plt.setp(ax.get_yticklabels(), fontsize=8)
+        
+        fig.tight_layout()
+        
+        canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        toolbar_frame = ttk.Frame(canvas_frame)
+        toolbar_frame.pack(fill=tk.X)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+        
+    except Exception as e:
+        logging.error(f"Error running multivariate analysis: {str(e)}")
+        traceback.print_exc()
+        messagebox.showerror("Error", f"Failed to run multivariate analysis: {str(e)}")
+
+def train_ml_model(model_type, test_size, results_frame):
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import train_test_split, cross_val_score
+    from sklearn.metrics import accuracy_score, classification_report, silhouette_score
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    for widget in results_frame.winfo_children():
+        widget.destroy()
+    
+    _out_folder = output_file_entry.get()
+    if not _out_folder or not os.path.isdir(_out_folder):
+        messagebox.showwarning("No Data", "No results folder available. Run analysis first.")
+        return
+    
+    try:
+        peptide_df = _get_cached_excel_sheet(_out_folder, 'Peptide Quantification')
+        
+        if peptide_df.empty:
+            messagebox.showwarning("No Data", "No peptide quantification data found.")
+            return
+            
+        intensity_cols = [col for col in peptide_df.columns if '_intensity' in col]
+        area_cols = [col for col in peptide_df.columns if '_eic_area' in col]
+        
+        if intensity_cols:
+            data_cols = intensity_cols
+            data_type = "Intensity"
+        elif area_cols:
+            data_cols = area_cols
+            data_type = "EIC Area"
+        else:
+            messagebox.showwarning("No Data", "No quantification data columns found.")
+            return
+        
+        sample_names = [col.split('_')[0] for col in data_cols]
+        
+        X = peptide_df[data_cols].values
+        
+        X = np.nan_to_num(X)
+        
+        peptide_names = peptide_df['peptide'].values
+        
+        if X.shape[0] < 10:
+            messagebox.showwarning("Insufficient Data", 
+                                  f"Need at least 10 peptides for machine learning. Got {X.shape[0]}.")
+            return
+            
+        text_widget = scrolledtext.ScrolledText(results_frame, wrap=tk.WORD, height=15)
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        def insert_text(text, tag=None):
+            text_widget.insert(tk.END, text, tag)
+            text_widget.see(tk.END)
+            
+        text_widget.tag_configure("title", font=("Arial", 12, "bold"))
+        text_widget.tag_configure("subtitle", font=("Arial", 10, "bold"))
+        text_widget.tag_configure("code", font=("Courier", 9))
+        
+        insert_text(f"Machine Learning Analysis: {model_type}\n\n", "title")
+        insert_text(f"Data type: {data_type}\n")
+        insert_text(f"Number of peptides: {X.shape[0]}\n")
+        insert_text(f"Number of samples: {X.shape[1]}\n")
+        insert_text(f"Samples: {', '.join(sample_names)}\n\n")
+        
+        if model_type == "Random Forest":
+            def extract_group(filename):
+                for i, char in enumerate(filename):
+                    if char == '_' or char.isdigit():
+                        return filename[:i]
+                return filename
+                
+            groups = [extract_group(name) for name in sample_names]
+            unique_groups = list(set(groups))
+            
+            if len(unique_groups) < 2:
+                insert_text("Error: Need at least 2 different sample groups for classification.\n")
+                insert_text("Try renaming your files to indicate different experimental groups (e.g., 'Control_1', 'Treatment_1').\n")
+                return
+                
+            y = np.array([unique_groups.index(g) for g in groups])
+            
+            X = X.T
+            
+            insert_text("Sample Groups:\n", "subtitle")
+            for i, group in enumerate(unique_groups):
+                insert_text(f"  Group {i}: {group}\n")
+                group_samples = [sample_names[j] for j, g in enumerate(groups) if g == group]
+                insert_text(f"    Samples: {', '.join(group_samples)}\n")
+            insert_text("\n")
+            
+            try:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=test_size, random_state=42, stratify=y)
+            except ValueError:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=test_size, random_state=42)
+            
+            insert_text("Training Random Forest Classifier...\n", "subtitle")
+            clf = RandomForestClassifier(n_estimators=100, random_state=42)
+            clf.fit(X_train, y_train)
+            
+            y_pred = clf.predict(X_test)
+            accuracy = accuracy_score(y_test, y_pred)
+            
+            insert_text(f"Model Accuracy: {accuracy:.2%}\n\n")
+            
+            feature_importances = clf.feature_importances_
+            
+            sorted_idx = np.argsort(feature_importances)[::-1]
+            
+            insert_text("Top 10 Important Peptides:\n", "subtitle")
+            for i, idx in enumerate(sorted_idx[:10]):
+                insert_text(f"  {i+1}. {peptide_names[idx]}: {feature_importances[idx]:.4f}\n")
+            
+            insert_text("\nCross-Validation:\n", "subtitle")
+            cv_scores = cross_val_score(clf, X, y, cv=min(5, len(unique_groups)))
+            insert_text(f"  Mean CV Accuracy: {cv_scores.mean():.2%}\n")
+            insert_text(f"  CV Scores: {', '.join([f'{s:.2%}' for s in cv_scores])}\n")
+            
+            insert_text("\nClassification Report:\n", "subtitle")
+            report = classification_report(y_test, y_pred, 
+                                      target_names=[f"Group {g}" for g in unique_groups])
+            insert_text(report, "code")
+            
+        elif model_type == "K-Means Clustering":
+            X_scaled = StandardScaler().fit_transform(X)
+            
+            max_clusters = min(10, X.shape[0] - 1)
+            
+            silhouette_scores = []
+            for k in range(2, max_clusters + 1):
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labels = kmeans.fit_predict(X_scaled)
+                score = silhouette_score(X_scaled, labels) if len(set(labels)) > 1 else 0
+                silhouette_scores.append(score)
+            
+            optimal_k = 2 + silhouette_scores.index(max(silhouette_scores))
+            
+            insert_text(f"Training K-Means Clustering with {optimal_k} clusters...\n", "subtitle")
+            kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(X_scaled)
+            
+            silhouette_avg = silhouette_score(X_scaled, cluster_labels)
+            insert_text(f"Silhouette Score: {silhouette_avg:.4f}\n\n")
+            
+            insert_text("Cluster Assignments:\n", "subtitle")
+            for cluster_id in range(optimal_k):
+                peptides_in_cluster = [peptide_names[i] for i, label in enumerate(cluster_labels) 
+                                     if label == cluster_id]
+                insert_text(f"  Cluster {cluster_id+1}: {len(peptides_in_cluster)} peptides\n")
+                if len(peptides_in_cluster) <= 10:
+                    insert_text(f"    {', '.join(peptides_in_cluster)}\n")
+                else:
+                    insert_text(f"    {', '.join(peptides_in_cluster[:10])}, ... and {len(peptides_in_cluster)-10} more\n")
+            
+            insert_text("\n")
+            
+            fig = Figure(figsize=(10, 5))
+            
+            ax1 = fig.add_subplot(121)
+            pca = PCA(n_components=2)
+            X_pca = pca.fit_transform(X_scaled)
+            
+            for cluster_id in range(optimal_k):
+                cluster_points = X_pca[cluster_labels == cluster_id]
+                ax1.scatter(cluster_points[:, 0], cluster_points[:, 1], 
+                           label=f'Cluster {cluster_id+1}', alpha=0.7)
+            
+            ax1.set_title('PCA Visualization of Clusters')
+            ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})')
+            ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})')
+            ax1.legend()
+            
+            ax2 = fig.add_subplot(122)
+            
+            centers = StandardScaler().inverse_transform(kmeans.cluster_centers_)
+            
+            for i in range(optimal_k):
+                ax2.plot(centers[i], marker='o', linestyle='-', 
+                        label=f'Cluster {i+1}')
+            
+            ax2.set_title('Cluster Profiles')
+            ax2.set_xlabel('Sample')
+            ax2.set_ylabel(data_type)
+            ax2.set_xticks(range(len(sample_names)))
+            ax2.set_xticklabels(sample_names, rotation=45, ha='right')
+            ax2.legend()
+            
+            fig.tight_layout()
+            
+            canvas_frame = ttk.Frame(results_frame)
+            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            
+            toolbar_frame = ttk.Frame(canvas_frame)
+            toolbar_frame.pack(fill=tk.X)
+            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+            toolbar.update()
+        
+    except Exception as e:
+        logging.error(f"Error training ML model: {str(e)}")
+        traceback.print_exc()
+        messagebox.showerror("Error", f"Failed to train model: {str(e)}")
+
+def _find_viewer():
+    """Locate the ProteoPRM Results Viewer executable or script.
+
+    Search order:
+      1. Same directory as the running app  (ProteoPRM_Results_Viewer.exe when
+         frozen, ProteoPRM_Results_Viewer.py when running from source).
+      2. If frozen and not found in step 1: silent background scan of the
+         current drive, capped at 5 seconds so it never noticeably extends
+         the perceived run time.
+
+    Returns:
+        (path, kind) where kind is 'exe', 'script', or (None, None) if absent.
+    """
+    viewer_name_exe    = 'ProteoPRM_Results_Viewer.exe'
+    viewer_name_script = 'ProteoPRM_Results_Viewer.py'
+
+    if IS_FROZEN:
+        # 1. Same folder as ProteoPRM.exe
+        exe_dir = os.path.dirname(sys.executable)
+        candidate = os.path.join(exe_dir, viewer_name_exe)
+        if os.path.isfile(candidate):
+            return candidate, 'exe'
+
+        # 2. Silent capped drive scan (daemon thread, 5 s hard limit)
+        import time as _time
+        drive = os.path.splitdrive(sys.executable)[0] or 'C:'
+        _skip = {'Windows', 'windows', '$Recycle.Bin', '$RECYCLE.BIN',
+                 'System Volume Information', 'Recovery', 'ProgramData',
+                 'MSOCache', 'Config.Msi', 'PerfLogs',
+                 '__pycache__', '.git', 'node_modules'}
+        _result = [None]
+
+        def _scan():
+            try:
+                root_walk = drive + '\\'
+                for dirpath, dirnames, filenames in os.walk(root_walk):
+                    if viewer_name_exe in filenames:
+                        _result[0] = os.path.join(dirpath, viewer_name_exe)
+                        return
+                    # Prune directories we never need to descend into
+                    dirnames[:] = [d for d in dirnames if d not in _skip]
+            except Exception:
+                pass
+
+        _t = threading.Thread(target=_scan, daemon=True)
+        _t.start()
+        _t.join(timeout=5.0)
+        if _result[0]:
+            return _result[0], 'exe'
+
+    else:
+        # Running from source: look for .py sibling
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidate = os.path.join(script_dir, viewer_name_script)
+        if os.path.isfile(candidate):
+            return candidate, 'script'
+
+    return None, None
+
+
+def update_visualization_options():
+    """Launch the ProteoPRM Results Viewer after a successful run."""
+    output_path = output_file_entry.get()
+    if not output_path or not os.path.exists(output_path):
+        return
+    try:
+        viewer_path, viewer_kind = _find_viewer()
+        mzml_dir = mzml_folder_entry.get() if mzml_folder_entry.get() else ''
+
+        if viewer_path:
+            if viewer_kind == 'exe':
+                cmd = [viewer_path, output_path]
+            else:  # script (dev mode)
+                cmd = [sys.executable, viewer_path, output_path]
+            if mzml_dir:
+                cmd.append(mzml_dir)
+            subprocess.Popen(cmd)
+            logging.info(f'Launched ProteoPRM Results Viewer: {viewer_path}')
+        else:
+            logging.warning('ProteoPRM Results Viewer not found on this system.')
+            messagebox.showwarning(
+                'Results Viewer Not Found',
+                'The ProteoPRM Results Viewer application could not be found.\n\n'
+                'To visualize your results, please download '
+                'ProteoPRM_Results_Viewer.exe and place it in the same folder as '
+                'ProteoPRM.exe.\n\n'
+                'Your analysis results have been saved and can be opened later:\n'
+                + output_path
+            )
+    except Exception as e:
+        logging.error(f'Error launching Results Viewer: {e}')
+
+def plot_ms2_spectrum(peptide, mzml_file, mzml_folder, canvas_frame, theoretical_ions_cache):
+    """Display MS2 spectrum with color-coded fragment ions"""
+    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    # Clear the canvas
+    for widget in canvas_frame.winfo_children():
+        widget.destroy()
+
+    if not peptide or not mzml_file:
+        messagebox.showwarning("Input Error", "Please select both a peptide and a file.")
+        return
+    
+    # Parse peptide and modification from input (format: "PEPTIDE" or "PEPTIDE (modification)")
+    peptide_seq = peptide
+    modification_from_input = ""
+    if " (" in peptide and peptide.endswith(")"):
+        peptide_seq = peptide.split(" (")[0]
+        modification_from_input = peptide.split(" (")[1][:-1]  # Remove closing parenthesis
+    
+    # --- Check in-memory figure cache first (instant) ---
+    mem_cache_key = f"MS2_{peptide}_{mzml_file}"
+    cached_png = _get_cached_plot_figure(mem_cache_key)
+    if cached_png is not None:
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(cached_png))
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=100)
+            ax.imshow(img)
+            ax.axis('off')
+            fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            toolbar_frame = ttk.Frame(canvas_frame)
+            toolbar_frame.pack(fill=tk.X)
+            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+            toolbar.update()
+            return
+        except Exception:
+            pass  # Fall through to fresh render
+
+    logging.debug(f"Plotting MS2 spectrum for peptide {peptide} from file {mzml_file}")
+
+    try:
+        # Load EICs and PSM data from output folder
+        if not output_file_entry.get() or not os.path.isdir(output_file_entry.get()):
+            messagebox.showinfo("No Results Folder", "Please run analysis first.")
+            return
+
+        eic_df = _get_cached_excel_sheet(output_file_entry.get(), 'EICs')
+        peptide_eic = eic_df[(eic_df['peptide'] == peptide_seq) & (eic_df['modification'] == modification_from_input) & (eic_df['file'] == mzml_file)]
+
+        if peptide_eic.empty:
+            messagebox.showinfo("No Data", f"No EIC data found for peptide {peptide_seq} in file {mzml_file}.")
+            return
+
+        # Load PSM sheet and find the best scan for this peptide and file
+        psm_df = _get_cached_excel_sheet(output_file_entry.get(), 'PSM')
+        psm_peptide = psm_df[(psm_df['peptide'] == peptide_seq) & (psm_df['modification'] == modification_from_input) & (psm_df['file'] == mzml_file)]
+        if not psm_peptide.empty:
+            best_psm = psm_peptide.loc[psm_peptide['psm_score'].idxmax()]
+            scan_number = best_psm['scan_number']
+            precursor_mz_val = best_psm['m_z'] if 'm_z' in best_psm else float('nan')
+            precursor_charge_val = best_psm['charge'] if 'charge' in best_psm else ''
+        else:
+            scan_number = peptide_eic['scan_number'].iloc[0]
+            best_psm = None
+            precursor_mz_val = peptide_eic['m_z'].iloc[0] if 'm_z' in peptide_eic.columns else float('nan')
+            # Check for both 'precursor_charge' (from EIC records) and 'charge' columns
+            if 'precursor_charge' in peptide_eic.columns:
+                precursor_charge_val = peptide_eic['precursor_charge'].iloc[0]
+            elif 'charge' in peptide_eic.columns:
+                precursor_charge_val = peptide_eic['charge'].iloc[0]
+            else:
+                precursor_charge_val = ''
+
+        scan_eic = peptide_eic[peptide_eic['scan_number'] == scan_number]
+
+        # Get the corresponding spectrum from the data file (mzML or .raw)
+        mzml_path = os.path.join(mzml_folder, mzml_file)
+        spectrum = None
+        scan_str = str(scan_number).strip()
+
+        # For .raw files: use O(1) direct scan access via fisher_py (fast)
+        ext = os.path.splitext(mzml_path)[1].lower()
+        if ext == '.raw' and _check_fisher_available():
+            spectrum = read_single_scan_fisher(mzml_path, scan_str)
+
+        # For mzML files or if direct access failed: use indexed random access
+        if spectrum is None and ext != '.raw':
+            try:
+                from pyteomics import mzml as mzml_mod
+                with mzml_mod.MzML(mzml_path) as reader:
+                    spectrum = reader.get_by_id(scan_str)
+            except Exception:
+                pass  # Fall through to sequential scan
+
+        # Last resort: sequential iteration (slow but always works)
+        if spectrum is None:
+            with read_spectra(mzml_path) as reader:
+                for spec in reader:
+                    spec_id = spec.get('id', '')
+                    if spec_id == scan_str:
+                        spectrum = spec
+                        break
+                    m_spec = re.search(r'scan=(\d+)', str(spec_id))
+                    m_query = re.search(r'(\d+)', scan_str)
+                    if m_spec and m_query and m_spec.group(1) == m_query.group(1):
+                        spectrum = spec
+                        break
+
+        if spectrum is None:
+            messagebox.showwarning("No Data", f"Could not find MS2 spectrum for scan {scan_number}")
+            return
+
+        # Prepare the plot
+        fig = Figure(figsize=(10, 6), dpi=100)
+        ax = fig.add_subplot(111)
+
+        mz_array = spectrum.get('m/z array', np.array([]))
+        intensity_array = spectrum.get('intensity array', np.array([]))
+        if intensity_array.size > 0 and np.max(intensity_array) > 0:
+            normalized_intensities = intensity_array / np.max(intensity_array) * 100
+        else:
+            normalized_intensities = intensity_array
+
+        # Plot the full spectrum as grey stems
+        markerline, stemlines, baseline = ax.stem(
+            mz_array, normalized_intensities, linefmt='grey', markerfmt=' ', basefmt=' '
+        )
+        plt.setp(stemlines, alpha=0.5)
+
+        # Define ion type colors
+        ion_colors = {
+            'b': 'blue',
+            'y': 'red',
+            'a': 'purple',
+            'c': 'green',
+            'z': 'orange',
+            'x': 'brown',
+            'unknown': 'darkgrey'
+        }
+
+        # Create a more organized approach to track fragment ions by type and charge
+        ion_groups = {}
+        for row_dict in scan_eic.to_dict('records'):
+            ion_type = str(row_dict['ion_type']).strip() if pd.notna(row_dict['ion_type']) else 'unknown'
+            charge = int(row_dict['charge']) if pd.notna(row_dict['charge']) else 1
+            neutral_loss = row_dict['neutral_loss'] if pd.notna(row_dict['neutral_loss']) else None
+            theoretical_mz = float(row_dict['theoretical_mz']) if pd.notna(row_dict['theoretical_mz']) else 0.0
+            
+            # Extract the base ion type (before any numbers)
+            base_ion_type = ''.join([c for c in ion_type if not c.isdigit()])
+            
+            # Create a unique group key
+            group_key = (base_ion_type, charge, neutral_loss)
+            
+            if group_key not in ion_groups:
+                ion_groups[group_key] = []
+                
+            ion_groups[group_key].append((theoretical_mz, row_dict))
+
+        # Plot each ion group with its own color
+        legend_handles = {}  # Dictionary to track unique legend entries by (ion_type, neutral_loss)
+
+        for (ion_type, charge, neutral_loss), ions in ion_groups.items():
+            # Get the color for this ion type
+            color = ion_colors.get(ion_type.lower(), 'darkgrey')
+            
+            # Adjust style for neutral loss ions (dashed lines for neutral losses)
+            linestyle = '--' if neutral_loss else '-'
+            alpha = 0.7 if neutral_loss else 1.0
+            
+            # Create a unique legend key based ONLY on ion type and neutral loss (not charge)
+            legend_key = (ion_type, neutral_loss)
+            
+            # Only add to legend if we haven't seen this ion type + neutral loss combo yet
+            if legend_key not in legend_handles:
+                label = f"{ion_type}" + (f"-{neutral_loss}" if neutral_loss else "")
+                legend_handles[legend_key] = ax.plot([], [], color=color, label=label, 
+                                                     linestyle=linestyle, linewidth=2)[0]
+            
+            # Get the m/z and intensity values for this group
+            mzs = [ion[0] for ion in ions]
+            intensities = []
+            
+            for mz in mzs:
+                idx = np.abs(mz_array - mz).argmin()
+                intensities.append(normalized_intensities[idx] if idx < len(normalized_intensities) else 0)
+            
+            # Plot stems for this ion group
+            markerline, stemlines, baseline = ax.stem(
+                mzs, intensities, markerfmt='o', linefmt='-', basefmt=' '
+            )
+            
+            # Set marker properties
+            markerline.set_color(color)
+            markerline.set_alpha(alpha)
+            markerline.set_markersize(6)
+            
+            # Set stem properties
+            if isinstance(stemlines, list):
+                for stem in stemlines:
+                    stem.set_color(color)
+                    stem.set_alpha(alpha)
+                    stem.set_linestyle(linestyle)
+            else:
+                stemlines.set_color(color)
+                stemlines.set_alpha(alpha)
+                try:
+                    stemlines.set_linestyle(linestyle)
+                except Exception:
+                    pass
+            
+            # Annotate peaks
+            for mz, intensity, (_, row) in zip(mzs, intensities, ions):
+                if intensity > 5:  # Only annotate significant peaks
+                    ion_number = ''
+                    if 'ion_type' in row and pd.notna(row['ion_type']):
+                        # Extract the number from ion_type (e.g., 'b5' -> '5')
+                        ion_number = ''.join([c for c in str(row['ion_type']) if c.isdigit()])
+                    
+                    # Create charge superscript
+                    superscripts = {1: '⁺', 2: '²⁺', 3: '³⁺'}
+                    charge_sup = superscripts.get(charge, f"^{charge}+")
+                    
+                    # Create the full ion label
+                    ion_label = f"{ion_type}{ion_number}{charge_sup}"
+                    if neutral_loss:
+                        ion_label += f"-{neutral_loss}"
+                        ax.text(mz, intensity+2, ion_label, fontsize=8, ha='center', rotation=90, color=color)
+                    else:
+                        ax.text(mz, intensity+2, ion_label, fontsize=8, ha='center', color=color)
+
+        # Add scan information overlay
+        scan_info = (
+            f"Scan: {scan_number}\n"
+            f"RT: {scan_eic['rt'].iloc[0]:.2f} min\n"
+            f"Precursor m/z: {precursor_mz_val:.4f}\n"
+            f"Charge: {precursor_charge_val}+\n"
+            f"Matched fragments: {len(scan_eic)}"
+        )
+
+        ax.text(0.02, 0.98, scan_info, transform=ax.transAxes, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=9)
+
+        # Add legend with only unique items (one per ion type, no charge repetition)
+        if legend_handles:
+            # Sort legend entries: base ions first (solid), then neutral losses (dashed)
+            sorted_handles = sorted(legend_handles.items(), 
+                                   key=lambda x: (x[0][1] is not None, x[0][0]))  # Sort by has_neutral_loss, then ion_type
+            ax.legend(handles=[h[1] for h in sorted_handles], loc='upper right', fontsize='small')
+            
+        ax.set_xlabel('m/z')
+        ax.set_ylabel('Relative Intensity (%)')
+        ax.set_title(f"MS2 Spectrum for {peptide} (scan {scan_number})")
+        ax.set_ylim(bottom=0)
+
+        canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        toolbar_frame = ttk.Frame(canvas_frame)
+        toolbar_frame.pack(fill=tk.X)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+        
+        # Cache the rendered figure for instant future access
+        try:
+            _cache_plot_figure(mem_cache_key, fig)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logging.error(f"Error plotting MS2 spectrum: {str(e)}")
+        traceback.print_exc()
+        messagebox.showerror("Error", f"Failed to plot MS2 spectrum: {str(e)}")
+
+def identify_fragment_ion(observed_mz, theoretical_ions, tolerance_ppm=20):
+    """Identifies fragment ion type from observed m/z, including neutral losses"""
+    best_match_type = 'unknown'
+    best_match_number = 0
+    best_match_diff = float('inf')
+    best_match_nl = None  # Track if the best match is a neutral loss
+    
+    for ion_type, charges in theoretical_ions.items():
+        for charge, mz_values in charges.items():
+            for i, theoretical_mz in enumerate(mz_values):
+                mass_diff_ppm = abs(observed_mz - theoretical_mz) / theoretical_mz * 1e6
+                
+                if mass_diff_ppm <= tolerance_ppm and mass_diff_ppm < best_match_diff:
+                    best_match_diff = mass_diff_ppm
+                    
+                    # Check if this is a neutral loss ion
+                    if '-' in ion_type:
+                        base_ion, nl_type = ion_type.split('-', 1)
+                        best_match_type = base_ion
+                        best_match_nl = nl_type
+                    else:
+                        best_match_type = ion_type
+                        best_match_nl = None
+                        
+                    best_match_number = i + 1
+    
+    return best_match_type, best_match_number, best_match_nl
+
+def save_settings():
+    file_path = filedialog.asksaveasfilename(
+        defaultextension=".json",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        title="Save Settings"
+    )
+    if not file_path:
+        return
+        
+    settings = {
+        "prm_input_file": prm_input_entry.get(),
+        "mzml_folder": mzml_folder_entry.get(),
+        "output_file": output_file_entry.get(),
+        "fasta_file": fasta_file_entry.get(),
+        "thread_capacity": thread_capacity_var.get(),
+        "show_logs": show_logs_var.get(),
+        "precursor_tolerance": precursor_tolerance_entry.get(),
+        "precursor_unit": precursor_unit_var.get(),
+        "fragment_tolerance": fragment_tolerance_entry.get(),
+        "fragment_unit": fragment_unit_var.get(),
+        "fragmentation_type": fragmentation_var.get(),
+        "fdr_threshold": fdr_threshold_var.get(),
+        "quant_method": quant_method_var.get(),
+        "generate_eics": generate_eics_var.get(),
+        "generate_ms2": generate_ms2_var.get() if 'generate_ms2_var' in globals() else False,
+        # Add new parallel execution settings
+        "file_conversion_concurrency": file_conversion_concurrency.get(),
+        "cleanup_mzml": cleanup_mzml_var.get(),
+        # Add filter settings
+        "rt_width": rt_width_var.get(),
+        "fragment_mz_lower": fragment_mz_lower_entry.get(),
+        "fragment_mz_upper": fragment_mz_upper_entry.get(),
+        # Add quantification options
+        "fragment_usage": fragment_usage_var.get(),
+        "flag_ambiguous": flag_ambiguous_var.get(),
+        # Prediction engine options (for probabilistic deconvolution)
+        "pred_engine": pred_engine_var.get(),
+        "apd_instrument": apd_instrument_var.get(),
+        "apd_nce": apd_nce_var.get(),
+        "apd_calibrate": apd_calibrate_var.get(),
+        "apd_mgf_path": apd_mgf_var.get(),
+        "apd_psm_path": apd_psm_var.get(),
+        "apd_cal_nce": apd_cal_nce_var.get(),
+        "apd_model_selection": apd_model_var.get(),
+        # Add neutral loss selections
+        "neutral_loss_H2O": main_nl_vars["H2O"].get(),
+        "neutral_loss_NH3": main_nl_vars["NH3"].get(),
+        "neutral_loss_select_all": main_nl_vars["SelectAll"].get(),
+        "neutral_loss_others_toggle": main_nl_vars["Others"].get(),
+        "neutral_loss_others": {key: var.get() for key, var in other_nl_vars.items()},
+        # Add RT drift correction selections
+        "rt_drift_enabled": rt_drift_enabled_var.get(),
+        "rt_drift_reference_peptides": rt_ref_peptides_var.get(),
+        "rt_drift_model": rt_drift_model_var.get(),
+        # Add mass accuracy drift correction selections
+        "mass_drift_enabled": mass_drift_enabled_var.get(),
+        "mass_drift_reference_peptides": rt_ref_peptides_var.get(),
+        "mass_drift_model": rt_drift_model_var.get(),
+        # Add minimum intensity threshold
+        "min_intensity_threshold": min_intensity_var.get(),
+        # Preferences dialog settings
+        "include_psm_sheet": include_psm_sheet_var.get(),
+        "include_eic_sheet": include_eic_sheet_var.get(),
+        "include_qc_metrics_sheet": include_qc_metrics_var.get(),
+        "auto_scroll_logs": auto_scroll_logs_var.get(),
+        "confirm_overwrite": confirm_overwrite_var.get(),
+        "remember_dirs": remember_dirs_var.get(),
+        "gpu_enabled": gpu_enabled_var.get()
+    }
+    
+    try:
+        with open(file_path, 'w') as f:
+            json.dump(settings, f, indent=4)
+        messagebox.showinfo("Success", f"Configuration saved to {file_path}")
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to save configuration: {str(e)}")
+
+def load_settings():
+    global prm_file_valid
+    
+    file_path = filedialog.askopenfilename(
+        defaultextension=".json",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        title="Load Settings"
+    )
+    if not file_path:
+        return
+    
+    # Initialize logging handlers if not already
+    global buffer_handler, widget_handler
+    if buffer_handler is None or widget_handler is None:
+        buffer_handler, widget_handler = initialize_logging(log_widget)
+
+    try:
+        with open(file_path, 'r') as f:
+            settings = json.load(f)
+            
+        if "prm_input_file" in settings and os.path.exists(settings["prm_input_file"]):
+            # Skip full re-validation on config load — the file was validated
+            # when originally selected.  Mark as valid and restore the path.
+            prm_file_valid = True
+            prm_input_entry.config(state='normal')
+            prm_input_entry.delete(0, tk.END)
+            prm_input_entry.insert(0, settings["prm_input_file"])
+            prm_input_entry.config(state='readonly')
+            
+        if "mzml_folder" in settings and os.path.exists(settings["mzml_folder"]):
+            mzml_folder_entry.config(state='normal')
+            mzml_folder_entry.delete(0, tk.END)
+            mzml_folder_entry.insert(0, settings["mzml_folder"])
+            mzml_folder_entry.config(state='readonly')
+            
+        if "output_file" in settings:
+            output_file_entry.config(state='normal')
+            output_file_entry.delete(0, tk.END)
+            output_file_entry.insert(0, settings["output_file"])
+            output_file_entry.config(state='readonly')
+            
+        if "fasta_file" in settings and os.path.exists(settings["fasta_file"]):
+            fasta_file_entry.config(state='normal')
+            fasta_file_entry.delete(0, tk.END)
+            fasta_file_entry.insert(0, settings["fasta_file"])
+            fasta_file_entry.config(state='readonly')
+            
+        if "thread_capacity" in settings:
+            thread_capacity_var.set(settings["thread_capacity"])
+            thread_capacity_var_menu.set(settings["thread_capacity"])
+            
+        if "show_logs" in settings:
+            show_logs_var.set(settings["show_logs"])
+            toggle_logs(log_widget, settings["show_logs"], buffer_handler, widget_handler)
+            
+        if "precursor_tolerance" in settings:
+            precursor_tolerance_entry.delete(0, tk.END)
+            precursor_tolerance_entry.insert(0, settings["precursor_tolerance"])
+            
+        if "precursor_unit" in settings:
+            precursor_unit_var.set(settings["precursor_unit"])
+            
+        if "fragment_tolerance" in settings:
+            fragment_tolerance_entry.delete(0, tk.END)
+            fragment_tolerance_entry.insert(0, settings["fragment_tolerance"])
+            
+        if "fragment_unit" in settings:
+            fragment_unit_var.set(settings["fragment_unit"])
+            
+        if "fragmentation_type" in settings:
+            fragmentation_var.set(settings["fragmentation_type"])
+            
+        if "fdr_threshold" in settings:
+            fdr_threshold_var.set(settings["fdr_threshold"])
+            
+        if "quant_method" in settings:
+            quant_method_var.set(settings["quant_method"])
+            
+        if "generate_eics" in settings:
+            generate_eics_var.set(settings["generate_eics"])
+            
+        if "generate_ms2" in settings and 'generate_ms2_var' in globals():
+            generate_ms2_var.set(settings["generate_ms2"])
+            
+        # Load the new file conversion concurrency setting
+        if "file_conversion_concurrency" in settings:
+            file_conversion_concurrency.set(settings["file_conversion_concurrency"])
+        
+        if "cleanup_mzml" in settings:
+            cleanup_mzml_var.set(settings["cleanup_mzml"])
+        
+        # Load filter settings
+        if "rt_width" in settings:
+            rt_width_var.set(settings["rt_width"])
+            
+        if "fragment_mz_lower" in settings:
+            fragment_mz_lower_entry.delete(0, tk.END)
+            fragment_mz_lower_entry.insert(0, settings["fragment_mz_lower"])
+            
+        if "fragment_mz_upper" in settings:
+            fragment_mz_upper_entry.delete(0, tk.END)
+            fragment_mz_upper_entry.insert(0, settings["fragment_mz_upper"])
+        
+        # Load quantification options
+        if "fragment_usage" in settings:
+            fragment_usage_var.set(settings["fragment_usage"])
+            
+        if "flag_ambiguous" in settings:
+            flag_ambiguous_var.set(settings["flag_ambiguous"])
+        
+        # Load prediction engine options
+        if "pred_engine" in settings:
+            pred_engine_var.set(settings["pred_engine"])
+        if "apd_instrument" in settings:
+            apd_instrument_var.set(settings["apd_instrument"])
+        if "apd_nce" in settings:
+            apd_nce_var.set(settings["apd_nce"])
+        if "apd_calibrate" in settings:
+            apd_calibrate_var.set(settings["apd_calibrate"])
+        if "apd_mgf_path" in settings:
+            apd_mgf_var.set(settings["apd_mgf_path"])
+        if "apd_cal_nce" in settings:
+            apd_cal_nce_var.set(settings["apd_cal_nce"])
+        if "apd_model_selection" in settings:
+            _refresh_apd_model_combo()
+            apd_model_var.set(settings["apd_model_selection"])
+        # Refresh prediction engine UI state
+        try:
+            _toggle_pred_engine_frame()
+        except Exception:
+            pass
+        
+        # Load neutral loss selections
+        if "neutral_loss_H2O" in settings:
+            main_nl_vars["H2O"].set(settings["neutral_loss_H2O"])
+            
+        if "neutral_loss_NH3" in settings:
+            main_nl_vars["NH3"].set(settings["neutral_loss_NH3"])
+
+        if "neutral_loss_select_all" in settings:
+            main_nl_vars["SelectAll"].set(settings["neutral_loss_select_all"])
+
+        if "neutral_loss_others_toggle" in settings:
+            main_nl_vars["Others"].set(settings["neutral_loss_others_toggle"])
+            
+        if "neutral_loss_others" in settings:
+            for key, value in settings["neutral_loss_others"].items():
+                if key in other_nl_vars:
+                    other_nl_vars[key].set(value)
+            # Update "Others" checkbox based on loaded values
+            main_nl_vars["Others"].set(any(var.get() for var in other_nl_vars.values()))
+            # Update "Select all" checkbox based on loaded values
+            if all(var.get() for var in other_nl_vars.values()) and main_nl_vars["H2O"].get() and main_nl_vars["NH3"].get():
+                main_nl_vars["SelectAll"].set(True)
+            else:
+                main_nl_vars["SelectAll"].set(False)
+
+        # Load RT drift correction selections
+        if "rt_drift_enabled" in settings:
+            rt_drift_enabled_var.set(settings["rt_drift_enabled"])
+
+        if "rt_drift_reference_peptides" in settings:
+            rt_ref_peptides_var.set(settings["rt_drift_reference_peptides"])
+
+        if "rt_drift_model" in settings:
+            rt_drift_model_var.set(settings["rt_drift_model"])
+
+        # Ensure dependent drift widgets reflect loaded enabled state
+        try:
+            _toggle_drift_widgets()
+        except Exception:
+            pass
+        
+        # Load minimum intensity threshold
+        if "min_intensity_threshold" in settings:
+            min_intensity_var.set(settings["min_intensity_threshold"])
+
+        # Load preferences dialog settings
+        if "include_psm_sheet" in settings:
+            include_psm_sheet_var.set(settings["include_psm_sheet"])
+        if "include_eic_sheet" in settings:
+            include_eic_sheet_var.set(settings["include_eic_sheet"])
+        if "include_qc_metrics_sheet" in settings:
+            include_qc_metrics_var.set(settings["include_qc_metrics_sheet"])
+        if "auto_scroll_logs" in settings:
+            auto_scroll_logs_var.set(settings["auto_scroll_logs"])
+        if "confirm_overwrite" in settings:
+            confirm_overwrite_var.set(settings["confirm_overwrite"])
+        if "remember_dirs" in settings:
+            remember_dirs_var.set(settings["remember_dirs"])
+        if "gpu_enabled" in settings:
+            gpu_enabled_var.set(settings["gpu_enabled"])
+            # Defer GPU detection to first actual use — skip slow
+            # nvidia-smi / wmic / dxdiag subprocess chain during load
+            if _gpu_info is not None:
+                set_gpu_enabled(settings["gpu_enabled"])
+
+        # Load paired PSM file path if present
+        if "apd_psm_path" in settings:
+            apd_psm_var.set(settings["apd_psm_path"])
+
+        # Load mass drift correction settings
+        if "mass_drift_enabled" in settings:
+            mass_drift_enabled_var.set(settings["mass_drift_enabled"])
+        if "rt_drift_reference_peptides" in settings:
+            rt_ref_peptides_var.set(settings["rt_drift_reference_peptides"])
+        elif "mass_drift_reference_peptides" in settings:
+            rt_ref_peptides_var.set(settings["mass_drift_reference_peptides"])
+        if "rt_drift_model" in settings:
+            rt_drift_model_var.set(settings["rt_drift_model"])
+        elif "mass_drift_model" in settings:
+            rt_drift_model_var.set(settings["mass_drift_model"])
+        try:
+            _toggle_drift_widgets()
+        except Exception:
+            pass
+
+        messagebox.showinfo("Success", f"Configuration successfully loaded from {file_path}")
+        # Refresh parameter tabs
+        try:
+            notebook.select(notebook.tabs()[0])
+        except Exception:
+            pass
+            
+        # Restore log widget visibility according to show_logs setting
+        toggle_logs(log_widget, show_logs_var.get(), buffer_handler, widget_handler)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to load configuration: {str(e)}")
+
+def test_msconvert_availability():
+    """Test if MSConvert is available (auto-detects from install paths, registry, PATH, and full drive scan)"""
+    msconvert_path = find_msconvert(force_refresh=True)
+    
+    if msconvert_path:
+        # Get version info
+        version = get_msconvert_version(msconvert_path)
+        version_str = f"\nVersion: {version}" if version else ""
+        
+        messagebox.showinfo(
+            "MSConvert Found",
+            f"✅ MSConvert detected!\n\n"
+            f"Location: {msconvert_path}{version_str}\n\n"
+            f"Vendor raw files (.raw, .wiff, .d) will be automatically converted to mzML."
+        )
+    else:
+        # Offer deep scan or download
+        choice = messagebox.askyesnocancel(
+            "MSConvert Not Found",
+            "❌ MSConvert was not found via quick search.\n\n"
+            "Searched:\n"
+            "  • System PATH\n"
+            "  • Program Files (ProteoWizard folders)\n"
+            "  • Windows Registry\n"
+            "  • Application directory\n\n"
+            "Would you like to run a deep scan of all drives?\n"
+            "(This searches every folder and may take 1–2 minutes)\n\n"
+            "Yes = Deep scan all drives\n"
+            "No  = Open ProteoWizard download page\n"
+            "Cancel = Do nothing"
+        )
+        
+        if choice is True:
+            # Deep scan with progress dialog
+            _run_deep_scan_with_progress()
+        elif choice is False:
+            download_and_install_proteowizard()
+
+
+def _run_deep_scan_with_progress():
+    """Run a deep scan for msconvert.exe with a progress dialog."""
+    scan_window = tk.Toplevel(root)
+    scan_window.title("Scanning for MSConvert...")
+    scan_window.geometry("500x150")
+    scan_window.resizable(False, False)
+    scan_window.transient(root)
+    scan_window.grab_set()
+    
+    ttk.Label(scan_window, text="Searching all drives for msconvert.exe...",
+              font=('Segoe UI', 10, 'bold')).pack(pady=(15, 5))
+    
+    status_var = tk.StringVar(value="Starting scan...")
+    status_label = ttk.Label(scan_window, textvariable=status_var, wraplength=460)
+    status_label.pack(pady=5, padx=20)
+    
+    progress = ttk.Progressbar(scan_window, mode='indeterminate', length=400)
+    progress.pack(pady=5)
+    progress.start(15)
+    
+    scan_cancelled = [False]
+    scan_result = [None]
+    
+    def cancel_scan():
+        scan_cancelled[0] = True
+    
+    cancel_btn = ttk.Button(scan_window, text="Cancel", command=cancel_scan)
+    cancel_btn.pack(pady=5)
+    
+    def do_scan():
+        update_counter = [0]
+        
+        def progress_callback(current_dir):
+            update_counter[0] += 1
+            # Update UI every 50 directories to avoid flooding
+            if update_counter[0] % 50 == 0:
+                # Truncate long paths for display
+                display_path = current_dir
+                if len(display_path) > 60:
+                    display_path = current_dir[:20] + "..." + current_dir[-37:]
+                try:
+                    status_var.set(f"Scanning: {display_path}")
+                except Exception:
+                    pass
+            return not scan_cancelled[0]  # Return False to abort
+        
+        result = deep_scan_for_msconvert(callback=progress_callback)
+        scan_result[0] = result
+    
+    def run_scan_thread():
+        scan_thread = threading.Thread(target=do_scan, daemon=True)
+        scan_thread.start()
+        
+        def check_done():
+            if scan_thread.is_alive():
+                scan_window.after(200, check_done)
+            else:
+                progress.stop()
+                scan_window.destroy()
+                
+                if scan_result[0]:
+                    version = get_msconvert_version(scan_result[0])
+                    version_str = f"\nVersion: {version}" if version else ""
+                    messagebox.showinfo(
+                        "MSConvert Found!",
+                        f"✅ Deep scan found MSConvert!\n\n"
+                        f"Location: {scan_result[0]}{version_str}\n\n"
+                        f"This path has been saved. Vendor raw files will be "
+                        f"automatically converted to mzML."
+                    )
+                elif scan_cancelled[0]:
+                    messagebox.showinfo("Scan Cancelled", "Deep scan was cancelled.")
+                else:
+                    if messagebox.askyesno(
+                        "Not Found",
+                        "❌ MSConvert was not found on any drive.\n\n"
+                        "Would you like to open the ProteoWizard download page?"
+                    ):
+                        download_and_install_proteowizard()
+        
+        check_done()
+    
+    run_scan_thread()
+
+menu_bar = Menu(root)
+file_menu = Menu(menu_bar, tearoff=0)
+file_menu.add_command(label="Save configuration", command=save_settings)
+file_menu.add_command(label="Load configuration", command=load_settings)
+file_menu.add_separator()
+file_menu.add_command(label="Exit", command=root.quit)
+menu_bar.add_cascade(label="File", menu=file_menu)
+
+# ============================================================================
+# PREFERENCE VARIABLES  (referenced by Preferences dialog, save/load, analysis)
+# ============================================================================
+file_conversion_concurrency = tk.IntVar(value=4)
+cleanup_mzml_var = tk.BooleanVar(value=False)
+thread_capacity_var_menu = thread_capacity_var          # alias used by the dialog
+gpu_enabled_var = tk.BooleanVar(value=GPU_ENABLED)
+include_psm_sheet_var = tk.BooleanVar(value=True)
+include_eic_sheet_var = tk.BooleanVar(value=True)
+include_qc_metrics_var = tk.BooleanVar(value=False)
+auto_scroll_logs_var = tk.BooleanVar(value=True)
+confirm_overwrite_var = tk.BooleanVar(value=True)
+remember_dirs_var = tk.BooleanVar(value=True)
+
+def toggle_gpu_acceleration():
+    set_gpu_enabled(gpu_enabled_var.get())
+
+# ============================================================================
+# PREFERENCES DIALOG
+# ============================================================================
+def open_preferences_dialog():
+    """Open a tabbed Preferences dialog with all application settings."""
+    pref_win = tk.Toplevel(root)
+    pref_win.title("Preferences")
+    pref_win.geometry("560x480")
+    pref_win.resizable(False, False)
+
+    nb = ttk.Notebook(pref_win)
+    nb.pack(fill='both', expand=True, padx=10, pady=(10, 0))
+
+    # ---- General tab -------------------------------------------------------
+    gen_frame = ttk.Frame(nb, padding=15)
+    nb.add(gen_frame, text="General")
+
+    ttk.Label(gen_frame, text="General", font=('Segoe UI', 11, 'bold')).grid(
+        row=0, column=0, columnspan=2, sticky='w', pady=(0, 8))
+    ttk.Checkbutton(gen_frame, text="Auto-scroll log output during analysis",
+                    variable=auto_scroll_logs_var).grid(row=1, column=0, columnspan=2, sticky='w', pady=3)
+    ttk.Checkbutton(gen_frame, text="Confirm before overwriting output file",
+                    variable=confirm_overwrite_var).grid(row=2, column=0, columnspan=2, sticky='w', pady=3)
+    ttk.Checkbutton(gen_frame, text="Remember last-used directories",
+                    variable=remember_dirs_var).grid(row=3, column=0, columnspan=2, sticky='w', pady=3)
+    ttk.Checkbutton(gen_frame, text="Show logs panel on startup",
+                    variable=show_logs_var).grid(row=4, column=0, columnspan=2, sticky='w', pady=3)
+
+    # ---- Output tab ---------------------------------------------------------
+    out_frame = ttk.Frame(nb, padding=15)
+    nb.add(out_frame, text="Output")
+
+    ttk.Label(out_frame, text="Results Workbook Sheets",
+              font=('Segoe UI', 11, 'bold')).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 8))
+    ttk.Checkbutton(out_frame, text="Include PSM sheet in results workbook",
+                    variable=include_psm_sheet_var).grid(row=1, column=0, columnspan=2, sticky='w', pady=3)
+    ttk.Checkbutton(out_frame, text="Include EIC sheet in results workbook",
+                    variable=include_eic_sheet_var).grid(row=2, column=0, columnspan=2, sticky='w', pady=3)
+    ttk.Checkbutton(out_frame, text="Include QC metrics sheet in results workbook",
+                    variable=include_qc_metrics_var).grid(row=3, column=0, columnspan=2, sticky='w', pady=3)
+
+    ttk.Separator(out_frame, orient='horizontal').grid(row=4, column=0, columnspan=2, sticky='ew', pady=10)
+
+    ttk.Label(out_frame, text="Post-Processing",
+              font=('Segoe UI', 11, 'bold')).grid(row=5, column=0, columnspan=2, sticky='w', pady=(0, 8))
+    ttk.Checkbutton(out_frame, text="Clean up converted mzML files after run",
+                    variable=cleanup_mzml_var).grid(row=6, column=0, columnspan=2, sticky='w', pady=3)
+
+    # ---- Performance tab ----------------------------------------------------
+    perf_frame = ttk.Frame(nb, padding=15)
+    nb.add(perf_frame, text="Performance")
+
+    ttk.Label(perf_frame, text="File Conversion Concurrency",
+              font=('Segoe UI', 11, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 6))
+    conv_values = [1, 2, 4, 6, 8, 12]
+    for idx, val in enumerate(conv_values):
+        lbl = f"{val} file{'s' if val > 1 else ''}"
+        ttk.Radiobutton(perf_frame, text=lbl, variable=file_conversion_concurrency,
+                        value=val).grid(row=1, column=idx % 3, sticky='w', padx=8, pady=2)
+        if idx >= 3:
+            # second row
+            ttk.Radiobutton(perf_frame, text=lbl, variable=file_conversion_concurrency,
+                            value=val).grid(row=2, column=idx % 3, sticky='w', padx=8, pady=2)
+    # Manual grid placement for clarity
+    for w in perf_frame.grid_slaves():
+        w.grid_forget()
+    ttk.Label(perf_frame, text="File Conversion Concurrency",
+              font=('Segoe UI', 11, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 6))
+    for idx, val in enumerate(conv_values):
+        lbl = f"{val} file{'s' if val > 1 else ''}"
+        r = 1 + idx // 3
+        c = idx % 3
+        ttk.Radiobutton(perf_frame, text=lbl, variable=file_conversion_concurrency,
+                        value=val).grid(row=r, column=c, sticky='w', padx=8, pady=2)
+
+    ttk.Separator(perf_frame, orient='horizontal').grid(row=3, column=0, columnspan=3, sticky='ew', pady=10)
+
+    ttk.Label(perf_frame, text="Core Processing Capacity",
+              font=('Segoe UI', 11, 'bold')).grid(row=4, column=0, columnspan=3, sticky='w', pady=(0, 6))
+    ttk.Radiobutton(perf_frame, text="Standard  (4 concurrent files)",
+                    variable=thread_capacity_var_menu, value="Light").grid(
+                        row=5, column=0, columnspan=3, sticky='w', padx=8, pady=2)
+    ttk.Radiobutton(perf_frame, text="Performance  (8 concurrent files)",
+                    variable=thread_capacity_var_menu, value="Normal").grid(
+                        row=6, column=0, columnspan=3, sticky='w', padx=8, pady=2)
+    ttk.Radiobutton(perf_frame, text="Maximum  (12 concurrent files)",
+                    variable=thread_capacity_var_menu, value="Medium").grid(
+                        row=7, column=0, columnspan=3, sticky='w', padx=8, pady=2)
+
+    # ---- GPU Acceleration tab -----------------------------------------------
+    _ensure_gpu_detected()   # lazy GPU detection — first time user opens prefs
+    gpu_frame = ttk.Frame(nb, padding=15)
+    nb.add(gpu_frame, text="GPU Acceleration")
+
+    ttk.Checkbutton(gpu_frame, text="Enable GPU Acceleration",
+                    variable=gpu_enabled_var,
+                    command=toggle_gpu_acceleration).grid(
+                        row=0, column=0, columnspan=2, sticky='w', pady=(0, 8))
+
+    ttk.Separator(gpu_frame, orient='horizontal').grid(row=1, column=0, columnspan=2, sticky='ew', pady=4)
+
+    info_row = 2
+    gpu_info_text = f"Detected: {GPU_DEVICE_NAME}" if GPU_AVAILABLE else "No NVIDIA GPU detected"
+    ttk.Label(gpu_frame, text=gpu_info_text,
+              font=('Segoe UI', 10)).grid(row=info_row, column=0, columnspan=2, sticky='w', pady=2)
+    info_row += 1
+
+    if GPU_AVAILABLE:
+        ttk.Label(gpu_frame, text=f"Memory: {GPU_MEMORY_GB:.1f} GB").grid(
+            row=info_row, column=0, columnspan=2, sticky='w', padx=15, pady=1)
+        info_row += 1
+        ttk.Label(gpu_frame, text=f"Driver: {GPU_DRIVER_VERSION}   CUDA: {GPU_CUDA_VERSION}").grid(
+            row=info_row, column=0, columnspan=2, sticky='w', padx=15, pady=1)
+        info_row += 1
+
+        accel_parts = []
+        if CUPY_AVAILABLE:
+            accel_parts.append("CuPy")
+        if CUML_AVAILABLE:
+            accel_parts.append("cuML")
+        accel_str = ", ".join(accel_parts) if accel_parts else "None installed"
+        ttk.Label(gpu_frame, text=f"Accelerators: {accel_str}").grid(
+            row=info_row, column=0, columnspan=2, sticky='w', padx=15, pady=1)
+        info_row += 1
+
+    ttk.Separator(gpu_frame, orient='horizontal').grid(row=info_row, column=0, columnspan=2, sticky='ew', pady=8)
+    info_row += 1
+
+    btn_row_frame = ttk.Frame(gpu_frame)
+    btn_row_frame.grid(row=info_row, column=0, columnspan=2, sticky='w')
+
+    if GPU_AVAILABLE and not CUPY_AVAILABLE:
+        def _quick_install():
+            ans = messagebox.askyesno("Install CuPy",
+                f"Install CuPy for GPU acceleration?\n\n"
+                f"GPU: {GPU_DEVICE_NAME}\nCUDA: {GPU_CUDA_VERSION}\n"
+                f"Package: {get_cupy_package_name(GPU_CUDA_VERSION)}\n\n"
+                f"This may take a few minutes.")
+            if not ans:
+                return
+            prog = tk.Toplevel(pref_win)
+            prog.title("Installing...")
+            prog.geometry("350x100")
+            prog.transient(pref_win)
+            ttk.Label(prog, text="Installing CuPy, please wait...",
+                      font=('Segoe UI', 10)).pack(pady=20)
+            pb = ttk.Progressbar(prog, mode='indeterminate', length=250)
+            pb.pack(pady=10); pb.start(10)
+            root.update()
+            def _do():
+                success, msg = auto_install_cupy_if_needed(GPU_CUDA_VERSION, force=True)
+                def _show():
+                    prog.destroy()
+                    if success:
+                        messagebox.showinfo("Success",
+                            "CuPy installed!\nRestart the application to enable GPU acceleration.")
+                    else:
+                        messagebox.showerror("Failed", f"Installation failed:\n{msg}")
+                root.after(0, _show)
+            threading.Thread(target=_do, daemon=True).start()
+        ttk.Button(btn_row_frame, text="Install CuPy Now...", command=_quick_install).pack(side='left', padx=5)
+
+    ttk.Button(btn_row_frame, text="GPU Diagnostics...", command=show_gpu_diagnostics).pack(side='left', padx=5)
+
+    # ---- Dialog buttons -----------------------------------------------------
+    btn_frame = ttk.Frame(pref_win)
+    btn_frame.pack(fill='x', padx=10, pady=10)
+    ttk.Button(btn_frame, text="Close", command=pref_win.destroy).pack(side='right', padx=5)
+
+# ============================================================================
+# GPU DIAGNOSTICS DIALOG  (moved here so it can be called from Preferences)
+# ============================================================================
+def show_gpu_diagnostics():
+    """Show detailed GPU diagnostics in a popup window."""
+    _ensure_gpu_detected()
+    diag_window = tk.Toplevel(root)
+    diag_window.title("GPU Diagnostics")
+    diag_window.geometry("600x500")
+    diag_window.resizable(True, True)
+
+    main_frame = ttk.Frame(diag_window)
+    main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+    diag_text = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, font=('Consolas', 10))
+    diag_text.pack(fill='both', expand=True)
+
+    diag_content = get_gpu_detailed_info()
+    diag_content += "\n\n" + "=" * 50 + "\nINSTALLATION GUIDE\n" + "=" * 50
+
+    if GPU_AVAILABLE and GPU_CUDA_VERSION:
+        cuda_major = GPU_CUDA_VERSION.split('.')[0] if GPU_CUDA_VERSION else "?"
+        diag_content += f"""
+
+Your system has CUDA {GPU_CUDA_VERSION} support.
+
+To install GPU acceleration libraries:
+
+1. CuPy (Required for GPU array operations):
+   pip install cupy-cuda{cuda_major}x
+
+2. cuML (Optional - for GPU machine learning):
+
+   OPTION A - Conda (Recommended):
+   conda create -n rapids-env python=3.11
+   conda activate rapids-env
+   conda install -c rapidsai -c conda-forge -c nvidia cuml cuda-version={cuda_major}
+
+   OPTION B - pip (CUDA 12):
+   pip install --extra-index-url https://pypi.nvidia.com cuml-cu12
+
+   OPTION C - pip (CUDA 11):
+   pip install --extra-index-url https://pypi.nvidia.com cuml-cu11
+
+3. Verify installation:
+   python -c "import cupy; print(cupy.cuda.runtime.getDeviceCount())"
+   python -c "import cuml; print('cuML ready')"
+"""
+    else:
+        diag_content += """
+
+No NVIDIA GPU detected.
+
+To use GPU acceleration, you need:
+1. An NVIDIA GPU (GTX 1000 series or newer recommended)
+2. NVIDIA drivers installed
+3. Verify with: nvidia-smi (in command prompt)
+
+Once drivers are installed, restart the application
+and install CuPy matching your CUDA version.
+"""
+
+    diag_content += f"""
+\n{"=" * 50}
+SYSTEM INFORMATION
+{"=" * 50}
+Python Version: {sys.version.split()[0]}
+Platform: {sys.platform}
+"""
+
+    diag_text.insert('1.0', diag_content)
+    diag_text.config(state='disabled')
+
+    btn_frame = ttk.Frame(diag_window)
+    btn_frame.pack(fill='x', padx=10, pady=5)
+
+    def copy_to_clipboard():
+        root.clipboard_clear()
+        root.clipboard_append(diag_content)
+        messagebox.showinfo("Copied", "Diagnostics copied to clipboard")
+
+    def refresh_detection():
+        diag_window.destroy()
+        detect_gpu()
+        show_gpu_diagnostics()
+
+    def install_cupy_now():
+        if not GPU_AVAILABLE:
+            messagebox.showwarning("No GPU", "No NVIDIA GPU detected.")
+            return
+        if CUPY_AVAILABLE:
+            messagebox.showinfo("Already Installed", "CuPy is already installed and working!")
+            return
+        progress_window = tk.Toplevel(diag_window)
+        progress_window.title("Installing CuPy...")
+        progress_window.geometry("400x150")
+        progress_window.transient(diag_window)
+        progress_window.grab_set()
+        ttk.Label(progress_window, text="Installing CuPy for GPU acceleration...",
+                  font=('Segoe UI', 10)).pack(pady=20)
+        pb = ttk.Progressbar(progress_window, mode='indeterminate', length=300)
+        pb.pack(pady=10); pb.start(10)
+        ttk.Label(progress_window, text="This may take a few minutes...").pack(pady=5)
+        def do_install():
+            pkg = get_cupy_package_name(GPU_CUDA_VERSION)
+            success, message = silent_install_package(pkg, timeout=600)
+            def update_ui():
+                pb.stop()
+                progress_window.destroy()
+                if success:
+                    try:
+                        if 'cupy' in sys.modules:
+                            del sys.modules['cupy']
+                        import cupy as test_cp
+                        test_cp.cuda.runtime.getDeviceCount()
+                        messagebox.showinfo("Success",
+                            "CuPy installed!\nClick 'Refresh Detection' to update the display.")
+                    except Exception as e:
+                        messagebox.showwarning("Partial Success",
+                            f"CuPy installed but may need driver updates.\n\nError: {e}")
+                else:
+                    messagebox.showerror("Failed",
+                        f"Could not install CuPy.\n\nError: {message}\n\n"
+                        f"Install manually: pip install {get_cupy_package_name(GPU_CUDA_VERSION)}")
+            diag_window.after(0, update_ui)
+        threading.Thread(target=do_install, daemon=True).start()
+
+    ttk.Button(btn_frame, text="Copy to Clipboard", command=copy_to_clipboard).pack(side='left', padx=5)
+    ttk.Button(btn_frame, text="Refresh Detection", command=refresh_detection).pack(side='left', padx=5)
+    if GPU_AVAILABLE and not CUPY_AVAILABLE:
+        ttk.Button(btn_frame, text="Install CuPy Now", command=install_cupy_now).pack(side='left', padx=5)
+    ttk.Button(btn_frame, text="Close", command=diag_window.destroy).pack(side='right', padx=5)
+
+# ============================================================================
+# ALPHAPEPTDEEP CALIBRATION DIALOG  (Settings menu)
+# ============================================================================
+def open_apd_calibration_dialog():
+    """
+    Open a dialog for calibrating (transfer-learning) an AlphaPeptDeep MS2
+    model on user-provided PSM spectra and saving the result for reuse.
+    """
+    cal_win = tk.Toplevel(root)
+    cal_win.title("Calibrate AlphaPeptDeep Model")
+    cal_win.geometry("680x760")
+    cal_win.resizable(True, True)
+
+    main_frame = ttk.Frame(cal_win, padding=10)
+    main_frame.pack(fill='both', expand=True)
+
+    # ── Input files ──────────────────────────────────────────────────────────
+    files_frame = ttk.LabelFrame(main_frame, text="Calibration Data", padding=5)
+    files_frame.pack(fill='x', pady=(0, 5))
+    files_frame.columnconfigure(1, weight=1)
+
+    ttk.Label(files_frame, text="MGF File(s):").grid(row=0, column=0, sticky='nw', padx=5, pady=3)
+    _cal_mgf_listbox = tk.Listbox(files_frame, height=4, selectmode='extended')
+    _cal_mgf_listbox.grid(row=0, column=1, sticky='nsew', padx=5, pady=3)
+    files_frame.rowconfigure(0, weight=1)
+    _mgf_btn_frame = ttk.Frame(files_frame)
+    _mgf_btn_frame.grid(row=0, column=2, sticky='ns', padx=5, pady=3)
+    def _browse_mgf():
+        fps = filedialog.askopenfilenames(
+            parent=cal_win, title="Select MGF File(s)",
+            filetypes=[("MGF files", "*.mgf"), ("All", "*.*")])
+        for fp in fps:
+            if fp and fp not in _cal_mgf_listbox.get(0, tk.END):
+                _cal_mgf_listbox.insert(tk.END, fp)
+    def _remove_mgf():
+        sel = list(_cal_mgf_listbox.curselection())
+        for idx in reversed(sel):
+            _cal_mgf_listbox.delete(idx)
+    ttk.Button(_mgf_btn_frame, text="Add…", command=_browse_mgf, width=8).pack(pady=(0,2))
+    ttk.Button(_mgf_btn_frame, text="Remove", command=_remove_mgf, width=8).pack(pady=(0,2))
+    ToolTip(_cal_mgf_listbox,
+            "MGF file(s) containing MS2 spectra (exported by MSConvert\n"
+            "or Proteome Discoverer).  The TITLE= field must contain the\n"
+            "raw-file name (e.g. File: \"Pool.raw\") and SCANS= or a\n"
+            "scan number in the TITLE for matching to the PSM file.")
+
+    ttk.Label(files_frame, text="PSM File:").grid(row=1, column=0, sticky='w', padx=5, pady=3)
+    _cal_psm_var = tk.StringVar()
+    _cal_psm_entry = ttk.Entry(files_frame, textvariable=_cal_psm_var, width=50)
+    _cal_psm_entry.grid(row=1, column=1, sticky='ew', padx=5, pady=3)
+    ToolTip(_cal_psm_entry,
+            "Proteome Discoverer PSMs export (.xlsx, .csv, .tsv).\n\n"
+            "Required columns (case-insensitive, whitespace-trimmed):\n"
+            "  • Sequence  (or 'Annotated Sequence')\n"
+            "  • First Scan  (or 'Scan', 'Scans', 'Scan Number')\n\n"
+            "Recommended columns:\n"
+            "  • Modifications\n"
+            "  • Charge\n"
+            "  • Spectrum File  (raw-file name — needed when MGF\n"
+            "    contains spectra from multiple raw files)\n\n"
+            "The Spectrum File name is matched to the raw-file name in\n"
+            "each MGF TITLE to build a (file, scan) composite key,\n"
+            "avoiding scan-number collisions across files.\n\n"
+            "If the PSM file is open in Excel, close it before loading.")
+    def _browse_psm():
+        fp = filedialog.askopenfilename(parent=cal_win, title="Select PSM File",
+                                        filetypes=[("All supported", "*.tsv;*.csv;*.xlsx;*.xls"),
+                                                   ("All", "*.*")])
+        if fp:
+            _cal_psm_var.set(fp)
+    ttk.Button(files_frame, text="Browse", command=_browse_psm).grid(row=1, column=2, padx=5, pady=3)
+
+    # ── Model parameters ─────────────────────────────────────────────────────
+    param_frame = ttk.LabelFrame(main_frame, text="Model Parameters", padding=5)
+    param_frame.pack(fill='x', pady=(0, 5))
+
+    ttk.Label(param_frame, text="Instrument:").grid(row=0, column=0, sticky='w', padx=5, pady=3)
+    _cal_inst_var = tk.StringVar(value=apd_instrument_var.get())
+    ttk.Combobox(param_frame, textvariable=_cal_inst_var,
+                 values=_APD_INSTRUMENTS, state='readonly', width=14).grid(row=0, column=1, sticky='w', padx=5)
+
+    ttk.Label(param_frame, text="NCE:").grid(row=0, column=2, sticky='w', padx=(15, 5), pady=3)
+    _cal_nce_var = tk.StringVar(value=apd_nce_var.get())
+    ttk.Entry(param_frame, textvariable=_cal_nce_var, width=6).grid(row=0, column=3, sticky='w', padx=5)
+
+    ttk.Label(param_frame, text="Model Name:").grid(row=1, column=0, sticky='w', padx=5, pady=3)
+    _cal_name_var = tk.StringVar(value="My Calibrated Model")
+    ttk.Entry(param_frame, textvariable=_cal_name_var, width=35).grid(
+        row=1, column=1, columnspan=3, sticky='ew', padx=5, pady=3)
+
+    # ── Progress / status ────────────────────────────────────────────────────
+    status_frame = ttk.LabelFrame(main_frame, text="Status", padding=5)
+    status_frame.pack(fill='both', expand=True, pady=(0, 5))
+
+    _cal_log = scrolledtext.ScrolledText(status_frame, height=12, state='disabled',
+                                         wrap='word', font=("Segoe UI", 9))
+    _cal_log.pack(fill='both', expand=True)
+
+    _progress_var = tk.DoubleVar(value=0)
+    _progress_bar = ttk.Progressbar(status_frame, variable=_progress_var, maximum=100)
+    _progress_bar.pack(fill='x', pady=(5, 0))
+
+    def _log(msg):
+        _cal_log.configure(state='normal')
+        _cal_log.insert('end', msg + '\n')
+        _cal_log.see('end')
+        _cal_log.configure(state='disabled')
+
+    # ── Saved models list ────────────────────────────────────────────────────
+    models_frame = ttk.LabelFrame(main_frame, text="Saved Calibrated Models", padding=5)
+    models_frame.pack(fill='x', pady=(0, 5))
+    models_frame.columnconfigure(0, weight=1)
+
+    _model_tree = ttk.Treeview(models_frame, columns=('instrument', 'nce', 'date'),
+                               show='headings', height=4)
+    _model_tree.heading('instrument', text='Instrument')
+    _model_tree.heading('nce', text='NCE')
+    _model_tree.heading('date', text='Date')
+    _model_tree.column('instrument', width=100)
+    _model_tree.column('nce', width=60)
+    _model_tree.column('date', width=160)
+    _model_tree.pack(fill='x', side='left', expand=True)
+
+    _tree_scroll = ttk.Scrollbar(models_frame, orient='vertical', command=_model_tree.yview)
+    _tree_scroll.pack(side='right', fill='y')
+    _model_tree.configure(yscrollcommand=_tree_scroll.set)
+
+    def _refresh_model_list():
+        for item in _model_tree.get_children():
+            _model_tree.delete(item)
+        for m in _list_apd_calibrated_models():
+            _model_tree.insert('', 'end', iid=m['folder'],
+                               text=m['name'],
+                               values=(m['instrument'], m['nce'],
+                                       m.get('date', '')[:19]))
+
+    _refresh_model_list()
+
+    def _delete_selected():
+        sel = _model_tree.selection()
+        if not sel:
+            return
+        if messagebox.askyesno("Delete Model",
+                               "Delete the selected calibrated model?",
+                               parent=cal_win):
+            for s in sel:
+                _delete_apd_calibrated_model(s)
+            _refresh_model_list()
+            # Also refresh the model combobox in the quant UI
+            try:
+                _refresh_apd_model_combo()
+            except Exception:
+                pass
+
+    # ── Buttons ──────────────────────────────────────────────────────────────
+    btn_frame = ttk.Frame(main_frame)
+    btn_frame.pack(fill='x')
+
+    def _run_calibration():
+        mgf_files = list(_cal_mgf_listbox.get(0, tk.END))
+        psm = _cal_psm_var.get().strip()
+        inst = _cal_inst_var.get()
+        name = _cal_name_var.get().strip()
+        try:
+            nce_val = float(_cal_nce_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid NCE", "NCE must be a number.", parent=cal_win)
+            return
+        # Validate MGF files
+        missing = [f for f in mgf_files if not os.path.exists(f)]
+        if not mgf_files:
+            messagebox.showerror("Missing MGF", "Please add at least one MGF file.", parent=cal_win)
+            return
+        if missing:
+            messagebox.showerror("Missing MGF",
+                f"Cannot find MGF file(s):\n" + "\n".join(missing), parent=cal_win)
+            return
+        if not name:
+            messagebox.showerror("Missing Name", "Please enter a model name.", parent=cal_win)
+            return
+
+        _progress_var.set(5)
+        _log(f"Starting calibration: instrument={inst}, NCE={nce_val}")
+        for mf in mgf_files:
+            _log(f"MGF: {mf}")
+        if psm:
+            _log(f"PSM: {psm}")
+
+        # Paper: "5,000 PSMs are randomly sampled from at most 8 RAW files"
+        _MAX_CAL_PSMS = 5_000
+        _MAX_MGF_FILES = 8      # per paper recommendation
+
+        def _do_calibrate():
+            try:
+                _ensure_peptdeep()
+                if not _ALPHAPEPTDEEP_AVAILABLE:
+                    cal_win.after(0, lambda: _log("ERROR: AlphaPeptDeep not available."))
+                    return
+
+                cal_win.after(0, lambda: _progress_var.set(15))
+                cal_win.after(0, lambda: _log("Loading pretrained model..."))
+
+                # Create a fresh model manager (don't reuse cached one)
+                model_dir = _alphapeptdeep_model_dir()
+                use_gpu = False
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        use_gpu = True
+                except ImportError:
+                    pass
+
+                mgr = _APD_ModelManager(device='gpu' if use_gpu else 'cpu')
+                ms2_path = os.path.join(model_dir, 'generic', 'ms2.pth')
+                if os.path.exists(ms2_path):
+                    rt_path = os.path.join(model_dir, 'generic', 'rt.pth')
+                    ccs_path = os.path.join(model_dir, 'generic', 'ccs.pth')
+                    chg_path = os.path.join(model_dir, 'generic', 'charge.pth')
+                    mgr.load_external_models(
+                        ms2_model_file=ms2_path,
+                        rt_model_file=rt_path if os.path.exists(rt_path) else '',
+                        ccs_model_file=ccs_path if os.path.exists(ccs_path) else '',
+                        charge_model_file=chg_path if os.path.exists(chg_path) else '',
+                    )
+                _patch_apd_predict_bug(mgr)
+                mgr.instrument = inst
+                mgr.nce = nce_val
+
+                # ── Pool spectra from multiple MGF files (max 8) ──
+                _use_files = mgf_files[:_MAX_MGF_FILES]
+                if len(mgf_files) > _MAX_MGF_FILES:
+                    cal_win.after(0, lambda: _log(
+                        f"Using first {_MAX_MGF_FILES} of {len(mgf_files)} MGF files (paper recommends ≤8)"))
+
+                all_psm_dfs = []
+                for i, mf in enumerate(_use_files, 1):
+                    cal_win.after(0, lambda i=i, mf=mf: _progress_var.set(15 + int(20 * i / len(_use_files))))
+                    cal_win.after(0, lambda mf=mf: _log(
+                        f"Streaming {os.path.basename(mf)}..."))
+                    part = _parse_mgf_for_alphapeptdeep(
+                        mf, nce_val, inst,
+                        psm_file=psm if psm else None)
+                    if not part.empty:
+                        all_psm_dfs.append(part)
+                        cal_win.after(0, lambda n=len(part), mf=mf: _log(
+                            f"  → {n:,} valid PSMs from {os.path.basename(mf)}"))
+
+                if not all_psm_dfs:
+                    cal_win.after(0, lambda: _log(
+                        "ERROR: No valid PSMs from any MGF file. "
+                        "If your PSM file is open in Excel, close it and retry."))
+                    cal_win.after(0, lambda: _progress_var.set(0))
+                    return
+
+                psm_df = pd.concat(all_psm_dfs, ignore_index=True)
+                n_total = len(psm_df)
+                cal_win.after(0, lambda: _log(
+                    f"Total pooled PSMs: {n_total:,} from {len(all_psm_dfs)} file(s)"))
+
+                if n_total < 10:
+                    cal_win.after(0, lambda: _log(
+                        f"ERROR: Need ≥10 valid identified PSMs for calibration, got {n_total}. "
+                        f"If your PSM file is open in Excel, close it and retry."))
+                    cal_win.after(0, lambda: _progress_var.set(0))
+                    return
+
+                # ── Mod-aware subsampling BEFORE predict_all ──
+                # Paper: "5,000 PSMs randomly sampled, top-10 mods, ≤100/mod"
+                if n_total > _MAX_CAL_PSMS:
+                    try:
+                        from peptdeep.pretrained_models import psm_sampling_with_important_mods
+                        cal_win.after(0, lambda: _log(
+                            f"Subsampling {n_total:,} → {_MAX_CAL_PSMS:,} PSMs "
+                            f"(mod-aware: top-10 mods, ≤100/mod)"))
+                        psm_df = psm_sampling_with_important_mods(
+                            psm_df, n_sample=_MAX_CAL_PSMS,
+                            top_n_mods=10, n_sample_each_mod=100,
+                        ).reset_index(drop=True)
+                    except ImportError:
+                        cal_win.after(0, lambda: _log(
+                            f"Subsampling {n_total:,} → {_MAX_CAL_PSMS:,} PSMs (random)"))
+                        psm_df = psm_df.sample(
+                            n=_MAX_CAL_PSMS, random_state=42
+                        ).reset_index(drop=True)
+                else:
+                    cal_win.after(0, lambda: _log(
+                        f"Using all {n_total:,} PSMs (≤{_MAX_CAL_PSMS:,} cap)"))
+
+                cal_win.after(0, lambda: _progress_var.set(45))
+                cal_win.after(0, lambda: _log(
+                    f"Predicting fragment m/z for {len(psm_df):,} PSMs..."))
+
+                cal_df = psm_df[['sequence', 'mods', 'mod_sites',
+                                 'charge', 'nce', 'instrument']].copy()
+                # Track original row order so we can realign psm_df
+                # after predict_all (which sorts by peptide length).
+                cal_df['_orig_row'] = np.arange(len(cal_df))
+                pred_result = mgr.predict_all(cal_df, predict_items=['ms2'],
+                                              multiprocessing=False)
+                frag_mz_df = pred_result['fragment_mz_df']
+
+                # predict_all sorts cal_df by nAA (peptide length) via
+                # refine_precursor_df — realign psm_df to the same order
+                # so that observed spectra match predicted fragments.
+                psm_df = psm_df.iloc[cal_df['_orig_row'].values].reset_index(drop=True)
+                cal_df = cal_df.drop(columns=['_orig_row'])
+
+                cal_win.after(0, lambda: _progress_var.set(60))
+                cal_win.after(0, lambda: _log("Matching observed peaks to predicted fragments..."))
+
+                matched_intensity_df = _match_observed_to_predicted(
+                    cal_df, frag_mz_df, psm_df, frag_tol_ppm=20.0)
+
+                cal_win.after(0, lambda: _progress_var.set(75))
+                cal_win.after(0, lambda: _log("Transfer-learning MS2 model..."))
+
+                # ── Diagnostics: verify alignment & matching ──
+                _nonzero_frag = int((frag_mz_df.values > 0).sum())
+                _nonzero_match = int((matched_intensity_df.values > 0).sum())
+                logging.info(
+                    f"AlphaPeptDeep diag: frag_mz_df shape={frag_mz_df.shape}, "
+                    f"non-zero m/z={_nonzero_frag:,}; "
+                    f"matched_intensity_df non-zero={_nonzero_match:,}")
+                for _si in range(min(3, len(cal_df))):
+                    _seq = cal_df.iloc[_si].get('sequence', '?')
+                    _fs = int(cal_df.iloc[_si]['frag_start_idx'])
+                    _fe = int(cal_df.iloc[_si]['frag_stop_idx'])
+                    _obs_n = len(psm_df.iloc[_si]['spec_mzs']) if psm_df.iloc[_si]['spec_mzs'] is not None else 0
+                    _pred_nz = int((frag_mz_df.values[_fs:_fe] > 0).sum())
+                    _match_nz = int((matched_intensity_df.values[_fs:_fe] > 0).sum())
+                    logging.info(
+                        f"  PSM[{_si}] seq={_seq[:20]}, frag[{_fs}:{_fe}], "
+                        f"obs_peaks={_obs_n}, pred_mz_nonzero={_pred_nz}, "
+                        f"matched={_match_nz}")
+                _model_types = set(mgr.ms2_model.charged_frag_types)
+                _frag_cols = set(frag_mz_df.columns)
+                _match_cols = set(matched_intensity_df.columns)
+                if _frag_cols != _model_types:
+                    logging.warning(
+                        f"AlphaPeptDeep diag: column mismatch! "
+                        f"model expects {sorted(_model_types)}, "
+                        f"frag_mz has {sorted(_frag_cols)}")
+                if _frag_cols != _match_cols:
+                    logging.warning(
+                        f"AlphaPeptDeep diag: matched cols "
+                        f"{sorted(_match_cols)} != frag cols "
+                        f"{sorted(_frag_cols)}")
+
+                # Paper-recommended TL params: epoch=10, warmup=5,
+                # lr=1e-5, dropout=0.1, batch_size=256.
+                mgr.epoch_to_train_ms2 = 10
+                mgr.warmup_epoch_to_train_ms2 = 5
+                mgr.lr_to_train_ms2 = 1e-5
+                mgr.batch_size_to_train_ms2 = 256
+                mgr.psm_num_to_train_ms2 = _MAX_CAL_PSMS
+                mgr.top_n_mods_to_train = 10
+                mgr.psm_num_per_mod_to_train_ms2 = 100
+                try:
+                    mgr.ms2_model.model.dropout.p = 0.1
+                except Exception:
+                    pass
+                mgr.train_ms2_model(cal_df, matched_intensity_df)
+
+                cal_win.after(0, lambda: _progress_var.set(90))
+                cal_win.after(0, lambda: _log("Saving calibrated model..."))
+
+                folder = _save_apd_calibrated_model(
+                    mgr, name, inst, nce_val,
+                    mgf_path=';'.join(_use_files), psm_path=psm)
+
+                cal_win.after(0, lambda: _progress_var.set(100))
+                cal_win.after(0, lambda: _log(
+                    f"Calibration complete! Model saved as '{name}'."))
+                cal_win.after(0, _refresh_model_list)
+                # Refresh the combobox in the quantification panel
+                try:
+                    cal_win.after(0, _refresh_apd_model_combo)
+                except Exception:
+                    pass
+
+            except Exception as exc:
+                import traceback
+                tb_str = traceback.format_exc()
+                logging.error(f"AlphaPeptDeep calibration error:\n{tb_str}")
+                cal_win.after(0, lambda: _log(f"ERROR: Calibration failed — {exc}"))
+                cal_win.after(0, lambda: _progress_var.set(0))
+
+        threading.Thread(target=_do_calibrate, daemon=True).start()
+
+    _run_btn = RoundedCanvasButton(
+        btn_frame, text="Run Calibration",
+        bg='#2e7d32', fg='white', hover_bg='#388e3c',
+        font=('Segoe UI', 10, 'bold'), height=34,
+        command=_run_calibration)
+    _run_btn.grid(row=0, column=0, padx=5, pady=5, sticky='ew')
+
+    _del_btn = RoundedCanvasButton(
+        btn_frame, text="Delete Selected Model",
+        bg='#c62828', fg='white', hover_bg='#d32f2f',
+        font=('Segoe UI', 10, 'bold'), height=34,
+        command=_delete_selected)
+    _del_btn.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+
+    ttk.Button(btn_frame, text="Close", command=cal_win.destroy).grid(row=0, column=2, padx=5, pady=5, sticky='e')
+    btn_frame.grid_columnconfigure(0, weight=1)
+    btn_frame.grid_columnconfigure(1, weight=1)
+    btn_frame.grid_columnconfigure(2, weight=0)
+
+
+# ============================================================================
+# BUILD THE SETTINGS MENU  (only 2 items)
+# ============================================================================
+settings_menu = Menu(menu_bar, tearoff=0)
+settings_menu.add_command(label="Manage Chemical Modifications",
+                          command=lambda: open_modifications_manager(root))
+settings_menu.add_command(label="Calibrate AlphaPeptDeep Model...",
+                          command=open_apd_calibration_dialog)
+settings_menu.add_separator()
+settings_menu.add_command(label="Preferences...", command=open_preferences_dialog)
+menu_bar.add_cascade(label="Settings", menu=settings_menu)
+
+# Add Help menu
+help_menu = Menu(menu_bar, tearoff=0)
+help_menu.add_command(label="User Guide", command=lambda: show_user_guide())
+help_menu.add_separator()
+help_menu.add_command(label="About", command=lambda: show_about())
+help_menu.add_command(label="Check for updates", command=lambda: check_for_updates())
+menu_bar.add_cascade(label="Help", menu=help_menu)
+
+# Fix the menu layout issue - create the tools menu
+tools_menu = Menu(menu_bar, tearoff=0)
+tools_menu.add_command(label="Peptide fragmentation tool", command=lambda: open_fragmentation_viewer())
+tools_menu.add_command(label="Retention time predictor", command=lambda: open_rt_predictor())
+tools_menu.add_command(label="PRM inclusion list generator", command=lambda: open_inclusion_list_generator())
+tools_menu.add_separator()
+tools_menu.add_command(label="Test MSConvert availability", command=test_msconvert_availability)
+
+# Rebuild the menu bar with correct order
+# First remove all existing menus from the menu bar
+for item in menu_bar.winfo_children():
+    menu_bar.delete(0, 'end')
+
+# --- View menu: theme toggle ---
+view_menu = Menu(menu_bar, tearoff=0)
+_dark_mode_var = tk.BooleanVar(value=False)
+
+def _toggle_theme():
+    if _dark_mode_var.get():
+        sv_ttk.set_theme("dark")
+    else:
+        sv_ttk.set_theme("light")
+
+view_menu.add_checkbutton(label="Dark Mode", variable=_dark_mode_var, command=_toggle_theme)
+
+# Re-add all menus in the desired order
+menu_bar.add_cascade(label="File", menu=file_menu)
+menu_bar.add_cascade(label="View", menu=view_menu)
+menu_bar.add_cascade(label="Settings", menu=settings_menu)
+menu_bar.add_cascade(label="Tools", menu=tools_menu)
+menu_bar.add_cascade(label="Help", menu=help_menu)
+
+root.config(menu=menu_bar)
+
+# Create help functions for the Help menu
+def show_user_guide():
+    """Display a modern, comprehensive user guide in a tabbed Toplevel window."""
+    guide_window = tk.Toplevel(root)
+    guide_window.title("ProteoPRM \u2014 User Guide")
+    guide_window.geometry("960x700")
+    guide_window.minsize(720, 480)
+
+    # ── Colour palette (light, clean look) ──
+    _BG       = '#ffffff'
+    _ACCENT   = '#0078d4'
+    _HEADING  = '#1a1a2e'
+    _SUBHEAD  = '#16213e'
+    _BODY     = '#2c2c2c'
+    _MUTED    = '#555555'
+    _CODE_BG  = '#f5f5f5'
+    _BULLET   = '#0078d4'
+    _TIP_BG   = '#eaf4ff'
+    _WARN_BG  = '#fff8e1'
+    _FONT     = 'Segoe UI'
+    _MONO     = 'Cascadia Mono'
+
+    def _make_page(parent):
+        """Return a styled tk.Text widget inside *parent*."""
+        txt = tk.Text(
+            parent, wrap=tk.WORD, bd=0, highlightthickness=0,
+            padx=28, pady=20, bg=_BG, cursor='arrow',
+            spacing1=2, spacing3=4,
+        )
+        # scrollbar
+        sb = ttk.Scrollbar(parent, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        txt.pack(side='left', fill='both', expand=True)
+
+        # Tag definitions
+        txt.tag_configure('h1', font=(_FONT, 20, 'bold'), foreground=_HEADING,
+                          spacing1=18, spacing3=8)
+        txt.tag_configure('h2', font=(_FONT, 15, 'bold'), foreground=_SUBHEAD,
+                          spacing1=14, spacing3=6)
+        txt.tag_configure('h3', font=(_FONT, 12, 'bold'), foreground=_SUBHEAD,
+                          spacing1=10, spacing3=4)
+        txt.tag_configure('body', font=(_FONT, 11), foreground=_BODY,
+                          spacing1=2, spacing3=2, lmargin1=8, lmargin2=8)
+        txt.tag_configure('bold', font=(_FONT, 11, 'bold'), foreground=_BODY)
+        txt.tag_configure('muted', font=(_FONT, 10), foreground=_MUTED, spacing1=0)
+        txt.tag_configure('bullet', font=(_FONT, 11), foreground=_BODY,
+                          lmargin1=28, lmargin2=44, spacing1=2, spacing3=1)
+        txt.tag_configure('bullet_bold', font=(_FONT, 11, 'bold'), foreground=_BODY)
+        txt.tag_configure('code', font=(_MONO, 10), foreground='#c7254e',
+                          background=_CODE_BG, spacing1=0, spacing3=0)
+        txt.tag_configure('tip', font=(_FONT, 10), foreground='#0d47a1',
+                          background=_TIP_BG, lmargin1=16, lmargin2=16,
+                          spacing1=4, spacing3=4, borderwidth=1, relief='flat')
+        txt.tag_configure('warn', font=(_FONT, 10), foreground='#6d4c00',
+                          background=_WARN_BG, lmargin1=16, lmargin2=16,
+                          spacing1=4, spacing3=4)
+        txt.tag_configure('num', font=(_FONT, 11, 'bold'), foreground=_ACCENT)
+        txt.tag_configure('divider', font=(_FONT, 2), foreground='#e0e0e0',
+                          spacing1=10, spacing3=10)
+        return txt
+
+    def _h1(t, s):   t.insert(tk.END, s + '\n', 'h1')
+    def _h2(t, s):   t.insert(tk.END, s + '\n', 'h2')
+    def _h3(t, s):   t.insert(tk.END, s + '\n', 'h3')
+    def _p(t, s):    t.insert(tk.END, s + '\n', 'body')
+    def _blank(t):   t.insert(tk.END, '\n', 'body')
+    def _tip(t, s):  t.insert(tk.END, '\u2139\ufe0f  ' + s + '\n', 'tip')
+    def _warn(t, s): t.insert(tk.END, '\u26a0\ufe0f  ' + s + '\n', 'warn')
+    def _hr(t):      t.insert(tk.END, '\u2500' * 80 + '\n', 'divider')
+
+    def _bullet(t, head, body=''):
+        t.insert(tk.END, '  \u2022  ', 'bullet')
+        if body:
+            t.insert(tk.END, head, ('bullet', 'bullet_bold'))
+            t.insert(tk.END, ' \u2014 ' + body + '\n', 'bullet')
+        else:
+            t.insert(tk.END, head + '\n', 'bullet')
+
+    def _num_step(t, n, head, body=''):
+        t.insert(tk.END, f'  {n}.  ', ('bullet', 'num'))
+        t.insert(tk.END, head, ('bullet', 'bullet_bold'))
+        if body:
+            t.insert(tk.END, ' \u2014 ' + body, 'bullet')
+        t.insert(tk.END, '\n', 'bullet')
+
+    # ────────────────────────────────────────────────────────────────
+    # Notebook with tabs
+    # ────────────────────────────────────────────────────────────────
+    nb = ttk.Notebook(guide_window)
+    nb.pack(fill='both', expand=True, padx=0, pady=0)
+
+    # ── TAB 1: Quick Start ──────────────────────────────────────────
+    qs_frame = ttk.Frame(nb)
+    nb.add(qs_frame, text='  Quick Start  ')
+    t = _make_page(qs_frame)
+
+    _h1(t, 'Quick Start Guide')
+    _p(t, 'Follow the four steps below to complete your first PRM data analysis.')
+    _hr(t)
+
+    _h2(t, 'Step 1 \u2014 Prepare Your Input Files')
+    _p(t, 'ProteoPRM requires three files:')
+    _blank(t)
+    _bullet(t, 'PRM Input File (Excel)',
+            'Each row defines a target peptide. Columns: Sequence, Modifications (optional), Precursor m/z, '
+            'Charge,  RT Start (min), RT Stop (min), Expected RT (optional).')
+    _bullet(t, 'Raw MS Data Folder',
+            'A single folder containing your .mzML, Thermo .raw, Sciex .wiff, or Bruker .d files. '
+            'Vendor formats are converted to mzML automatically via ProteoWizard msconvert.')
+    _bullet(t, 'Protein FASTA File',
+            'Standard FASTA file with target protein sequences for peptide\u2013protein mapping '
+            'and roll-up quantification.')
+    _blank(t)
+    _tip(t, 'You can generate a PRM input file from a Proteome Discoverer PSM export using '
+            'Tools \u2192 PRM Inclusion List Generator.')
+
+    _h2(t, 'Step 2 \u2014 Load Files into ProteoPRM')
+    _num_step(t, 1, 'PRM Input File', 'Click Browse next to "PRM Input File" and select your Excel file.')
+    _num_step(t, 2, 'Raw/mzML Folder', 'Click Browse next to "Raw Files / mzML Folder" and select the data folder.')
+    _num_step(t, 3, 'Output Location', 'Click Save As to choose the folder where results will be saved.')
+    _num_step(t, 4, 'FASTA File', 'Click Browse next to "Protein FASTA File" and select your .fasta.')
+    _blank(t)
+    _tip(t, 'Save your configuration via File \u2192 Save Configuration so you can reload it later.')
+
+    _h2(t, 'Step 3 \u2014 Configure Parameters')
+    _p(t, 'Review the parameter section:')
+    _bullet(t, 'Digestion & Instrument', 'Set precursor tolerance, fragment tolerance, '
+            'fragmentation type and enzyme specificity.')
+    _bullet(t, 'Filters', 'Set the FDR threshold (default 1%).')
+    _bullet(t, 'Quantification', 'Choose quantification method (Intensity, Area, or Both).')
+    _bullet(t, 'EIC Visualization', 'Check "Generate EIC plots and/or Generate MS2 plots" to produce extracted-ion chromatograms and MS2 spectra.')
+    _blank(t)
+    _warn(t, 'Make sure your fragmentation type matches the acquisition method used on the instrument.')
+
+    _h2(t, 'Step 4 \u2014 Run & Review Results')
+    _num_step(t, 1, 'Click Start')
+    _num_step(t, 2, 'Wait for completion')
+    _num_step(t, 3, 'Review results')
+    _num_step(t, 4, 'Explore visuals')
+    _blank(t)
+
+    t.configure(state='disabled')
+
+    # ── TAB 2: Input & Output ──────────────────────────────────────
+    io_frame = ttk.Frame(nb)
+    nb.add(io_frame, text='  Input & Output  ')
+    t = _make_page(io_frame)
+
+    _h1(t, 'Input & Output Reference')
+    _hr(t)
+
+    _h2(t, 'Input Files')
+    _h3(t, 'PRM Input File (Excel)')
+    _p(t, 'An Excel workbook (.xlsx) where each row represents a target peptide. '
+          'The following columns are expected (headers are matched flexibly):')
+    _bullet(t, 'Sequence', 'Peptide amino-acid sequence (no flanking residues).')
+    _bullet(t, 'Modifications', 'Optional. Modification string (e.g. "Oxidation [M3]").')
+    _bullet(t, 'Precursor m/z', 'Monoisotopic m/z of the precursor ion.')
+    _bullet(t, 'Charge', 'Precursor charge state (integer).')
+    _bullet(t, 'RT Start', 'Retention-time window in minutes for the scheduled acquisition.')
+    _bullet(t, 'RT Stop', 'Retention-time window in minutes for the scheduled acquisition.')
+    _bullet(t, 'Expected RT', 'Optional. Known or predicted apex retention time in minutes.')
+    _blank(t)
+
+    _h3(t, 'Raw MS Data')
+    _p(t, 'Place all data files in one folder. Supported formats:')
+    _bullet(t, '.mzML')
+    _bullet(t, 'Thermo .raw')
+    _bullet(t, 'Sciex .wiff / Bruker .d')
+    _blank(t)
+
+    _h3(t, 'Protein FASTA')
+    _p(t, 'Standard FASTA file. Used for in-silico digestion and peptide\u2013protein mapping')
+    _blank(t)
+
+    _h2(t, 'Output Files')
+    _p(t, 'Results are stored as CSV files inside a dedicated results folder:')
+    _blank(t)
+    _bullet(t, 'PSM.csv', 'All peptide-spectrum matches with fragment ions, intensities, SA scores, '
+            'Mokapot q-values, and predicted retention times.')
+    _bullet(t, 'Peptide_Quantification.csv', 'Peptide-level quantities (summed intensity / integrated area) '
+            'across all raw files.')
+    _bullet(t, 'Protein_Quantification.csv', 'Protein-level roll-up')
+    _bullet(t, 'Combined.csv', 'Wide-format matrix with hierarchical protein \u2192 peptide grouping.')
+    _bullet(t, 'QC_Metrics.csv', 'Per-file quality metrics (RT deviation, mass error, ID counts).')
+    _bullet(t, 'EICs.csv', 'Full fragment-level extracted ion chromatogram data for every target.')
+    _blank(t)
+
+    t.configure(state='disabled')
+
+    # ── TAB 3: Tools ───────────────────────────────────────────────
+    tools_frame = ttk.Frame(nb)
+    nb.add(tools_frame, text='  Tools  ')
+    t = _make_page(tools_frame)
+
+    _h1(t, 'Built-in Tools')
+    _hr(t)
+
+    _h2(t, 'PRM Inclusion List Generator')
+    _p(t, 'Converts a Proteome Discoverer PSM export into a filtered PRM inclusion list '
+          'ready for instrument methods.')
+    _bullet(t, 'Filters', 'Confidence, charge, m/z range, length, missed cleavages, '
+            'modifications, methionine / cysteine / tryptophan exclusion, N-terminal Gln, '
+            'DP/DG, NG/QG motifs, unique peptides, XCorr, q-value, and more.')
+    _bullet(t, 'Ranking', 'Peptides are ranked by XCorr, # PSMs, or Qvality PEP, '
+            'then deduplicated and capped per protein.')
+    _bullet(t, 'Chimeric Assessment', 'Optionally evaluates co-isolated interference '
+            'using the isolation window and in-silico fragmentation.')
+    _blank(t)
+
+    _h2(t, 'Peptide Fragmentation Viewer')
+    _p(t, 'Interactive tool that shows all theoretical fragment ions for a given peptide '
+          'sequence, charge state, and modification. Useful for method troubleshooting.')
+    _blank(t)
+
+    _h2(t, 'Retention Time Predictor')
+    _p(t, 'Train or apply a gradient-boosted or deep-learning RT model. '
+          'Supports transfer learning from community-trained DeepLC or AlphaPeptDeep models '
+          'or your own calibration data.')
+    _blank(t)
+
+    _h2(t, 'Results Viewer')
+    _p(t, 'A standalone application for browsing completed results folders. '
+          'Supports re-integration, protein-level roll-up, and CSV export without '
+          'rerunning the full pipeline.')
+    _blank(t)
+
+    t.configure(state='disabled')
+
+    # ── TAB 5: FAQ / Tips ──────────────────────────────────────────
+    faq_frame = ttk.Frame(nb)
+    nb.add(faq_frame, text='  FAQ & Tips  ')
+    t = _make_page(faq_frame)
+
+    _h1(t, 'Frequently Asked Questions')
+    _hr(t)
+
+    _h3(t, 'What do negative Mokapot SVM scores mean?')
+    _p(t, 'Mokapot trains a semi-supervised SVM to separate target PSMs from decoys. '
+          'The score is the signed distance from the decision boundary: positive means '
+          'target-like, negative means decoy-like. Low-confidence PSMs naturally receive '
+          'negative scores. The q-value and PEP columns are derived from these scores '
+          'and are the recommended filters for downstream use.')
+    _blank(t)
+
+    _h3(t, 'How do I convert vendor raw files?')
+    _p(t, 'Install ProteoWizard (proteo-wizard.sourceforge.net) and ensure msconvert is on '
+          'your system PATH. ProteoPRM will call msconvert automatically for .wiff, and .d files.')
+    
+    _blank(t)
+
+    _h3(t, 'How is protein quantification calculated?')
+    _p(t, 'Peptide quantities are rolled up to protein level by summing peptide intensities.')
+    _blank(t)
+
+    _h3(t, 'Can I re-run quantification without reprocessing spectra?')
+    _p(t, 'Yes. Open the Results Viewer, load the results folder, adjust integration '
+          'parameters, and click Re-integrate. The viewer reads cached EIC data and '
+          'recalculates quantities on the fly.')
+    _blank(t)
+
+    _h2(t, 'Tips & Best Practices')
+    _bullet(t, 'Use narrow RT windows', 'Tighter windows reduce chimeric interference and speed up processing.')
+    _bullet(t, 'Calibrate your prediction model', 'A calibrated AlphaPeptDeep model gives more '
+            'reliable spectral angles for your specific LC\u2013MS setup.')
+    _bullet(t, 'Check QC Metrics first', 'Look at the QC_Metrics.csv for mass-error drift, '
+            'RT shifts, or low ID rates before diving into peptide-level data.')
+    _bullet(t, 'Save configurations', 'Use File \u2192 Save Configuration after tuning parameters '
+            'so you can reproduce the analysis later.')
+    _blank(t)
+
+    t.configure(state='disabled')
+
+    # ── Close button ────────────────────────────────────────────────
+    btn_frame = ttk.Frame(guide_window)
+    btn_frame.pack(fill='x', padx=10, pady=(4, 10))
+    ttk.Button(btn_frame, text='Close', command=guide_window.destroy).pack(side='right')
+
+def show_about():
+    """Display information about the application"""
+    about_window = tk.Toplevel(root)
+    about_window.title("About ProteoPRM")
+    about_window.geometry("400x300")
+    
+    # Add a frame with padding
+    frame = ttk.Frame(about_window, padding="20 20 20 20")
+    frame.pack(fill='both', expand=True)
+    
+    # App title
+    ttk.Label(frame, text="ProteoPRM", font=("Segoe UI", 16, "bold")).pack(pady=(0, 10))
+
+    # Version
+    ttk.Label(frame, text="Peptide PRM Quantification Tool v1.0").pack()
+
+    # Description
+    description = ("A comprehensive tool for processing and analyzing Parallel "
+                    "Reaction Monitoring (PRM) mass spectrometry data.")
+    ttk.Label(frame, text=description, wraplength=350, justify="center").pack(pady=(10, 20))
+
+    # Close button
+    ttk.Button(frame, text="OK", command=about_window.destroy).pack(pady=(20, 0))
+
+def check_for_updates():
+    """Check if updates are available for the application"""
+    # This would normally connect to a server to check for updates
+    # Here we'll just show a message box
+    messagebox.showinfo("Updates", "You are using the latest version (1.0.6).")
+
+# Add tooltips to main interface components
+def add_tooltips():
+    # Main input fields tooltips
+    ToolTip(prm_input_entry, "Excel file with peptide sequences, m/z values, and retention time windows")
+    ToolTip(mzml_folder_entry, "Folder containing mzML files or vendor raw files to be analyzed")
+    ToolTip(output_file_entry, "Location to save the analysis results")
+    ToolTip(fasta_file_entry, "FASTA file with protein sequences for peptide-to-protein mapping")
+    
+    # Parameter tooltips
+    ToolTip(precursor_tolerance_entry, "Maximum allowed difference between expected and observed precursor m/z values")
+    ToolTip(fragment_tolerance_entry, "Maximum allowed difference between theoretical and observed fragment ion m/z values")
+    ToolTip(fragmentation_combo, "Type of fragmentation used in the MS experiment")
+    ToolTip(fdr_threshold_entry, "Maximum acceptable false discovery rate (1% = 0.01)")
+    
+    # Button tooltips
+    ToolTip(start_button, "Start the analysis with current settings")
+    ToolTip(stop_button, "Stop the analysis before completion")
+
+# Call add_tooltips after the main GUI is set up
+add_tooltips()
+
+# Call add_tooltips after the main GUI is set up
+add_tooltips()
+
+
+# ============================================================================
+# SPECTRAL PREDICTION QC VIEWER
+# ============================================================================
+
+def open_spectral_prediction_qc():
+    """
+    Open a Spectral Prediction QC tool that lets the user load a completed
+    ProteoPRM results file and inspect how well the predicted spectra
+    (MS2PIP / AlphaPeptDeep) match the experimentally observed spectra.
+
+    Features:
+      • Per-PSM table with spectral-angle scores
+      • SA distribution histogram
+      • Interactive mirror plot (observed ↑ vs predicted ↓) embedded in PSM tab
+      • All scan ions visible: matched in colour, unmatched in grey
+      • Predicted spectrum uses actual APD / MS2PIP intensities
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+    qc_win = tk.Toplevel(root)
+    qc_win.title("Spectral Prediction QC Viewer")
+    qc_win.geometry("1100x820")
+    qc_win.minsize(950, 650)
+
+    outer = ttk.Frame(qc_win)
+    outer.pack(fill='both', expand=True, padx=6, pady=6)
+    outer.columnconfigure(0, weight=1)
+    outer.rowconfigure(2, weight=1)
+
+    # ── file selector ────────────────────────────────────────────────────
+    file_frame = ttk.LabelFrame(outer, text="Data Sources")
+    file_frame.grid(row=0, column=0, sticky='ew', padx=4, pady=(0, 4))
+    file_frame.columnconfigure(1, weight=1)
+
+    ttk.Label(file_frame, text="Results:").grid(row=0, column=0, sticky='w', padx=6, pady=4)
+    qc_file_var = tk.StringVar()
+    qc_file_entry = ttk.Entry(file_frame, textvariable=qc_file_var, width=60)
+    qc_file_entry.grid(row=0, column=1, sticky='ew', padx=4, pady=4)
+
+    ttk.Label(file_frame, text="mzML / Raw:").grid(row=1, column=0, sticky='w', padx=6, pady=4)
+    qc_mzml_var = tk.StringVar()
+    qc_mzml_entry = ttk.Entry(file_frame, textvariable=qc_mzml_var, width=60)
+    qc_mzml_entry.grid(row=1, column=1, sticky='ew', padx=4, pady=4)
+
+    qc_status_var = tk.StringVar(value="Load a ProteoPRM results folder to begin.")
+    ttk.Label(file_frame, textvariable=qc_status_var, foreground='gray').grid(
+        row=2, column=0, columnspan=4, sticky='w', padx=6, pady=(0, 4))
+
+    # Internal state
+    _qc_data = {'df': None, 'eic_df': None, 'pred_engine': '', 'sa_col': 'spectral_angle'}
+
+    # ── notebook ─────────────────────────────────────────────────────────
+    nb = ttk.Notebook(outer)
+    nb.grid(row=2, column=0, sticky='nsew', padx=4, pady=4)
+
+    # Tab 1: PSM Spectral Angles — treeview (top) + mirror plot (bottom)
+    tab_table = ttk.Frame(nb)
+    nb.add(tab_table, text="PSM Spectral Angles")
+    tab_table.columnconfigure(0, weight=1)
+    tab_table.rowconfigure(0, weight=1)
+
+    pw = ttk.PanedWindow(tab_table, orient='vertical')
+    pw.pack(fill='both', expand=True)
+
+    # -- Upper pane: treeview --
+    tree_outer = ttk.Frame(pw)
+    pw.add(tree_outer, weight=1)
+    tree_outer.columnconfigure(0, weight=1)
+    tree_outer.rowconfigure(0, weight=1)
+
+    tree_cols = ('peptide', 'charge', 'file', 'scan', 'spectral_angle',
+                 'matched_fragments', 'mass_accuracy')
+    tree = ttk.Treeview(tree_outer, columns=tree_cols, show='headings', selectmode='browse')
+    _col_labels = {
+        'peptide': 'Peptide', 'charge': 'Charge', 'file': 'File',
+        'scan': 'Scan', 'spectral_angle': 'SA Score',
+        'matched_fragments': 'Matched Ions', 'mass_accuracy': 'Mass Acc (ppm)',
+    }
+    def _sort_qc_tree(col, reverse):
+        """Sort the QC treeview by column."""
+        items = [(tree.set(k, col), k) for k in tree.get_children('')]
+        try:
+            items.sort(key=lambda t: float(t[0]) if t[0] else 0, reverse=reverse)
+        except (ValueError, TypeError):
+            items.sort(key=lambda t: t[0], reverse=reverse)
+        for index, (_, k) in enumerate(items):
+            tree.move(k, '', index)
+        tree.heading(col, command=lambda _col=col: _sort_qc_tree(_col, not reverse))
+
+    for c in tree_cols:
+        tree.heading(c, text=_col_labels.get(c, c),
+                     command=lambda _col=c: _sort_qc_tree(_col, False))
+        w = 90 if c not in ('peptide', 'file') else 200
+        tree.column(c, width=w, minwidth=60)
+    tree_scroll = ttk.Scrollbar(tree_outer, orient='vertical', command=tree.yview)
+    tree.configure(yscrollcommand=tree_scroll.set)
+    tree.grid(row=0, column=0, sticky='nsew')
+    tree_scroll.grid(row=0, column=1, sticky='ns')
+
+    # -- Lower pane: mirror plot --
+    mirror_outer = ttk.Frame(pw)
+    pw.add(mirror_outer, weight=2)
+
+    mirror_info_var = tk.StringVar(value="Select a PSM above to view its mirror plot.")
+    ttk.Label(mirror_outer, textvariable=mirror_info_var,
+              font=('Segoe UI', 9)).pack(anchor='w', padx=8, pady=2)
+
+    fig_mirror = Figure(figsize=(8, 4), dpi=100)
+    ax_mirror = fig_mirror.add_subplot(111)
+    canvas_mirror = FigureCanvasTkAgg(fig_mirror, master=mirror_outer)
+    canvas_mirror.get_tk_widget().pack(fill='both', expand=True)
+    _mirror_tb_frame = ttk.Frame(mirror_outer)
+    _mirror_tb_frame.pack(fill='x')
+    toolbar_mirror = NavigationToolbar2Tk(canvas_mirror, _mirror_tb_frame)
+    toolbar_mirror.update()
+
+    # Tab 2: SA histogram
+    tab_hist = ttk.Frame(nb)
+    nb.add(tab_hist, text="SA Distribution")
+    fig_hist = Figure(figsize=(7, 4), dpi=100)
+    ax_hist = fig_hist.add_subplot(111)
+    canvas_hist = FigureCanvasTkAgg(fig_hist, master=tab_hist)
+    canvas_hist.get_tk_widget().pack(fill='both', expand=True)
+    toolbar_hist = NavigationToolbar2Tk(canvas_hist, tab_hist)
+    toolbar_hist.update()
+
+    # ── browse helpers ───────────────────────────────────────────────────
+
+    def _browse_results():
+        fp = filedialog.askdirectory(
+            title="Select ProteoPRM Results Folder",
+            parent=qc_win,
+        )
+        if fp:
+            qc_file_var.set(fp)
+
+    def _browse_mzml():
+        fp = filedialog.askdirectory(title="Select mzML / Raw File Folder", parent=qc_win)
+        if fp:
+            qc_mzml_var.set(fp)
+
+    # ── load logic ───────────────────────────────────────────────────────
+
+    def _load_results():
+        fp = qc_file_var.get()
+        if not fp or not os.path.isdir(fp):
+            messagebox.showwarning("No Folder",
+                                   "Please browse for a results folder first.",
+                                   parent=qc_win)
+            return
+        qc_status_var.set("Loading\u2026")
+        qc_win.update_idletasks()
+
+        try:
+            df = _get_cached_excel_sheet(fp, 'PSM')
+
+            # Try to pre-load the EICs data (used by mirror plot)
+            eic_df = pd.DataFrame()
+            try:
+                eic_df = _get_cached_excel_sheet(fp, 'EICs')
+            except Exception:
+                pass
+
+            # Identify the SA column
+            sa_col = None
+            for candidate in ['spectral_angle', 'Spectral Angle', 'SA',
+                              'spectral_contrast_angle', 'sa_score']:
+                if candidate in df.columns:
+                    sa_col = candidate
+                    break
+            if sa_col is None:
+                qc_status_var.set("No spectral-angle column found in the file.  "
+                                  "Run analysis with Probabilistic deconvolution enabled.")
+                return
+
+            _qc_data['df'] = df
+            _qc_data['eic_df'] = eic_df
+            _qc_data['sa_col'] = sa_col
+
+            # Populate tree
+            for item in tree.get_children():
+                tree.delete(item)
+
+            pep_col = next((c for c in df.columns if c.lower() in ('peptide', 'sequence')), None)
+            chg_col = next((c for c in df.columns if c.lower() in ('charge', 'precursor_charge')), None)
+            file_col = next((c for c in df.columns if c.lower() in ('file', 'raw_file', 'filename')), None)
+            scan_col = next((c for c in df.columns if c.lower() in ('scan', 'scan_number', 'scannumber')), None)
+            mf_col = next((c for c in df.columns if c.lower() in ('matched_fragments', 'fragment_count')), None)
+            ma_col = next((c for c in df.columns if c.lower() in ('mass_accuracy',)), None)
+
+            n_with_sa = 0
+            # Pre-filter: exclude decoys and zero/NaN SA rows vectorially
+            _pep_vals = df[pep_col].astype(str) if pep_col else pd.Series([''] * len(df), index=df.index)
+            _sa_vals_raw = pd.to_numeric(df[sa_col], errors='coerce').fillna(0)
+            _tree_mask = ~_pep_vals.str.startswith('DECOY_') & (_sa_vals_raw > 0)
+            _tree_df = df[_tree_mask]
+            n_with_sa = len(_tree_df)
+            _chg_vals = _tree_df[chg_col].astype(str).values if chg_col else [''] * n_with_sa
+            _file_vals = _tree_df[file_col].apply(lambda x: os.path.basename(str(x))).values if file_col else [''] * n_with_sa
+            _scan_vals = _tree_df[scan_col].astype(str).values if scan_col else [''] * n_with_sa
+            _sa_fmt = [f"{float(v):.4f}" for v in _sa_vals_raw[_tree_mask].values]
+            _mf_vals = _tree_df[mf_col].astype(str).values if mf_col else [''] * n_with_sa
+            _ma_vals = [f"{float(v):.2f}" for v in _tree_df[ma_col].fillna(0).values] if ma_col else [''] * n_with_sa
+            for pep_v, chg_v, file_v, scan_v, sa_v, mf_v, ma_v in zip(
+                _pep_vals[_tree_mask].values, _chg_vals, _file_vals,
+                _scan_vals, _sa_fmt, _mf_vals, _ma_vals
+            ):
+                tree.insert('', 'end', values=(
+                    str(pep_v), str(chg_v), str(file_v), str(scan_v),
+                    sa_v, str(mf_v), ma_v,
+                ))
+
+            # Draw histogram
+            sa_vals = df[sa_col].dropna()
+            sa_vals = sa_vals[sa_vals > 0]
+            ax_hist.clear()
+            if len(sa_vals) > 0:
+                ax_hist.hist(sa_vals, bins=50, color='#1976d2', edgecolor='white',
+                             alpha=0.85)
+                median_sa = float(sa_vals.median())
+                ax_hist.axvline(median_sa, color='#d32f2f', linestyle='--', linewidth=1.5,
+                                label=f'Median SA = {median_sa:.3f}')
+                ax_hist.set_xlabel('Spectral Angle (SA)')
+                ax_hist.set_ylabel('Count')
+                ax_hist.set_title(f'SA Distribution  (n={len(sa_vals):,},  '
+                                  f'median={median_sa:.3f})')
+                ax_hist.legend(loc='upper left')
+            else:
+                ax_hist.text(0.5, 0.5, 'No SA scores > 0', ha='center', va='center',
+                             transform=ax_hist.transAxes, fontsize=14, color='gray')
+            fig_hist.tight_layout()
+            canvas_hist.draw()
+
+            qc_status_var.set(f"Loaded {len(df):,} PSMs \u2014 {n_with_sa:,} with SA > 0.  "
+                              f"Select a row to view its mirror plot.")
+
+        except Exception as exc:
+            qc_status_var.set(f"Error loading file: {exc}")
+            logging.error(f"Spectral QC: load error: {exc}")
+
+    # Browse & Load buttons
+    ttk.Button(file_frame, text="Browse", command=_browse_results).grid(
+        row=0, column=2, padx=6, pady=4)
+    ttk.Button(file_frame, text="Browse", command=_browse_mzml).grid(
+        row=1, column=2, padx=6, pady=4)
+    _load_rcb = RoundedCanvasButton(
+        file_frame, text="Load",
+        bg='#2e7d32', fg='white', hover_bg='#1b5e20',
+        font=('Segoe UI', 10, 'bold'), corner_radius=8, height=34,
+        command=_load_results,
+    )
+    _load_rcb.grid(row=0, column=3, rowspan=2, padx=6, pady=4, sticky='ns')
+
+    # ── mirror plot on selection ─────────────────────────────────────────
+
+    # LRU cache for raw spectra to avoid re-reading from disk on every click
+    _mirror_spectrum_cache = {}           # (file_path, scan_key) -> (mz_arr, int_arr) | None
+    _MIRROR_CACHE_MAX = 100
+    _mirror_debounce_id = [None]          # mutable container for after-id
+
+    def _on_tree_select_debounced(event=None):
+        """Debounce rapid tree-view clicks (150 ms) to avoid redundant work."""
+        if _mirror_debounce_id[0] is not None:
+            try:
+                qc_win.after_cancel(_mirror_debounce_id[0])
+            except Exception:
+                pass
+        _mirror_debounce_id[0] = qc_win.after(150, _on_tree_select)
+
+    def _on_tree_select(event=None):
+        sel = tree.selection()
+        if not sel:
+            return
+        vals = tree.item(sel[0], 'values')
+        peptide = vals[0]
+        charge = vals[1]
+        file_name = vals[2]
+        scan_str = vals[3]
+        sa_score = vals[4]
+
+        df = _qc_data['df']
+        if df is None:
+            return
+
+        sa_col = _qc_data['sa_col']
+        pep_col = next((c for c in df.columns if c.lower() in ('peptide', 'sequence')), None)
+        frag_mz_col = next((c for c in df.columns if c.lower() in ('fragment_mzs',)), None)
+        if pep_col is None:
+            return
+
+        ax_mirror.clear()
+
+        from matplotlib.lines import Line2D
+
+        # Fragment type colour mapping (consistent with EIC plots)
+        _ion_colors = {
+            'b': '#1976d2', 'y': '#d32f2f', 'a': '#7b1fa2',
+            'c': '#388e3c', 'z': '#f57c00', 'x': '#5d4037',
+        }
+        _default_color = '#757575'
+        _unmatched_color = '#bdbdbd'
+
+        # Scan-key helper
+        def _sk(v):
+            t = str(v).strip()
+            m = re.search(r'(\d+)(?:\.0+)?$', t)
+            return m.group(1) if m else t
+
+        # ── 1. Load matched ions + predicted intensities from EICs ───
+        matched_ions = []   # (mz, intensity, ion_label, base_type)
+        pred_ions = []      # (mz, predicted_intensity, ion_label, base_type)
+
+        eic_df = _qc_data.get('eic_df')
+        if eic_df is None or eic_df.empty:
+            eic_df = pd.DataFrame()
+
+        if not eic_df.empty:
+            try:
+                pep_eic = eic_df[
+                    (eic_df['peptide'] == peptide) &
+                    (eic_df['file'] == file_name)
+                ]
+                if not pep_eic.empty and 'scan_number' in pep_eic.columns:
+                    req_key = _sk(scan_str)
+                    scan_keys = pep_eic['scan_number'].apply(_sk)
+                    scan_rows = pep_eic[scan_keys == req_key]
+                    if not scan_rows.empty:
+                        main = scan_rows[
+                            scan_rows['neutral_loss'].isnull() |
+                            (scan_rows['neutral_loss'] == '')
+                        ]
+                        for row_dict in main.to_dict('records'):
+                            it = str(row_dict.get('ion_type', '')) if pd.notna(row_dict.get('ion_type')) else ''
+                            mz = float(row_dict.get('fragment_theoretical_mz', 0))
+                            inten = float(row_dict.get('intensity', 0))
+                            base_type = ''.join(c for c in it if c.isalpha()).lower()
+                            matched_ions.append((mz, inten, it, base_type))
+                            # Actual APD / MS2PIP predicted intensity
+                            pred_int = row_dict.get('predicted_intensity', np.nan)
+                            try:
+                                pred_int = float(pred_int)
+                            except Exception:
+                                pred_int = np.nan
+                            if pd.notna(pred_int) and pred_int > 0:
+                                pred_ions.append((mz, pred_int, it, base_type))
+            except Exception:
+                pass
+
+        # Fallback: parse fragment_mzs from PSM data
+        if not matched_ions:
+            _fb_mask = (
+                (df[pep_col].astype(str) == peptide) &
+                (df[sa_col].apply(lambda v: f"{float(v):.4f}" if pd.notna(v) else '') == sa_score)
+            )
+            _fb_rows = df[_fb_mask]
+            sel_row = _fb_rows.iloc[0] if len(_fb_rows) > 0 else None
+            if sel_row is not None and frag_mz_col and pd.notna(sel_row.get(frag_mz_col, None)):
+                frag_str = str(sel_row[frag_mz_col])
+                for entry in frag_str.split(','):
+                    entry = entry.strip()
+                    if ':' in entry:
+                        parts = entry.split(':')
+                        try:
+                            matched_ions.append((float(parts[0]), 1.0, '', ''))
+                        except ValueError:
+                            pass
+
+        # ── 2. Load ALL raw scan peaks from mzML / .raw (for unmatched) ──
+        #       Uses an in-memory cache to avoid re-reading from disk.
+        all_scan_peaks = None  # (mz_array, int_array) numpy arrays
+        mzml_folder = qc_mzml_var.get()
+        if mzml_folder and os.path.isdir(mzml_folder):
+            data_file_path = None
+            file_name_base = os.path.splitext(file_name)[0].lower()
+            for fn in os.listdir(mzml_folder):
+                if os.path.splitext(fn)[0].lower() == file_name_base:
+                    data_file_path = os.path.join(mzml_folder, fn)
+                    break
+            if data_file_path is None:
+                candidate = os.path.join(mzml_folder, file_name)
+                if os.path.isfile(candidate):
+                    data_file_path = candidate
+
+            if data_file_path and os.path.isfile(data_file_path):
+                _cache_key = (data_file_path, _sk(scan_str))
+                if _cache_key in _mirror_spectrum_cache:
+                    all_scan_peaks = _mirror_spectrum_cache[_cache_key]
+                else:
+                    ext_raw = os.path.splitext(data_file_path)[1].lower()
+                    spectrum = None
+                    # Direct .raw access via fisher_py (fast, O(1))
+                    if ext_raw == '.raw' and _check_fisher_available():
+                        spectrum = read_single_scan_fisher(data_file_path, scan_str)
+                    # Indexed mzML access
+                    if spectrum is None and ext_raw in ('.mzml', '.gz'):
+                        try:
+                            from pyteomics import mzml as _mzml_mod
+                            target_id = f"controllerType=0 controllerNumber=1 scan={_sk(scan_str)}"
+                            with _mzml_mod.MzML(data_file_path) as reader:
+                                try:
+                                    spectrum = reader.get_by_id(target_id)
+                                except KeyError:
+                                    spectrum = reader.get_by_id(scan_str)
+                        except Exception:
+                            pass
+                    # Sequential fallback
+                    if spectrum is None:
+                        try:
+                            req_num = _sk(scan_str)
+                            with read_spectra(data_file_path) as reader:
+                                for spec in reader:
+                                    m_spec = re.search(r'scan=(\d+)', str(spec.get('id', '')))
+                                    if m_spec and m_spec.group(1) == req_num:
+                                        spectrum = spec
+                                        break
+                        except Exception:
+                            pass
+
+                    if spectrum is not None:
+                        _mz_arr = spectrum.get('m/z array', np.array([]))
+                        _int_arr = spectrum.get('intensity array', np.array([]))
+                        if _mz_arr.size > 0 and _int_arr.size > 0:
+                            all_scan_peaks = (_mz_arr.astype(np.float64),
+                                              _int_arr.astype(np.float64))
+
+                    # Store in cache (evict oldest if over limit)
+                    if len(_mirror_spectrum_cache) >= _MIRROR_CACHE_MAX:
+                        try:
+                            _mirror_spectrum_cache.pop(next(iter(_mirror_spectrum_cache)))
+                        except StopIteration:
+                            pass
+                    _mirror_spectrum_cache[_cache_key] = all_scan_peaks
+
+        # ── 3. Draw Observed spectrum (upward) ───────────────────────
+        actual_matched = 0
+        has_raw = all_scan_peaks is not None
+        tol_da = 0.02  # m/z tolerance for mapping matched → raw peaks
+        _LABEL_THRESH = 3.0  # only label ions ≥ 3% relative intensity
+
+        if has_raw:
+            mz_all, int_all = all_scan_peaks
+            max_all = float(np.max(int_all)) if int_all.size > 0 else 1.0
+            if max_all <= 0:
+                max_all = 1.0
+            int_norm = int_all / max_all * 100.0
+
+            # Build match map: raw-peak index → (ion_label, base_type)
+            matched_raw_idx = {}
+            for mmz, _, lbl, bt in matched_ions:
+                diffs = np.abs(mz_all - mmz)
+                best_idx = int(np.argmin(diffs))
+                if diffs[best_idx] < tol_da:
+                    matched_raw_idx[best_idx] = (lbl, bt)
+
+            # Unmatched peaks in grey (vectorised)
+            unmatched_mask = np.ones(len(mz_all), dtype=bool)
+            for idx in matched_raw_idx:
+                unmatched_mask[idx] = False
+            if np.any(unmatched_mask):
+                ax_mirror.vlines(mz_all[unmatched_mask], 0, int_norm[unmatched_mask],
+                                 colors=_unmatched_color, linewidth=0.7, alpha=0.45)
+
+            # Batch matched peaks by colour for fewer draw calls
+            _batched_obs = {}  # base_type -> (mz_list, int_list, lbl_list)
+            for idx, (lbl, bt) in matched_raw_idx.items():
+                _batched_obs.setdefault(bt, ([], [], []))
+                _batched_obs[bt][0].append(mz_all[idx])
+                _batched_obs[bt][1].append(int_norm[idx])
+                _batched_obs[bt][2].append(lbl)
+            for bt, (mzs, ints, lbls) in _batched_obs.items():
+                color = _ion_colors.get(bt, _default_color)
+                ax_mirror.vlines(mzs, 0, ints, colors=color, linewidth=1.4)
+                for _m, _i, _l in zip(mzs, ints, lbls):
+                    if _l and _i >= _LABEL_THRESH:
+                        ax_mirror.text(_m, _i + 2, _l, fontsize=7,
+                                       ha='center', va='bottom', rotation=90, color=color)
+            actual_matched = len(matched_raw_idx)
+        else:
+            # No raw data — show only matched ions from EICs
+            if matched_ions:
+                max_obs = max(i[1] for i in matched_ions)
+                if max_obs <= 0:
+                    max_obs = 1.0
+                _batched_obs2 = {}
+                for mz, inten, lbl, bt in matched_ions:
+                    norm_int = inten / max_obs * 100.0
+                    _batched_obs2.setdefault(bt, ([], [], []))
+                    _batched_obs2[bt][0].append(mz)
+                    _batched_obs2[bt][1].append(norm_int)
+                    _batched_obs2[bt][2].append(lbl)
+                for bt, (mzs, ints, lbls) in _batched_obs2.items():
+                    color = _ion_colors.get(bt, _default_color)
+                    ax_mirror.vlines(mzs, 0, ints, colors=color, linewidth=1.4)
+                    for _m, _i, _l in zip(mzs, ints, lbls):
+                        if _l and _i >= _LABEL_THRESH:
+                            ax_mirror.text(_m, _i + 2, _l, fontsize=7, ha='center',
+                                           va='bottom', rotation=90, color=color)
+            actual_matched = len(matched_ions)
+
+        # ── 4. Draw Predicted spectrum (downward) — actual APD/MS2PIP ─
+        pred_norm = []
+        if pred_ions:
+            max_pred = max(i[1] for i in pred_ions)
+            if max_pred <= 0:
+                max_pred = 1.0
+            pred_norm = [(mz, inten / max_pred * 100.0, lbl, bt)
+                         for mz, inten, lbl, bt in pred_ions]
+
+        # Batch predicted peaks by colour
+        _batched_pred = {}
+        for pmz, inten, plabel, pbt in pred_norm:
+            _batched_pred.setdefault(pbt, ([], [], []))
+            _batched_pred[pbt][0].append(pmz)
+            _batched_pred[pbt][1].append(-inten)
+            _batched_pred[pbt][2].append(plabel)
+        for pbt, (mzs, neg_ints, lbls) in _batched_pred.items():
+            color = _ion_colors.get(pbt, _default_color)
+            ax_mirror.vlines(mzs, 0, neg_ints, colors=color, linewidth=1.2, alpha=0.9)
+            for _m, _ni, _l in zip(mzs, neg_ints, lbls):
+                if _l and abs(_ni) >= _LABEL_THRESH:
+                    ax_mirror.text(_m, _ni - 2, _l, fontsize=7, ha='center',
+                                   va='top', rotation=90, color=color, alpha=0.9)
+
+        # ── 5. Axes formatting ───────────────────────────────────────
+        ax_mirror.axhline(0, color='black', linewidth=0.8)
+        ax_mirror.set_xlabel('m/z')
+
+        mirror_info_var.set(f"{peptide}  z={charge}   SA={sa_score}   matched={actual_matched}")
+        ax_mirror.set_title(f'Mirror Plot \u2014 {peptide} {charge}+   SA = {sa_score}')
+
+        current_ylim = ax_mirror.get_ylim()
+        max_abs = max(abs(current_ylim[0]), abs(current_ylim[1]), 100)
+        ax_mirror.set_ylim(-max_abs * 1.15, max_abs * 1.15)
+        yticks = ax_mirror.get_yticks()
+        ax_mirror.set_yticklabels([f'{abs(v):.0f}' for v in yticks])
+        ax_mirror.set_ylabel('Relative Intensity (%)')
+
+        ax_mirror.text(0.01, 0.95, 'Observed \u2191', transform=ax_mirror.transAxes,
+                       fontsize=9, va='top', ha='left', fontstyle='italic', color='#555')
+        if pred_norm:
+            ax_mirror.text(0.01, 0.05, 'Predicted \u2193', transform=ax_mirror.transAxes,
+                           fontsize=9, va='bottom', ha='left', fontstyle='italic', color='#555')
+        else:
+            ax_mirror.text(0.01, 0.05, 'Predicted \u2193  (no predictions in this file)',
+                           transform=ax_mirror.transAxes, fontsize=8, va='bottom', ha='left',
+                           fontstyle='italic', color='#888')
+
+        # Legend: one entry per ion type + unmatched
+        seen_types = set()
+        legend_handles = []
+        for items_list in [matched_ions, pred_norm]:
+            for item in items_list:
+                bt = item[3]
+                if bt and bt not in seen_types:
+                    seen_types.add(bt)
+                    legend_handles.append(
+                        Line2D([0], [0], color=_ion_colors.get(bt, _default_color),
+                               linewidth=2, label=f'{bt}-ions'))
+        if has_raw:
+            legend_handles.append(
+                Line2D([0], [0], color=_unmatched_color, linewidth=1.5,
+                       alpha=0.5, label='unmatched'))
+        if legend_handles:
+            ax_mirror.legend(handles=legend_handles, loc='upper right', fontsize=8)
+
+        fig_mirror.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.10)
+        canvas_mirror.draw_idle()
+
+    tree.bind('<<TreeviewSelect>>', _on_tree_select_debounced)
+
+    # ── export button (orange) ───────────────────────────────────────────
+
+    def _export_sa_csv():
+        df = _qc_data['df']
+        if df is None:
+            messagebox.showwarning("No Data", "Load results first.", parent=qc_win)
+            return
+        fp = filedialog.asksaveasfilename(
+            title="Export SA Scores",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+            parent=qc_win,
+        )
+        if not fp:
+            return
+        sa_col = _qc_data['sa_col']
+        cols = [c for c in df.columns if c.lower() in
+                ('peptide', 'sequence', 'charge', 'precursor_charge',
+                 'file', 'raw_file', 'scan', 'scan_number',
+                 'matched_fragments', 'mass_accuracy', sa_col.lower())]
+        if not cols:
+            cols = list(df.columns)
+        df[cols].to_csv(fp, index=False)
+        qc_status_var.set(f"Exported to {os.path.basename(fp)}")
+
+    export_frame = ttk.Frame(outer)
+    export_frame.grid(row=3, column=0, sticky='ew', padx=4, pady=(0, 4))
+    _export_rcb = RoundedCanvasButton(
+        export_frame, text="Export SA Scores to CSV",
+        bg='#ef6c00', fg='white', hover_bg='#f57c00',
+        font=('Segoe UI', 10, 'bold'), corner_radius=8, height=34,
+        command=_export_sa_csv,
+    )
+    _export_rcb.pack(side='left', padx=6, pady=4)
+
+
+def open_fragmentation_viewer():
+    """Open the peptide fragmentation viewer tool."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    frag_window = tk.Toplevel(root)
+    frag_window.title("Peptide Fragmentation Tool")
+    frag_window.geometry("800x600")
+
+    # Main container for layout
+    main_container = ttk.Frame(frag_window)
+    main_container.pack(fill='both', expand=True)
+    main_container.rowconfigure(3, weight=1)  # notebook row expands
+    main_container.columnconfigure(0, weight=1)
+
+    # Label
+    ttk.Label(main_container, text="Enter peptide sequence or upload a file for bulk processing").grid(row=0, column=0, sticky='ew', padx=15, pady=10)
+
+    # Parameters section
+    param_frame = ttk.Frame(main_container)
+    param_frame.grid(row=1, column=0, sticky='ew', padx=10, pady=5)
+    param_frame.grid_columnconfigure(0, weight=1)
+    param_frame.grid_columnconfigure(1, weight=1)
+    param_frame.grid_columnconfigure(2, weight=0)
+    param_frame.grid_columnconfigure(3, weight=0)
+    
+    # Single Processing frame
+    single_frame = ttk.LabelFrame(param_frame, text="Single Processing")
+    single_frame.grid(row=0, column=0, columnspan=4, sticky='ew', padx=5, pady=5)
+    single_frame.grid_columnconfigure(1, weight=1)
+    
+    ttk.Label(single_frame, text="Peptide:").grid(row=0, column=0, sticky='w', padx=5, pady=5)
+    peptide_var = tk.StringVar()
+    ttk.Entry(single_frame, textvariable=peptide_var, width=40).grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
+
+    ttk.Label(single_frame, text="Modifications:").grid(row=1, column=0, sticky='w', padx=5, pady=5)
+    mod_var = tk.StringVar()
+    ttk.Entry(single_frame, textvariable=mod_var, width=40).grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
+    ttk.Label(single_frame, text="(e.g., 'Oxidation [M7]; Acetyl [N-Term]')").grid(row=1, column=3, sticky='w', padx=5, pady=5)
+
+    # Bulk upload section
+    bulk_frame = ttk.LabelFrame(param_frame, text="Bulk Processing")
+    bulk_frame.grid(row=1, column=0, columnspan=4, sticky='ew', padx=5, pady=5)
+    bulk_frame.grid_columnconfigure(1, weight=1)
+    
+    ttk.Label(bulk_frame, text="Upload file:").grid(row=0, column=0, sticky='w', padx=5, pady=5)
+    bulk_file_var = tk.StringVar()
+    bulk_file_entry = ttk.Entry(bulk_frame, textvariable=bulk_file_var, width=40)
+    bulk_file_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+    
+    # Variable to track the last processing mode
+    last_mode = tk.StringVar(value="single")
+    
+    def browse_bulk_file():
+        filename = filedialog.askopenfilename(
+            filetypes=[("Excel and CSV files", "*.csv *.xlsx *.xls"), 
+                      ("CSV files", "*.csv"), 
+                      ("Excel files", "*.xlsx *.xls"),
+                      ("All files", "*.*")]
+        )
+        if filename:
+            bulk_file_entry.config(state='normal')
+            bulk_file_entry.delete(0, tk.END)
+            bulk_file_entry.insert(0, filename)
+            bulk_file_entry.config(state='readonly')
+            
+            # Don't clear single processing entries - allow switching between modes
+            
+            # Update status
+            bulk_status_label.config(text="Status: File loaded. Ready to process.")
+    ttk.Button(bulk_frame, text="Browse", command=browse_bulk_file).grid(row=0, column=2, padx=5, pady=5)
+    ToolTip(bulk_file_entry, "Select an Excel or CSV file with peptide sequences (column 1) and modifications (column 2) for bulk processing.")
+
+    # Add status label for bulk processing
+    bulk_status_label = ttk.Label(bulk_frame, text="Status: No file loaded")
+    bulk_status_label.grid(row=1, column=0, columnspan=4, sticky='w', padx=5, pady=5)
+
+    frag_method_frame = ttk.Frame(param_frame)
+    frag_method_frame.grid(row=2, column=0, columnspan=1, sticky='w', padx=2, pady=5)
+    ttk.Label(frag_method_frame, text="Fragmentation:").pack(side='left', padx=5)
+    frag_var = tk.StringVar(value="HCD")
+    frag_combo = ttk.Combobox(
+        frag_method_frame,
+        textvariable=frag_var,
+        values=['HCD', 'CID', 'ETD', 'EThcD', 'UVPD'],
+        width=12,
+        state='readonly'
+    )
+    frag_combo.pack(side='left', padx=2)
+    frag_combo.current(0)
+    #frag_combo.grid(row=2, column=1, padx=5, pady=5, sticky='w')
+
+    charge1_var = tk.BooleanVar(value=True)
+    charge2_var = tk.BooleanVar(value=True)
+    charge3_var = tk.BooleanVar(value=True)
+
+    charge_frame = ttk.Frame(param_frame)
+    charge_frame.grid(row=2, column=2, columnspan=1, sticky='w', padx=2, pady=5)
+    ttk.Label(charge_frame, text="Charge:").pack(side='left', padx=5)
+    ttk.Checkbutton(charge_frame, text="1+", variable=charge1_var).pack(side='left', padx=2)
+    ttk.Checkbutton(charge_frame, text="2+", variable=charge2_var).pack(side='left', padx=2)
+    ttk.Checkbutton(charge_frame, text="3+", variable=charge3_var).pack(side='left', padx=2)
+
+    # Add neutral loss ion options after charge options
+    nl_frame = ttk.Frame(param_frame)
+    nl_frame.grid(row=2, column=3, columnspan=1, sticky='w', padx=2, pady=5)
+    ttk.Label(nl_frame, text="Neutral Loss Ions:").pack(side='left', padx=5)
+
+    # Define variables for neutral loss checkboxes
+    frag_main_nl_vars = {}
+    frag_main_ions = [("H2O", "H2O"), ("NH3", "NH3")]
+    frag_other_ions = [
+        ("H3PO4", "H3PO4"),
+        ("CH3SOH", "CH3SOH"),
+        ("CH3SOH-H2O", "CH3SOH-H2O"),
+        ("2CH3SOH", "2CH3SOH"),
+        ("2CH3SOH-H2O", "2CH3SOH-H2O"),
+        ("3CH3SOH", "3CH3SOH"),
+        ("3CH3SOH-H2O", "3CH3SOH-H2O"),
+        ("2H2O", "2H2O"),
+        ("2NH3", "2NH3"),
+        ("H2O+NH3", "H2O+NH3"),
+        ("NH2-CO-CH2SH", "NH2-CO-CH2SH"),
+        ("2NH2-CO-CH2SH", "2NH2-CO-CH2SH"),
+        ("3NH2-CO-CH2SH", "3NH2-CO-CH2SH"),
+        ("4NH2-CO-CH2SH", "4NH2-CO-CH2SH"),
+        ("5NH2-CO-CH2SH", "5NH2-CO-CH2SH"),
+        ("6NH2-CO-CH2SH", "6NH2-CO-CH2SH"),
+        ("7NH2-CO-CH2SH", "7NH2-CO-CH2SH"),
+    ]
+    frag_main_nl_vars["H2O"] = tk.BooleanVar(value=True)
+    frag_main_nl_vars["NH3"] = tk.BooleanVar(value=True)
+    frag_main_nl_vars["Others"] = tk.BooleanVar(value=False)
+    frag_other_nl_vars = {key: tk.BooleanVar(value=False) for label, key in frag_other_ions}
+
+    def frag_update_main_from_others(*args):
+        return
+
+    def frag_show_others_dialog():
+        dialog = tk.Toplevel(frag_window)
+        dialog.title("Select Other Neutral Loss Ions")
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        ttk.Label(dialog, text="Select additional neutral loss ions:").grid(row=0, column=0, columnspan=4, pady=8)
+        for idx, (label, key) in enumerate(frag_other_ions):
+            cb = ttk.Checkbutton(dialog, text=label, variable=frag_other_nl_vars[key])
+            cb.grid(row=1 + idx // 4, column=idx % 4, sticky='w', padx=5, pady=2)
+        def on_ok():
+            dialog.destroy()
+            frag_main_nl_vars["Others"].set(any(var.get() for var in frag_other_nl_vars.values()))
+        ttk.Button(dialog, text="OK", command=on_ok).grid(row=1 + len(frag_other_ions) // 4 + 1, column=0, columnspan=4, pady=8)
+        dialog.wait_window()
+
+    def frag_on_others_checked(*args):
+        if frag_main_nl_vars["Others"].get():
+            frag_show_others_dialog()
+        else:
+            for var in frag_other_nl_vars.values():
+                var.set(False)
+
+    # Place main checkboxes in the Fragmentation Tool UI (e.g., in nl_frame)
+    ttk.Checkbutton(nl_frame, text="H2O", variable=frag_main_nl_vars["H2O"]).pack(side='left', padx=2)
+    ttk.Checkbutton(nl_frame, text="NH3", variable=frag_main_nl_vars["NH3"]).pack(side='left', padx=2)
+    ttk.Checkbutton(nl_frame, text="Others", variable=frag_main_nl_vars["Others"], command=frag_on_others_checked).pack(side='left', padx=2)
+
+    def frag_get_selected_neutral_losses():
+        selected = []
+        if frag_main_nl_vars["H2O"].get():
+            selected.append("H2O")
+        if frag_main_nl_vars["NH3"].get():
+            selected.append("NH3")
+        for key, var in frag_other_nl_vars.items():
+            if var.get():
+                selected.append(key)
+        return selected
+
+    # Sample peptides section
+    sample_frame = ttk.Frame(main_container)
+    sample_frame.grid(row=2, column=0, sticky='ew', padx=10, pady=5)
+    ttk.Label(sample_frame, text="Sample Peptides:").pack(side='left', padx=5)
+
+    def _frag_train_style_button(parent, text, command):
+        return RoundedCanvasButton(
+            parent,
+            text=text,
+            bg='#ef6c00',
+            fg='white',
+            hover_bg='#f57c00',
+            font=('Segoe UI', 10, 'bold'),
+            corner_radius=8,
+            height=34,
+            command=command,
+        )
+
+    def _frag_predict_style_button(parent, text, command):
+        return RoundedCanvasButton(
+            parent,
+            text=text,
+            bg='#2e7d32',
+            fg='white',
+            hover_bg='#388e3c',
+            disabled_bg='#2e7d32',
+            disabled_fg='#c8e6c9',
+            font=('Segoe UI', 10, 'bold'),
+            corner_radius=8,
+            height=34,
+            command=command,
+        )
+
+    def set_sample_peptide(peptide, mod=""):
+        peptide_var.set(peptide)
+        mod_var.set(mod)
+        last_mode.set("single")  # Set mode to single when using sample peptides
+    _frag_train_style_button(
+        sample_frame,
+        text="VSEGGPAEIAGLQIGDK",
+        command=lambda: set_sample_peptide("VSEGGPAEIAGLQIGDK")
+    ).pack(side='left', padx=2)
+    _frag_train_style_button(
+        sample_frame,
+        text="IPMVVNTMKPRVETIVQFSR",
+        command=lambda: set_sample_peptide("IPMVVNTMKPRVETIVQFSR", "Oxidation [M3]")
+    ).pack(side='left', padx=2)
+
+    # Notebook for visualization tabs
+    notebook = ttk.Notebook(main_container)
+    notebook.grid(row=3, column=0, sticky='nsew', padx=10, pady=10)
+
+    # Fragments Table tab
+    table_frame = ttk.Frame(notebook)
+    viewer_frame = ttk.Frame(notebook)
+    notebook.add(table_frame, text="Fragments Table")
+    notebook.add(viewer_frame, text="Fragments Viewer")
+
+    # Table view setup
+    columns = ("fragment_id", "charge", "mz")
+    fragment_table = ttk.Treeview(table_frame, columns=columns, show="headings")
+    fragment_table.heading("fragment_id", text="Fragment")
+    fragment_table.heading("charge", text="Charge")
+    fragment_table.heading("mz", text="m/z")
+    fragment_table.column("fragment_id", width=100)
+    fragment_table.column("charge", width=80)
+    fragment_table.column("mz", width=120)
+    y_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=fragment_table.yview)
+    fragment_table.configure(yscrollcommand=y_scrollbar.set)
+    y_scrollbar.pack(side="right", fill="y")
+    fragment_table.pack(fill="both", expand=True)
+
+    # Keep track of sort settings for each column
+    sort_settings = {}
+
+    # Function to handle column sorting
+    def sort_column(tree, col, descending=False):
+        """Sort tree contents when a column header is clicked"""
+        # Get all the data from the treeview
+        data = [(tree.set(item, col), item) for item in tree.get_children('')]
+        
+        # Convert numeric values properly for sorting
+        try:
+            if col == "mz":
+                # If the column contains numbers
+                data = [(float(value), item) for value, item in data]
+            elif col == "charge":
+                # If charge column might have 'N/A' in bulk mode
+                data = [(float(value) if value != 'N/A' else -1, item) for value, item in data]
+        except ValueError:
+            # If it's text, leave as is
+            pass
+            
+        # Sort the data
+        data.sort(reverse=descending)
+        
+        # Rearrange items in sorted order
+        for idx, (val, item) in enumerate(data):
+            tree.move(item, '', idx)
+            
+        # Update the sort settings for this tree and column
+        tree_id = str(tree)
+        if tree_id not in sort_settings:
+            sort_settings[tree_id] = {}
+        sort_settings[tree_id][col] = not descending
+        
+        # Update column headings to indicate sort direction
+        for c in columns:
+            if c != col:
+                tree.heading(c, text=tree.heading(c, 'text').replace(' ↑', '').replace(' ↓', ''))
+        
+        current_text = tree.heading(col, 'text')
+        clean_text = current_text.replace(' ↑', '').replace(' ↓', '')
+        tree.heading(col, text=f"{clean_text} {'↓' if descending else '↑'}")
+
+    # Bind column headers to the sort function
+    for col in columns:
+        fragment_table.heading(col, command=lambda _col=col: sort_column(fragment_table, _col, 
+                                                                    False if str(fragment_table) not in sort_settings or
+                                                                    _col not in sort_settings[str(fragment_table)] else
+                                                                    sort_settings[str(fragment_table)][_col]))
+    
+    # Store bulk processing results
+    bulk_results = []
+    predicted_spectrum_export = {
+        "rows": [],
+        "peptide": "",
+        "fragmentation_type": "",
+        "precursor_text": "",
+        "is_predicted": False,
+        "figure": None
+    }
+
+    # Function to validate modifications in bulk input file
+    def validate_bulk_modifications(df):
+        """Validate modifications in bulk file against defined modifications"""
+        if df.shape[1] < 2:
+            return True  # No modifications column
+            
+        mod_col = df.iloc[:, 1].dropna().astype(str)
+        valid_mods = set(m['name'].lower() for m in FIXED_MODIFICATIONS + VARIABLE_MODIFICATIONS)
+        
+        # Create ID to name mapping for better error messages
+        id_to_name = {}
+        for name, mod_info in UNIMOD_MODIFICATIONS.items():
+            if 'id' in mod_info:
+                id_to_name[str(mod_info['id'])] = name
+        
+        invalid_mods = set()
+        
+        for mod_entry in mod_col:
+            if pd.isna(mod_entry) or not mod_entry.strip():
+                continue
+                
+            # Split by semicolons outside brackets
+            mods = []
+            current_mod = ""
+            in_brackets = False
+            
+            for char in mod_entry:
+                if char == '[':
+                    in_brackets = True
+                    current_mod += char
+                elif char == ']':
+                    in_brackets = False
+                    current_mod += char
+                elif char == ';' and not in_brackets:
+                    if current_mod.strip():
+                        mods.append(current_mod.strip())
+                    current_mod = ""
+                else:
+                    current_mod += char
+                    
+            # Don't forget the last one
+            if current_mod.strip():
+                mods.append(current_mod.strip())
+                
+            # Now extract modification names
+            for mod in mods:
+                # Extract name portion (before the bracket)
+                if '[' in mod:
+                    name_part = mod.split('[')[0].strip()
+                else:
+                    name_part = mod.strip()
+                
+                # Extract just the modification name (handling "NX" prefix)
+                if 'x' in name_part:
+                    parts = name_part.split('x', 1)
+                    try:
+                        # Check if the first part is a number
+                        int(parts[0])
+                        # If we're here, it was a number, so get the second part as the name
+                        mod_name = parts[1].strip().lower()
+                    except ValueError:
+                        # Not a number, treat the whole thing as the name
+                        mod_name = name_part.lower()
+                else:
+                    mod_name = name_part.lower()
+                
+                if mod_name and mod_name not in valid_mods:
+                    # Try to provide a more informative error message
+                    resolved_name = id_to_name.get(mod_name, name_part.strip())
+                    if resolved_name != name_part.strip():
+                        invalid_mods.add(f"{name_part.strip()} (Unimod: {resolved_name})")
+                    else:
+                        invalid_mods.add(f"{name_part.strip()} (in '{mod_entry}')")
+                    
+        if invalid_mods:
+            messagebox.showerror(
+                "Invalid Modifications Found",
+                f"The following modifications in the bulk file are not defined in the Chemical Modification Manager:\n\n"
+                f"{', '.join(sorted(invalid_mods))}\n\n"
+                f"Please open Settings > Manage Chemical Modifications and add these before proceeding."
+            )
+            return False
+            
+        return True
+
+    # Function to save fragment table data to a CSV file
+    def _normalize_mz_value(mz_value):
+        """Return float m/z if valid, otherwise None."""
+        try:
+            if mz_value is None:
+                return None
+            mz_float = float(mz_value)
+            if pd.isna(mz_float):
+                return None
+            return mz_float
+        except Exception:
+            return None
+
+    def save_fragment_table():
+        """Save fragment table data to a CSV file"""
+        if last_mode.get() == "bulk" and bulk_results:
+            # Special format for bulk mode
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt")],
+                title="Save Bulk Fragment Table"
+            )
+            
+            if not filename:
+                return
+                
+            try:
+                with open(filename, 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    
+                    # Write header
+                    writer.writerow(["Peptide", "Fragment_m/z"])
+                    
+                    # Write data - each peptide with comma-separated fragment m/z values
+                    for peptide, fragments in bulk_results:
+                        valid_fragment_mzs = [
+                            _normalize_mz_value(mz) for mz in fragments
+                        ]
+                        valid_fragment_mzs = [mz for mz in valid_fragment_mzs if mz is not None]
+                        fragment_mzs = ", ".join([f"{mz:.6f}" for mz in valid_fragment_mzs])
+                        writer.writerow([peptide, fragment_mzs])
+                        
+                messagebox.showinfo("Success", f"Bulk fragment table saved to {filename}")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+        
+        elif fragment_table.get_children():
+            # Original format for single peptide mode
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt")],
+                title="Save Fragment Table"
+            )
+
+            if not filename:
+                return
+
+            try:
+                with open(filename, 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+
+                    # Write header
+                    writer.writerow(["Fragment", "Charge", "m/z"])
+
+                    # Write data
+                    for item in fragment_table.get_children():
+                        values = fragment_table.item(item)["values"]
+                        writer.writerow(values)
+
+                messagebox.showinfo("Success", f"Fragment table saved to {filename}")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+        else:
+            messagebox.showinfo("No Data", "No fragment data to save.")
+
+    def save_predicted_spectrum():
+        """Save currently displayed predicted spectrum to CSV."""
+        if not predicted_spectrum_export["rows"]:
+            messagebox.showinfo("No Data", "No spectrum data available. Run Fragmentation first.")
+            return
+
+        if not predicted_spectrum_export["is_predicted"]:
+            messagebox.showinfo("MS2PIP Unavailable", "No predicted spectrum available for download because MS2PIP prediction was not used.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt")],
+            title="Save Predicted Spectrum"
+        )
+
+        if not filename:
+            return
+
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["Peptide", predicted_spectrum_export["peptide"]])
+                writer.writerow(["Fragmentation", predicted_spectrum_export["fragmentation_type"]])
+                writer.writerow(["Precursor", predicted_spectrum_export["precursor_text"]])
+                writer.writerow([])
+                writer.writerow(["Fragment", "m/z", "Relative Intensity (%)"])
+                for label, mz_val, intensity in predicted_spectrum_export["rows"]:
+                    writer.writerow([label, f"{mz_val:.6f}", f"{intensity:.4f}"])
+
+            messagebox.showinfo("Success", f"Predicted spectrum saved to {filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save predicted spectrum: {str(e)}")
+
+    def save_predicted_spectrum_png():
+        """Save currently displayed predicted spectrum figure to PNG."""
+        if not predicted_spectrum_export["is_predicted"]:
+            messagebox.showinfo("MS2PIP Unavailable", "No predicted spectrum image available because MS2PIP prediction was not used.")
+            return
+
+        if predicted_spectrum_export["figure"] is None:
+            messagebox.showinfo("No Figure", "No predicted spectrum figure available. Run Fragmentation first.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png")],
+            title="Save Predicted Spectrum Image"
+        )
+
+        if not filename:
+            return
+
+        try:
+            predicted_spectrum_export["figure"].savefig(filename, dpi=300, bbox_inches='tight')
+            messagebox.showinfo("Success", f"Predicted spectrum image saved to {filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save predicted spectrum image: {str(e)}")
+
+    def create_viewer_download_icons():
+        """Create top-right download icon buttons inside the fragment viewer area."""
+        icon_bar = ttk.Frame(viewer_frame)
+        icon_bar.pack(fill='x', padx=4, pady=(4, 0))
+
+        right_icons = ttk.Frame(icon_bar)
+        right_icons.pack(side='right')
+
+        csv_icon_btn = ttk.Button(right_icons, text="⬇", width=3, command=save_predicted_spectrum)
+        csv_icon_btn.pack(side='left', padx=(0, 4))
+        ToolTip(csv_icon_btn, "Download predicted spectrum (CSV)")
+
+        png_icon_btn = ttk.Button(right_icons, text="🖼", width=3, command=save_predicted_spectrum_png)
+        png_icon_btn.pack(side='left')
+        ToolTip(png_icon_btn, "Download predicted spectrum (PNG)")
+
+    # View Available Modifications popup
+    def show_mods_info():
+        global FIXED_MODIFICATIONS, VARIABLE_MODIFICATIONS
+        mod_info_window = tk.Toplevel(frag_window)
+        mod_info_window.title("Available Modifications")
+        mod_info_window.geometry("500x400")
+        notebook2 = ttk.Notebook(mod_info_window)
+        notebook2.pack(fill='both', expand=True, padx=10, pady=10)
+        fixed_frame = ttk.Frame(notebook2)
+        notebook2.add(fixed_frame, text="Fixed Modifications")
+        fixed_text = scrolledtext.ScrolledText(fixed_frame, wrap=tk.WORD, font=("Segoe UI", 10), height=15)
+        fixed_text.pack(fill='both', expand=True, padx=5, pady=5)
+        fixed_text.insert(tk.END, "Fixed Modifications:\n\n")
+        for mod in FIXED_MODIFICATIONS:
+            fixed_text.insert(tk.END, f"Name: {mod['name']}\n")
+            fixed_text.insert(tk.END, f"Mass shift: {mod['mass_shift']:.6f} Da\n")
+            fixed_text.insert(tk.END, f"Residues: {mod['residues']}\n")
+            fixed_text.insert(tk.END, f"Position: {mod['position']}\n\n")
+        fixed_text.configure(state='disabled')
+
+        var_frame = ttk.Frame(notebook2)
+        notebook2.add(var_frame, text="Variable Modifications")
+        var_text = scrolledtext.ScrolledText(var_frame, wrap=tk.WORD, font=("Segoe UI", 10), height=15)
+        var_text.pack(fill='both', expand=True, padx=5, pady=5)
+        var_text.insert(tk.END, "Variable Modifications:\n\n")
+        for mod in VARIABLE_MODIFICATIONS:
+            var_text.insert(tk.END, f"Name: {mod['name']}\n")
+            var_text.insert(tk.END, f"Mass shift: {mod['mass_shift']:.6f} Da\n")
+            var_text.insert(tk.END, f"Residues: {mod['residues']}\n")
+            var_text.insert(tk.END, f"Position: {mod['position']}\n\n")
+        var_text.configure(state='disabled')
+
+        ttk.Button(mod_info_window, text="Close", command=mod_info_window.destroy).pack(pady=10)
+
+    def visualize_fragmentation():
+        """Unified function to visualize fragmentation for both single and bulk modes"""
+        predicted_spectrum_export["rows"] = []
+        predicted_spectrum_export["peptide"] = ""
+        predicted_spectrum_export["fragmentation_type"] = ""
+        predicted_spectrum_export["precursor_text"] = ""
+        predicted_spectrum_export["is_predicted"] = False
+        predicted_spectrum_export["figure"] = None
+
+        # Clear previous results
+        for widget in viewer_frame.winfo_children():
+            widget.destroy()
+        create_viewer_download_icons()
+        fragment_table.delete(*fragment_table.get_children())
+        bulk_results.clear()
+        
+        selected_neutral_losses = normalize_neutral_losses(frag_get_selected_neutral_losses())
+
+        bulk_file = bulk_file_var.get()
+        
+        # Determine which mode to use based on inputs
+        if bulk_file:
+            # Bulk mode
+            if not os.path.exists(bulk_file):
+                messagebox.showerror("File Not Found", f"The file {bulk_file} does not exist.")
+                return
+                
+            # Get parameters
+            fragmentation_type = frag_var.get()
+            selected_charges = []
+            if charge1_var.get():
+                selected_charges.append(1)
+            if charge2_var.get():
+                selected_charges.append(2)
+            if charge3_var.get():
+                selected_charges.append(3)
+                
+            if not selected_charges:
+                messagebox.showwarning("No Charge States", "Please select at least one charge state.")
+                return
+                
+            try:
+                # Read the file
+                if bulk_file.lower().endswith('.csv'):
+                    df = pd.read_csv(bulk_file)
+                else:
+                    df = pd.read_excel(bulk_file)
+                    
+                # Check if we have at least one column
+                if df.shape[1] == 0:
+                    messagebox.showerror("Invalid File", "The file does not contain any columns.")
+                    return
+                    
+                # Validate modifications
+                if not validate_bulk_modifications(df):
+                    return
+                    
+                # Get peptides from first column
+                peptides = df.iloc[:, 0].tolist()
+                
+                # Get modifications from second column if available
+                if df.shape[1] > 1:
+                    modifications = df.iloc[:, 1].tolist()
+                else:
+                    modifications = [""] * len(peptides)
+                    
+                # Fill NaNs with empty strings
+                modifications = [mod if pd.notna(mod) else "" for mod in modifications]
+                
+                # Create progress window
+                progress_window = tk.Toplevel(frag_window)
+                progress_window.title("Bulk Processing")
+                progress_window.geometry("400x150")
+                
+                ttk.Label(progress_window, text="Processing peptides...").pack(pady=10)
+                progress = ttk.Progressbar(progress_window, orient="horizontal", length=300, mode="determinate")
+                progress.pack(pady=10, padx=20)
+                progress['maximum'] = len(peptides)
+                
+                status_label = ttk.Label(progress_window, text="0/" + str(len(peptides)))
+                status_label.pack(pady=5)
+                
+                abort_flag = [False]
+                ttk.Button(progress_window, text="Abort", 
+                         command=lambda: abort_flag.__setitem__(0, True)).pack(pady=5)
+                
+                progress_window.update()
+                
+                # Process each peptide
+                for i, (peptide, modification) in enumerate(zip(peptides, modifications)):
+                    if abort_flag[0]:
+                        messagebox.showinfo("Aborted", f"Processing aborted after {i} peptides.")
+                        progress_window.destroy()
+                        return
+                        
+                    peptide = str(peptide).strip().upper()
+                    if not peptide:
+                        continue
+                        
+                    modification = str(modification).strip()
+                    
+                    # Update progress
+                    progress['value'] = i + 1
+                    status_label.config(text=f"{i+1}/{len(peptides)}: {peptide}")
+                    progress_window.update()
+                    
+                    try:
+                        # Generate theoretical ions
+                        theoretical_ions = generate_theoretical_ions_cached(
+                            peptide, modification, fragmentation_type, 
+                            selected_neutral_losses=selected_neutral_losses
+                        )                        
+                        # Collect all m/z values across selected charges
+                        all_mz_values = []
+                        for ion_type, charges in theoretical_ions.items():
+                            for charge, mzs in charges.items():
+                                if charge in selected_charges:
+                                    for mz in mzs:
+                                        mz_value = _normalize_mz_value(mz)
+                                        if mz_value is not None:
+                                            all_mz_values.append(mz_value)
+                                    
+                        # Sort by m/z
+                        all_mz_values.sort()
+                        
+                        # Add to bulk results
+                        bulk_results.append((peptide, all_mz_values))
+                        
+                    except Exception as e:
+                        messagebox.showerror("Error Processing Peptide", 
+                                          f"Error processing {peptide}: {str(e)}")
+                        logging.error(f"Error processing peptide {peptide}: {str(e)}")
+                
+                progress_window.destroy()
+                
+                # Update the table with first peptide results for preview
+                if bulk_results:
+                    fragment_table.delete(*fragment_table.get_children())
+
+                    # Show first peptide's results in the table with detailed info
+                    first_peptide, first_fragments = bulk_results[0]
+                    # Find the corresponding modification for the first peptide
+                    first_modification = ""
+                    if df.shape[1] > 1:
+                        first_modification = str(df.iloc[0, 1]) if pd.notna(df.iloc[0, 1]) else ""
+                    # Regenerate theoretical ions for the first peptide
+                    theoretical_ions = generate_theoretical_ions_cached(
+                        first_peptide, first_modification, fragmentation_type,
+                        selected_neutral_losses=selected_neutral_losses
+                    )
+                    # For each ion type and charge, add to table
+                    for ion_type, charges in theoretical_ions.items():
+                        for charge, mzs in charges.items():
+                            if charge in selected_charges:
+                                for i, mz in enumerate(mzs):
+                                    mz_value = _normalize_mz_value(mz)
+                                    if mz_value is None:
+                                        continue
+                                    # Determine fragment index
+                                    fragment_index = i + 1
+                                    # Handle neutral loss
+                                    if '-' in ion_type:
+                                        base_ion, nl_type = ion_type.split('-', 1)
+                                        fragment_id = f"{base_ion}{fragment_index}-{nl_type}"
+                                    else:
+                                        fragment_id = f"{ion_type}{fragment_index}"
+                                    fragment_table.insert("", "end", values=(fragment_id, charge, f"{mz_value:.6f}"))
+
+                    # Update status
+                    bulk_status_label.config(text=f"Status: Processed {len(bulk_results)} peptides. Showing preview of first peptide.")
+
+                    # Create summary in viewer tab
+                    summary_text = scrolledtext.ScrolledText(viewer_frame, wrap=tk.WORD, font=("Segoe UI", 10))
+                    summary_text.pack(fill='both', expand=True, padx=5, pady=5)
+                    summary_text.config(state='normal')  # Enable editing to insert text
+
+                    summary_text.insert(tk.END, f"Bulk Processing Summary\n\n")
+                    summary_text.insert(tk.END, f"Total peptides processed: {len(bulk_results)}\n")
+                    summary_text.insert(tk.END, f"Fragmentation type: {fragmentation_type}\n")
+                    summary_text.insert(tk.END, f"Charge states: {', '.join(map(str, selected_charges))}\n\n")
+                    summary_text.insert(tk.END, "First 5 peptides processed:\n\n")
+                    for i, (peptide, fragments) in enumerate(bulk_results[:5]):
+                        summary_text.insert(tk.END, f"{i+1}. {peptide}: {len(fragments)} fragments\n")
+                    summary_text.insert(tk.END, "\nClick 'Download Table' to save all results in bulk format.")
+
+                    summary_text.config(state='disabled')  # Make read-only
+
+                    # Switch to viewer tab to show summary
+                    notebook.select(viewer_frame)
+                    last_mode.set("bulk")
+                    
+                else:
+                    messagebox.showinfo("No Results", "No valid peptides were processed.")
+                    
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to process bulk file: {str(e)}")
+                logging.error(f"Error processing bulk file: {str(e)}")
+                traceback.print_exc()
+                
+        else:
+            # Single peptide mode
+            peptide = peptide_var.get().strip().upper()
+            modifications = mod_var.get().strip()
+            fragmentation_type = frag_var.get()
+            selected_charges = []
+            if charge1_var.get():
+                selected_charges.append(1)
+            if charge2_var.get():
+                selected_charges.append(2)
+            if charge3_var.get():
+                selected_charges.append(3)
+                
+            if not peptide:
+                messagebox.showerror("Error", "Please enter a peptide sequence or select a bulk file.")
+                return
+                
+            if not selected_charges:
+                messagebox.showwarning("No Charge States", "Please select at least one charge state.")
+                return
+            
+            try:
+                theoretical_ions = generate_theoretical_ions_cached(
+                    peptide, modifications, fragmentation_type,
+                    selected_neutral_losses=selected_neutral_losses
+                )
+                # Calculate precursor m/z using the same modification handling approach as main application
+                precursor_mass = sum(get_amino_acid_mass(aa) for aa in peptide)
+
+                # Parse modifications properly
+                mod_positions = parse_modifications_cached(modifications)
+
+                # Apply fixed modifications from Chemical Modifications Manager
+                for i, aa in enumerate(peptide):
+                    for mod in FIXED_MODIFICATIONS:
+                        residues = mod['residues'].split(',')
+                        # Check if this amino acid is modified by this fixed mod
+                        if aa in residues or 'any' in residues:
+                            # Check position constraints
+                            position_valid = (
+                                mod['position'] == 'anywhere' or
+                                (mod['position'] == 'N-term' and i == 0) or
+                                (mod['position'] == 'C-term' and i == len(peptide) - 1)
+                            )
+                            if position_valid:
+                                precursor_mass += mod['mass_shift']
+
+                # Apply variable modifications as specified in the input
+                # Oxidation
+                if mod_positions['oxidation']:
+                    for pos in mod_positions['oxidation']:
+                        if pos < len(peptide) and peptide[pos] == 'M':
+                            precursor_mass += get_modification_mass_shift("Oxidation")
+
+                # Acetylation
+                if mod_positions['acetyl']:
+                    precursor_mass += get_modification_mass_shift("Acetyl")
+
+                # Phosphorylation
+                if mod_positions['phospho']:
+                    for pos in mod_positions['phospho']:
+                        if pos < len(peptide) and peptide[pos] in ['S', 'T', 'Y']:
+                            precursor_mass += get_modification_mass_shift("Phospho")
+
+                # Custom modifications
+                if 'custom_mods' in mod_positions:
+                    for pos, mod_list in mod_positions['custom_mods'].items():
+                        for mod_name, residue in mod_list:
+                            if pos < len(peptide) and peptide[pos] == residue:
+                                try:
+                                    precursor_mass += get_modification_mass_shift(mod_name)
+                                except ValueError:
+                                    # If not found in modification manager, show a warning
+                                    messagebox.showwarning("Modification Warning",
+                                                         f"Modification '{mod_name}' not found in Chemical Modifications Manager.\n"
+                                                         f"Mass calculation might be inaccurate.")
+
+                # Calculate the base peptide mass first and print it
+                base_mass = sum(get_amino_acid_mass(aa) for aa in peptide)
+                print(f"Base peptide mass for {peptide}: {base_mass:.6f} Da")
+
+                # Initialize precursor mass
+                precursor_mass = base_mass
+
+                # Add H2O
+                precursor_mass += 18.01056468403
+                print(f"After adding H2O: {precursor_mass:.6f} Da")
+
+                # Track each modification addition
+                if mod_positions['oxidation']:
+                    for pos in mod_positions['oxidation']:
+                        if pos < len(peptide) and peptide[pos] == 'M':
+                            ox_mass = get_modification_mass_shift("Oxidation")
+                            precursor_mass += ox_mass
+                            print(f"Added oxidation at M{pos+1}: +{ox_mass:.6f} Da -> Total: {precursor_mass:.6f} Da")
+
+                # Calculate precursor m/z values for each selected charge
+                precursor_mzs = []
+                for charge in selected_charges:
+                    mz = (precursor_mass + charge * 1.0072764665789) / charge
+                    precursor_mzs.append((charge, mz))
+                    print(f"Precursor m/z for charge {charge}+: {mz:.6f}")
+
+                # Populate the fragment table
+                fragment_data = []
+
+                for ion_type, charges in theoretical_ions.items():
+                    # Extract base ion type and neutral loss information
+                    if '-' in ion_type:
+                        base_ion = ion_type.split('-')[0]
+                        nl_type = ion_type.split('-', 1)[1]
+                    else:
+                        base_ion = ion_type
+                        nl_type = None
+                    
+                    for ch, mzs in charges.items():
+                        if ch not in selected_charges:
+                            continue
+                        
+                        for i, mz in enumerate(mzs):
+                            mz_value = _normalize_mz_value(mz)
+                            if mz_value is None:
+                                continue
+                            # Determine the fragment index (e.g., "b1", "y2", etc.)
+                            fragment_index = i + 1
+                            
+                            # Create fragment ID with appropriate neutral loss suffix
+                            if nl_type:
+                                fragment_id = f"{base_ion}{fragment_index}-{nl_type}"
+                            else:
+                                fragment_id = f"{base_ion}{fragment_index}"
+
+                            # Add row to the table
+                            fragment_table.insert("", "end", values=(fragment_id, ch, f"{mz_value:.6f}"))
+
+                            # Also collect for the visualization
+                            fragment_data.append((mz_value, f"{fragment_id}{'⁺' * ch}"))
+
+                # Sort the table by fragment type and index
+                try:
+                    sorted_items = sorted(fragment_table.get_children(),
+                                        key=lambda item: (
+                                            fragment_table.item(item)["values"][0][0],  # ion type (b, y, etc.)
+                                            int(''.join(filter(str.isdigit, fragment_table.item(item)["values"][0].split('-')[0])))  # Extract number before any neutral loss
+                                        ))
+                    
+                    for i, item in enumerate(sorted_items):
+                        fragment_table.move(item, "", i)
+                except Exception as e:
+                    logging.warning(f"Could not sort fragment table: {str(e)}")
+
+                # ----- MS2PIP predicted intensities -----
+                _pred_intensities = {}  # {(ion_type, frag_pos, charge): relative_intensity 0-1}
+                _ms2pip_ok = False
+                _ensure_ms2pip()
+                if HAS_MS2PIP:
+                    try:
+                        # Try precursor charge 2 first (most common PRM charge), then 3
+                        for _try_ch in [2, 3]:
+                            _pred_intensities = ms2pip_predict_intensities(
+                                peptide, modifications, _try_ch, fragmentation_type
+                            )
+                            if _pred_intensities:
+                                break
+
+                        if _pred_intensities:
+                            # ms2pip XGBoost models return log2-transformed intensities.
+                            # The normalisation in ms2pip_predict_intensities divides by
+                            # max_val, but ONLY when max_val > 0.  When all raw predictions
+                            # are negative (common), normalisation is skipped and we get
+                            # raw log2 values.  Convert to linear-scale here.
+                            _vals = list(_pred_intensities.values())
+                            if any(v < 0 for v in _vals):
+                                # Values are still in log2-space → convert to linear
+                                _pred_intensities = {k: 2.0 ** v for k, v in _pred_intensities.items()}
+                            else:
+                                # Already normalised to [0,1] or linear — ensure all ≥ 0
+                                _pred_intensities = {k: max(v, 0.0) for k, v in _pred_intensities.items()}
+
+                            # (Re-)normalise to [0, 1] so the most intense fragment = 1.0
+                            _pmax = max(_pred_intensities.values()) if _pred_intensities else 0
+                            if _pmax > 0:
+                                _pred_intensities = {k: v / _pmax for k, v in _pred_intensities.items()}
+                                _ms2pip_ok = True
+                    except Exception as _ms2pip_err:
+                        logging.debug("MS2PIP prediction failed in fragmentation viewer: %s", _ms2pip_err)
+
+                # In MS2PIP mode, remove neutral-loss ions from spectrum data only.
+                # MS2PIP predicts backbone ions (b/y/c/z/a/x), not neutral-loss daughters.
+                if _ms2pip_ok:
+                    fragment_data = [
+                        (mz, lbl) for mz, lbl in fragment_data
+                        if '-' not in lbl
+                    ]
+
+                # Apply highlighting based on modifications
+                mod_positions_flat = []
+                if mod_positions['oxidation']:
+                    mod_positions_flat.extend([(pos, "Oxidation") for pos in mod_positions['oxidation']])
+                if mod_positions['phospho']:
+                    mod_positions_flat.extend([(pos, "Phospho") for pos in mod_positions['phospho']])
+                if 'custom_mods' in mod_positions:
+                    for pos, mod_list in mod_positions['custom_mods'].items():
+                        for mod_name, _ in mod_list:
+                            mod_positions_flat.append((pos, mod_name))
+
+                # ================================================================
+                # Create the figure with peptide annotation + spectrum
+                # ================================================================
+                fig = Figure(figsize=(10, 8), dpi=100)
+
+                precursor_text = "\n".join([f"Precursor m/z: {mz:.4f} ({ch}+)" for ch, mz in precursor_mzs])
+                fig.suptitle(f"Theoretical {fragmentation_type} Fragmentation of {peptide}\n"
+                            f"{precursor_text}\n"
+                            f"{'Modified peptide' if mod_positions_flat else 'Unmodified peptide'}",
+                            fontsize=10, y=0.99, va='top')
+
+                gs = fig.add_gridspec(2, 1, height_ratios=[1, 2.2],
+                                      hspace=0.30, top=0.82)
+
+                # ---- Top panel: peptide sequence with conventional fragment lines ----
+                ax1 = fig.add_subplot(gs[0])
+                ax1.set_axis_off()
+
+                sequence_length = len(peptide)
+                # Adaptive font size: shrink for long peptides
+                _aa_fontsize = max(7, min(16, int(180 / max(sequence_length, 1))))
+                _label_fontsize = max(7, _aa_fontsize - 1)
+                # Spacing
+                _x_start = 0.5  # left margin
+                _x_spacing = max(0.4, min(1.0, 14.0 / max(sequence_length, 1)))
+                _total_width = (sequence_length - 1) * _x_spacing
+                _x_start = max(0.5, (sequence_length * _x_spacing) / 2.0 - _total_width / 2.0)
+
+                _y_seq = 0.50   # y-position of the amino-acid letters
+                _y_b_label = 0.92  # b/c/a ion labels (above)
+                _y_y_label = 0.08  # y/z/x ion labels (below)
+                _bar_top = 0.72    # top of the vertical tick above the bond
+                _bar_bot = 0.28    # bottom of the vertical tick below the bond
+
+                # Draw amino-acid letters
+                for i, aa in enumerate(peptide):
+                    _x = _x_start + i * _x_spacing
+                    # Check if this position has a modification
+                    _mod_here = [mn for (mp, mn) in mod_positions_flat if mp == i]
+                    _aa_color = 'darkred' if _mod_here else 'black'
+                    ax1.text(_x, _y_seq, aa, ha='center', va='center',
+                             fontfamily='monospace', fontsize=_aa_fontsize, fontweight='bold',
+                             color=_aa_color)
+                    # Small modification annotation below the letter
+                    if _mod_here:
+                        _mod_abbrev = ', '.join(mn[:3] for mn in _mod_here)
+                        ax1.text(_x, _y_seq - 0.12, _mod_abbrev, ha='center', va='top',
+                                 fontsize=max(5, _label_fontsize - 2), color='darkred')
+
+                # Draw fragment-site lines and labels between each pair of residues
+                # Convention:  b-ions → ┐ (top-right angle above bond)
+                #              y-ions → └ (bottom-left angle below bond)
+                for i in range(1, sequence_length):
+                    _x_bond = _x_start + (i - 0.5) * _x_spacing  # midpoint between residues i-1 and i
+
+                    if fragmentation_type in ['HCD', 'CID', 'EThcD']:
+                        # --- b-ion line (vertical tick going UP from bond, then short horizontal to the left) ---
+                        ax1.plot([_x_bond, _x_bond], [_y_seq + 0.10, _bar_top],
+                                 color='blue', linewidth=1.0, solid_capstyle='round')
+                        ax1.plot([_x_bond, _x_bond - _x_spacing * 0.25], [_bar_top, _bar_top],
+                                 color='blue', linewidth=1.0, solid_capstyle='round')
+                        ax1.text(_x_bond - _x_spacing * 0.05, _y_b_label,
+                                 f'b$_{{{i}}}$', ha='center', va='center',
+                                 color='blue', fontsize=_label_fontsize)
+
+                        # --- y-ion line (vertical tick going DOWN from bond, then short horizontal to the right) ---
+                        _y_idx = sequence_length - i
+                        ax1.plot([_x_bond, _x_bond], [_y_seq - 0.10, _bar_bot],
+                                 color='red', linewidth=1.0, solid_capstyle='round')
+                        ax1.plot([_x_bond, _x_bond + _x_spacing * 0.25], [_bar_bot, _bar_bot],
+                                 color='red', linewidth=1.0, solid_capstyle='round')
+                        ax1.text(_x_bond + _x_spacing * 0.05, _y_y_label,
+                                 f'y$_{{{_y_idx}}}$', ha='center', va='center',
+                                 color='red', fontsize=_label_fontsize)
+
+                    if fragmentation_type in ['ETD', 'EThcD']:
+                        _c_offset = 0.04 if fragmentation_type == 'EThcD' else 0.0
+                        ax1.plot([_x_bond + _c_offset, _x_bond + _c_offset],
+                                 [_y_seq + 0.10, _bar_top - 0.04],
+                                 color='green', linewidth=0.8, linestyle='--', solid_capstyle='round')
+                        ax1.text(_x_bond + _c_offset, _y_b_label - 0.06,
+                                 f'c$_{{{i}}}$', ha='center', va='center',
+                                 color='green', fontsize=max(5, _label_fontsize - 1))
+
+                        _z_idx = sequence_length - i
+                        ax1.plot([_x_bond + _c_offset, _x_bond + _c_offset],
+                                 [_y_seq - 0.10, _bar_bot + 0.04],
+                                 color='orange', linewidth=0.8, linestyle='--', solid_capstyle='round')
+                        ax1.text(_x_bond + _c_offset, _y_y_label + 0.06,
+                                 f'z$_{{{_z_idx}}}$', ha='center', va='center',
+                                 color='orange', fontsize=max(5, _label_fontsize - 1))
+
+                    if fragmentation_type == 'UVPD':
+                        ax1.plot([_x_bond, _x_bond], [_y_seq + 0.10, _bar_top],
+                                 color='purple', linewidth=1.0, solid_capstyle='round')
+                        ax1.text(_x_bond, _y_b_label,
+                                 f'a$_{{{i}}}$', ha='center', va='center',
+                                 color='purple', fontsize=_label_fontsize)
+
+                        _x_idx = sequence_length - i
+                        ax1.plot([_x_bond, _x_bond], [_y_seq - 0.10, _bar_bot],
+                                 color='brown', linewidth=1.0, solid_capstyle='round')
+                        ax1.text(_x_bond, _y_y_label,
+                                 f'x$_{{{_x_idx}}}$', ha='center', va='center',
+                                 color='brown', fontsize=_label_fontsize)
+
+                ax1.set_xlim(_x_start - _x_spacing * 0.8,
+                             _x_start + (sequence_length - 1) * _x_spacing + _x_spacing * 0.8)
+                ax1.set_ylim(-0.05, 1.05)
+
+                # ---- Bottom panel: theoretical spectrum with MS2PIP intensities ----
+                ax2 = fig.add_subplot(gs[1])
+
+                # Sort fragment data by m/z
+                fragment_data.sort(key=lambda x: x[0])
+
+                # Build spectrum using MS2PIP predicted intensities when available
+                mzs = []
+                labels = []
+                intensities = []
+
+                for mz_val, label in fragment_data:
+                    _int = None  # will be set if prediction found
+                    if _ms2pip_ok:
+                        # Parse ion_type, position, charge from label like "b5⁺" or "y12⁺⁺"
+                        _lbl_clean = label.replace('⁺', '')
+                        _ion_ch = label.count('⁺')
+                        if _ion_ch == 0:
+                            _ion_ch = 1
+
+                        # Split off neutral-loss suffix: "b5-H2O" → base="b5", nl="H2O"
+                        _has_nl = False
+                        _lbl_base = _lbl_clean
+                        if '-' in _lbl_clean:
+                            _lbl_base = _lbl_clean.split('-')[0]
+                            _has_nl = True
+
+                        # MS2PIP does not directly predict neutral-loss ions
+                        if _has_nl:
+                            continue
+
+                        _m_lbl = re.match(r'^([a-zA-Z]+?)(\d+)', _lbl_base)
+                        if _m_lbl:
+                            _ion_t = _m_lbl.group(1).lower()
+                            _ion_p = int(_m_lbl.group(2))
+
+                            # Look up the base-ion prediction (charge 1 from MS2PIP)
+                            _pred_val = _pred_intensities.get((_ion_t, _ion_p, _ion_ch), None)
+                            if _pred_val is None and _ion_ch > 1:
+                                # Fallback: use charge-1 prediction scaled down
+                                _pred_val = _pred_intensities.get((_ion_t, _ion_p, 1), None)
+                                if _pred_val is not None:
+                                    _pred_val = _pred_val * (0.5 ** (_ion_ch - 1))
+
+                            if _pred_val is not None:
+                                _int = max(float(_pred_val) * 100.0, 1.0)
+                            # else: no MS2PIP prediction → omit this ion entirely
+
+                    if not _ms2pip_ok:
+                        _int = 100.0  # uniform fallback when MS2PIP unavailable
+
+                    # Only keep ions that have an intensity value
+                    if _int is not None:
+                        mzs.append(mz_val)
+                        labels.append(label)
+                        intensities.append(_int)
+
+                # Re-normalise so the tallest predicted peak = 100%
+                if _ms2pip_ok and intensities:
+                    _imax = max(intensities)
+                    if _imax > 0:
+                        intensities = [v / _imax * 100.0 for v in intensities]
+
+                predicted_spectrum_export["rows"] = list(zip(labels, mzs, intensities))
+                predicted_spectrum_export["peptide"] = peptide
+                predicted_spectrum_export["fragmentation_type"] = fragmentation_type
+                predicted_spectrum_export["precursor_text"] = precursor_text.replace('\n', '; ')
+                predicted_spectrum_export["is_predicted"] = _ms2pip_ok
+
+                def _ion_color(lbl):
+                    """Return colour for a fragment label."""
+                    if lbl.startswith('b'):  return 'blue'
+                    if lbl.startswith('y'):  return 'red'
+                    if lbl.startswith('c'):  return 'green'
+                    if lbl.startswith('z'):  return 'orange'
+                    if lbl.startswith('a'):  return 'purple'
+                    if lbl.startswith('x'):  return 'brown'
+                    return 'darkgrey'
+
+                if mzs:
+                    # Draw stem lines
+                    for mz_val, label, intensity in zip(mzs, labels, intensities):
+                        color = _ion_color(label)
+                        alpha = 0.35 if '-' in label else 1.0
+                        ax2.vlines(mz_val, 0, intensity, colors=color,
+                                   linewidth=1.2, alpha=alpha)
+
+                    # Label only singly-charged base ions (no neutral losses)
+                    # among the top-N by intensity, with spacing to avoid overlap.
+                    _label_candidates = [
+                        (mz_val, label, intensity)
+                        for mz_val, label, intensity in zip(mzs, labels, intensities)
+                        if '-' not in label and label.count('⁺') <= 1
+                    ]
+                    _label_candidates.sort(key=lambda x: x[2], reverse=True)
+                    _label_candidates = _label_candidates[:25]  # top 25
+
+                    # Sort by m/z for overlap check
+                    _label_candidates.sort(key=lambda x: x[0])
+                    _min_mz_gap = (max(mzs) - min(mzs)) * 0.018 if len(mzs) > 1 else 10
+                    _last_labeled_mz = -9999
+                    for mz_val, label, intensity in _label_candidates:
+                        if mz_val - _last_labeled_mz < _min_mz_gap:
+                            continue  # skip to avoid overlap
+                        ax2.text(mz_val, intensity + 1.5, label,
+                                 ha='center', va='bottom',
+                                 color=_ion_color(label), fontsize=7,
+                                 rotation=90, alpha=0.9)
+                        _last_labeled_mz = mz_val
+
+                else:
+                    ax2.text(0.5, 0.5, "No fragments generated",
+                             ha='center', va='center', transform=ax2.transAxes)
+
+                ax2.set_xlabel('m/z')
+                ax2.set_ylabel('Relative Intensity (%)')
+                ax2.set_ylim(0, 120)
+                if mzs:
+                    ax2.set_xlim(min(mzs) - 50, max(mzs) + 50)
+
+                # Subtitle indicating whether MS2PIP was used
+                _intensity_note = "MS2PIP predicted intensities" if _ms2pip_ok else "Uniform intensities (MS2PIP unavailable)"
+                ax2.set_title(_intensity_note, fontsize=8, fontstyle='italic', color='grey')
+
+                fig.tight_layout(rect=[0, 0, 1, 0.82])
+
+                if _ms2pip_ok:
+                    predicted_spectrum_export["figure"] = fig
+
+                # Display the figure in the viewer tab
+                canvas = FigureCanvasTkAgg(fig, master=viewer_frame)
+                canvas.draw()
+                canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+                toolbar_frame = ttk.Frame(viewer_frame)
+                toolbar_frame.pack(fill=tk.X)
+                toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+                toolbar.update()
+
+                # If table has content, switch to table tab first
+                if len(fragment_table.get_children()) > 0:
+                    notebook.select(table_frame)
+                else:
+                    # Otherwise switch to viewer tab
+                    notebook.select(viewer_frame)
+                    
+                # Set the last mode to single
+                last_mode.set("single")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to visualize fragmentation: {str(e)}")
+                logging.error(f"Error in fragmentation viewer: {str(e)}")
+                traceback.print_exc()
+
+    # Add the download button to the button frame
+    frag_button_frame = ttk.Frame(main_container)
+    frag_button_frame.grid(row=4, column=0, sticky='ew', padx=10, pady=10)
+    download_button = ttk.Button(frag_button_frame, text="Download Table", command=save_fragment_table)
+    download_button.pack(side='left', padx=5)
+
+    # Create the other buttons in the button frame
+    mods_button = ttk.Button(frag_button_frame, text="View Available Modifications", command=show_mods_info)
+    mods_button.pack(side='left', padx=5)
+    visualize_button = _frag_predict_style_button(
+        frag_button_frame,
+        text="Run Fragmentation",
+        command=visualize_fragmentation,
+    )
+    visualize_button.pack(side='right', padx=5)
+
+# ---------------------------------------------------------------------------
+# PRM Inclusion List Generator
+# ---------------------------------------------------------------------------
+def open_inclusion_list_generator():
+    """Generate a PRM inclusion list from Proteome Discoverer PeptideGroups output."""
+
+    # ── PD columns (accept aliases to be forgiving across search engines) ──
+    COLUMN_ALIASES = {
+        'sequence': ['Sequence', 'Annotated Sequence', 'Peptide Sequence'],
+        'modifications': ['Modifications', 'Modification'],
+        'confidence': ['Confidence'],
+        'master_protein_accessions': [
+            'Master Protein Accessions', 'Protein Accessions', 'Accessions', 'Accession'
+        ],
+        'protein_groups': ['# Protein Groups', 'Protein Groups', '#Protein Groups'],
+        'psms': ['# PSMs', 'PSMs', 'PSM Count', '#PSM'],
+        'missed_cleavages': ['# Missed Cleavages', 'Missed Cleavages'],
+        'theo_mh': ['Theo. MH+ [Da]', 'Theo MH+ [Da]', 'Theo. MH+', 'Theo MH+'],
+        'sequence_length': ['Sequence Length', 'Length'],
+        'charge': ['Charge (by Search Engine): Sequest HT', 'Charge'],
+        'mz': ['m/z [Da] (by Search Engine): Sequest HT', 'm/z [Da]', 'm/z', 'Precursor m/z', 'Precursor m/z [Da]'],
+        'rt_search': ['RT [min] (by Search Engine): Sequest HT', 'RT [min]', 'RT (min)', 'RT'],
+        'xcorr': ['XCorr (by Search Engine): Sequest HT', 'XCorr'],
+        'pep': ['Qvality PEP', 'PEP', 'Posterior Error Probability'],
+        'qvalue': ['Qvality q-value', 'q-value', 'Q-value', 'FDR q-value'],
+        'top_apex_rt': ['Top Apex RT [min]', 'Top Apex RT', 'Apex RT [min]', 'Apex RT'],
+    }
+
+    REQUIRED_KEYS = [
+        'sequence',
+        'modifications',
+        'confidence',
+        'master_protein_accessions',
+        'protein_groups',
+        'psms',
+        'missed_cleavages',
+        'theo_mh',
+        'sequence_length',
+        'charge',
+        'mz',
+        'rt_search',
+        'pep',
+        'qvalue',
+        'top_apex_rt',
+    ]
+
+    # ── window setup ──────────────────────────────────────────────────────
+    win = tk.Toplevel(root)
+    win.title("PRM Inclusion List Generator")
+    win.geometry("1150x780")
+    win.minsize(900, 650)
+
+    # Make the window resizable
+    win.rowconfigure(0, weight=1)
+    win.columnconfigure(0, weight=1)
+
+    outer = ttk.Frame(win)
+    outer.pack(fill='both', expand=True)
+    outer.rowconfigure(1, weight=1)          # results area expands
+    outer.columnconfigure(0, weight=1)
+
+    # ── top area: file selection + filters ─────────────────────────────────
+    top_frame = ttk.Frame(outer)
+    top_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=(10, 0))
+    top_frame.columnconfigure(0, weight=1)
+
+    # -- row 0: PD file input --
+    file_frame = ttk.LabelFrame(top_frame, text="Proteome Discoverer Input")
+    file_frame.grid(row=0, column=0, sticky='ew', pady=(0, 5))
+    file_frame.columnconfigure(1, weight=1)
+
+    ttk.Label(file_frame, text="PeptideGroups File:").grid(row=0, column=0, sticky='w', padx=5, pady=4)
+    pd_file_var = tk.StringVar()
+    pd_file_entry = ttk.Entry(file_frame, textvariable=pd_file_var, width=60)
+    pd_file_entry.grid(row=0, column=1, sticky='ew', padx=5, pady=4)
+    ToolTip(pd_file_entry,
+            "Proteome Discoverer PeptideGroups Excel export (.xlsx/.xls).\n\n"
+            "Required columns (matched case-insensitively):\n"
+            "  \u2022 Sequence  (or 'Annotated Sequence', 'Peptide Sequence')\n"
+            "  \u2022 Modifications  (or 'Modification')\n"
+            "  \u2022 Confidence\n"
+            "  \u2022 Master Protein Accessions  (or 'Protein Accessions', 'Accession')\n"
+            "  \u2022 # Protein Groups  (or 'Protein Groups')\n"
+            "  \u2022 # PSMs  (or 'PSMs', 'PSM Count')\n"
+            "  \u2022 # Missed Cleavages  (or 'Missed Cleavages')\n"
+            "  \u2022 Theo. MH+ [Da]  (or 'Theo MH+', 'Theo. MH+')\n"
+            "  \u2022 Sequence Length  (or 'Length')\n"
+            "  \u2022 Charge  (or 'Charge (by Search Engine): Sequest HT')\n"
+            "  \u2022 m/z [Da]  (or 'm/z', 'Precursor m/z [Da]')\n"
+            "  \u2022 RT [min] (by Search Engine): Sequest HT  (or 'RT [min]')\n"
+            "  \u2022 Qvality PEP  (or 'PEP', 'Posterior Error Probability')\n"
+            "  \u2022 Qvality q-value  (or 'q-value', 'Q-value')\n"
+            "  \u2022 Top Apex RT [min]  (or 'Apex RT [min]', 'Apex RT')\n\n"
+            "Optional but recommended:\n"
+            "  \u2022 XCorr  (enables XCorr-based filtering and ranking)")
+
+    def _green_rounded_button(parent, text, command):
+        return RoundedCanvasButton(
+            parent,
+            text=text,
+            bg='#2e7d32',
+            fg='white',
+            hover_bg='#388e3c',
+            font=('Segoe UI', 10, 'bold'),
+            corner_radius=8,
+            height=34,
+            command=command,
+        )
+
+    def _refresh_sheet_names(file_path):
+        file_path = (file_path or '').strip()
+        if not file_path or not os.path.isfile(file_path):
+            return
+        try:
+            xl = pd.ExcelFile(file_path)
+            sheet_names = list(xl.sheet_names)
+        except Exception:
+            return
+
+        sheet_combo['values'] = sheet_names
+        current_sheet = sheet_var.get().strip()
+        if current_sheet in sheet_names:
+            sheet_var.set(current_sheet)
+        elif 'PeptideGroups' in sheet_names:
+            sheet_var.set('PeptideGroups')
+        elif sheet_names:
+            sheet_var.set(sheet_names[0])
+
+    def _browse_pd_file():
+        fp = filedialog.askopenfilename(
+            title="Select Proteome Discoverer PeptideGroups File",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        )
+        if fp:
+            pd_file_var.set(fp)
+            _refresh_sheet_names(fp)
+            _validate_pd_input(show_popup=True)
+
+    ttk.Button(file_frame, text="Browse", command=_browse_pd_file).grid(row=0, column=2, padx=5, pady=4)
+
+    ttk.Label(file_frame, text="Sheet Name:").grid(row=0, column=3, sticky='w', padx=(10, 2), pady=4)
+    sheet_var = tk.StringVar(value="PeptideGroups")
+    sheet_combo = ttk.Combobox(file_frame, textvariable=sheet_var, state='readonly', width=22)
+    sheet_combo['values'] = ["PeptideGroups"]
+    sheet_combo.grid(row=0, column=4, padx=5, pady=4)
+    ToolTip(
+        sheet_combo,
+        "Flexible headers are accepted (e.g., 'Charge' for charge state).\n"
+        "XCorr is optional; if missing, XCorr filtering/ranking is skipped/fallback."
+    )
+    pd_file_entry.bind('<FocusOut>', lambda _e: _refresh_sheet_names(pd_file_var.get()))
+    pd_file_entry.bind('<Return>', lambda _e: _refresh_sheet_names(pd_file_var.get()))
+    sheet_combo.bind('<<ComboboxSelected>>', lambda _e: _validate_pd_input(show_popup=True))
+
+    # -- row 1: two‐column filters ----------------------------------------
+    filt_outer = ttk.LabelFrame(top_frame, text="Filters & Options")
+    filt_outer.grid(row=1, column=0, sticky='ew', pady=5)
+    filt_outer.columnconfigure(0, weight=1)
+    filt_outer.columnconfigure(1, weight=0)     # separator
+    filt_outer.columnconfigure(2, weight=1)
+
+    # ---- LEFT column of filters ----
+    left_filt = ttk.Frame(filt_outer)
+    left_filt.grid(row=0, column=0, sticky='nsew', padx=5, pady=2)
+    left_filt.columnconfigure(1, weight=1)
+
+    r = 0
+    ttk.Label(left_filt, text="Protein Accessions:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    accessions_var = tk.StringVar()
+    ttk.Entry(left_filt, textvariable=accessions_var, width=30).grid(row=r, column=1, columnspan=2, sticky='ew', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(left_filt, text="(comma-separated, leave blank for all)").grid(row=r, column=1, columnspan=2, sticky='w', padx=2, pady=0)
+
+    r += 1
+    ttk.Label(left_filt, text="Or upload FASTA:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    fasta_var = tk.StringVar()
+    fasta_entry = ttk.Entry(left_filt, textvariable=fasta_var, width=25)
+    fasta_entry.grid(row=r, column=1, sticky='ew', padx=2, pady=2)
+
+    def _browse_fasta():
+        fp = filedialog.askopenfilename(
+            title="Select FASTA File",
+            filetypes=[("FASTA files", "*.fasta *.fa *.faa"), ("All files", "*.*")]
+        )
+        if fp:
+            fasta_var.set(fp)
+
+    ttk.Button(left_filt, text="Browse", command=_browse_fasta).grid(row=r, column=2, padx=2, pady=2)
+
+    r += 1
+    ttk.Label(left_filt, text="Max Peptides / Protein:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    pep_per_prot_var = tk.StringVar(value="5")
+    ttk.Entry(left_filt, textvariable=pep_per_prot_var, width=8).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(left_filt, text="Total Peptide Limit:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    total_limit_var = tk.StringVar(value="")
+    total_limit_frame = ttk.Frame(left_filt)
+    total_limit_frame.grid(row=r, column=1, columnspan=2, sticky='w', padx=2, pady=2)
+    ttk.Entry(total_limit_frame, textvariable=total_limit_var, width=8).pack(side='left')
+    ttk.Label(total_limit_frame, text=" (blank = no limit)").pack(side='left', padx=(4, 0))
+
+    r += 1
+    ttk.Label(left_filt, text="Min Peptide Length:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    min_len_var = tk.StringVar(value="7")
+    ttk.Entry(left_filt, textvariable=min_len_var, width=8).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(left_filt, text="Max Peptide Length:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    max_len_var = tk.StringVar(value="25")
+    ttk.Entry(left_filt, textvariable=max_len_var, width=8).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(left_filt, text="Max Missed Cleavages:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    max_mc_var = tk.StringVar(value="0")
+    ttk.Entry(left_filt, textvariable=max_mc_var, width=8).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    # vertical separator
+    ttk.Separator(filt_outer, orient='vertical').grid(row=0, column=1, sticky='ns', padx=5)
+
+    # ---- RIGHT column of filters ----
+    right_filt = ttk.Frame(filt_outer)
+    right_filt.grid(row=0, column=2, sticky='nsew', padx=5, pady=2)
+    right_filt.columnconfigure(1, weight=1)
+
+    r = 0
+    ttk.Label(right_filt, text="Confidence Level:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    confidence_var = tk.StringVar(value="High")
+    ttk.Combobox(right_filt, textvariable=confidence_var, values=["High", "Medium", "Low", "Any"],
+                 state='readonly', width=10).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(right_filt, text="Charges to Include:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    charge_frame = ttk.Frame(right_filt)
+    charge_frame.grid(row=r, column=1, columnspan=2, sticky='w', padx=2, pady=2)
+    charge_vars = {}
+    for z_val in [2, 3, 4, 5]:
+        v = tk.BooleanVar(value=(z_val in (2, 3)))
+        charge_vars[z_val] = v
+        ttk.Checkbutton(charge_frame, text=f"{z_val}+", variable=v).pack(side='left', padx=3)
+
+    r += 1
+    ttk.Label(right_filt, text="m/z Range:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    mz_range_frame = ttk.Frame(right_filt)
+    mz_range_frame.grid(row=r, column=1, columnspan=2, sticky='w', padx=2, pady=2)
+    mz_min_var = tk.StringVar(value="350")
+    mz_max_var = tk.StringVar(value="1400")
+    ttk.Entry(mz_range_frame, textvariable=mz_min_var, width=8).pack(side='left')
+    ttk.Label(mz_range_frame, text=" - ").pack(side='left')
+    ttk.Entry(mz_range_frame, textvariable=mz_max_var, width=8).pack(side='left')
+
+    r += 1
+    ttk.Label(right_filt, text="RT Window (min):").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    rt_window_var = tk.StringVar(value="10")
+    rt_window_frame = ttk.Frame(right_filt)
+    rt_window_frame.grid(row=r, column=1, columnspan=2, sticky='w', padx=2, pady=2)
+    ttk.Entry(rt_window_frame, textvariable=rt_window_var, width=8).pack(side='left')
+    ttk.Label(rt_window_frame, text=" (+/- around apex RT)").pack(side='left', padx=(4, 0))
+
+    r += 1
+    ttk.Label(right_filt, text="Min # PSMs:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    min_psms_var = tk.StringVar(value="1")
+    ttk.Entry(right_filt, textvariable=min_psms_var, width=8).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(right_filt, text="Min XCorr:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    min_xcorr_var = tk.StringVar(value="2.0")
+    ttk.Entry(right_filt, textvariable=min_xcorr_var, width=8).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(right_filt, text="Max q-value:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    max_qval_var = tk.StringVar(value="0.01")
+    ttk.Entry(right_filt, textvariable=max_qval_var, width=8).grid(row=r, column=1, sticky='w', padx=2, pady=2)
+
+    r += 1
+    ttk.Label(right_filt, text="Rank Peptides By:").grid(row=r, column=0, sticky='w', padx=2, pady=2)
+    rank_var = tk.StringVar(value="XCorr")
+    ttk.Combobox(right_filt, textvariable=rank_var,
+                 values=["XCorr", "# PSMs", "Qvality PEP (ascending)"],
+                 state='readonly', width=22).grid(row=r, column=1, columnspan=2, sticky='w', padx=2, pady=2)
+
+    # ---- checkbox row below the two filter columns ----
+    chk_frame = ttk.Frame(filt_outer)
+    chk_frame.grid(row=1, column=0, columnspan=3, sticky='w', padx=5, pady=(4, 2))
+
+    unique_only_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(chk_frame, text="Unique peptides only", variable=unique_only_var).pack(side='left', padx=8)
+
+    exclude_mods_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(chk_frame, text="Exclude modified peptides", variable=exclude_mods_var).pack(side='left', padx=8)
+
+    exclude_met_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(chk_frame, text="Exclude methionine-containing peptides", variable=exclude_met_var).pack(side='left', padx=8)
+
+    # ---- PeptidePicker-inspired sequence-motif filters (second row) ----
+    chk_frame2 = ttk.Frame(filt_outer)
+    chk_frame2.grid(row=2, column=0, columnspan=3, sticky='w', padx=5, pady=(0, 2))
+
+    exclude_cys_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(chk_frame2, text="Exclude Cys (C)", variable=exclude_cys_var).pack(side='left', padx=8)
+
+    exclude_trp_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(chk_frame2, text="Exclude Trp (W)", variable=exclude_trp_var).pack(side='left', padx=8)
+
+    exclude_nterm_gln_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(chk_frame2, text="Exclude N-term Gln (Q)", variable=exclude_nterm_gln_var).pack(side='left', padx=8)
+
+    exclude_dp_dg_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(chk_frame2, text="Exclude DP/DG motifs", variable=exclude_dp_dg_var).pack(side='left', padx=8)
+
+    exclude_deamid_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(chk_frame2, text="Exclude NG/QG motifs", variable=exclude_deamid_var).pack(side='left', padx=8)
+
+    ToolTip(
+        chk_frame2,
+        "• Cys (C): oxidation & incomplete alkylation split signal\n"
+        "• Trp (W): oxidation-prone (less than Met)\n"
+        "• N-term Gln: cyclises to pyroglutamate under acidic conditions\n"
+        "• DP/DG: aspartic acid-proline (DP)/aspartic acid-glycine (DG) - acid-labile dipeptide bonds (hydrolysis)\n"
+        "• NG/QG: asparagine–glycine (NG)/glutamine–glycine (QG) - deamidation-prone at neutral/alkaline pH"
+    )
+    # ---- Chimeric Spectra Analysis section (single row) ----
+    chimeric_frame = ttk.LabelFrame(filt_outer, text="Chimeric Spectra Assessment")
+    chimeric_frame.grid(row=3, column=0, columnspan=3, sticky='ew', padx=5, pady=(4, 2))
+
+    chimeric_row = ttk.Frame(chimeric_frame)
+    chimeric_row.pack(fill='x', padx=5, pady=3)
+
+    chimeric_enabled_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(chimeric_row, text="Enable", variable=chimeric_enabled_var).pack(side='left', padx=(0, 10))
+
+    ttk.Label(chimeric_row, text="Iso. Window (m/z):").pack(side='left')
+    isolation_window_var = tk.StringVar(value="1.6")
+    ttk.Entry(chimeric_row, textvariable=isolation_window_var, width=6).pack(side='left', padx=(2, 10))
+    ToolTip(chimeric_frame, "Total isolation window width in m/z (e.g. 1.6 means ±0.8 m/z around precursor).")
+
+    ttk.Label(chimeric_row, text="Frag. Tol (ppm):").pack(side='left')
+    chimeric_frag_tol_var = tk.StringVar(value="20")
+    ttk.Entry(chimeric_row, textvariable=chimeric_frag_tol_var, width=6).pack(side='left', padx=(2, 10))
+
+    ttk.Label(chimeric_row, text="Charges:").pack(side='left')
+    frag_charge_vars = {}
+    for fz in [1, 2, 3]:
+        v = tk.BooleanVar(value=True if fz == 1 else False)
+        frag_charge_vars[fz] = v
+        ttk.Checkbutton(chimeric_row, text=f"{fz}+", variable=v).pack(side='left', padx=2)
+
+    ttk.Label(chimeric_row, text="Fragmentation:").pack(side='left', padx=(10, 0))
+    chimeric_frag_type_var = tk.StringVar(value="HCD")
+    ttk.Combobox(chimeric_row, textvariable=chimeric_frag_type_var,
+                 values=["HCD", "CID", "ETD", "EThcD"],
+                 state='readonly', width=7).pack(side='left', padx=2)
+
+    # ---- Generate button row ----
+    gen_frame = ttk.Frame(top_frame)
+    gen_frame.grid(row=4, column=0, sticky='ew', pady=5)
+    gen_frame.columnconfigure(0, weight=1)
+    gen_frame.columnconfigure(1, weight=0)
+
+    status_var = tk.StringVar(value="")
+    status_label = ttk.Label(gen_frame, textvariable=status_var, foreground='gray')
+    status_label.grid(row=0, column=0, sticky='w', padx=10)
+
+    resolved_cols = {}
+    cached_pd_df = None
+    cached_pd_signature = None
+
+    def _normalize_col_name(name):
+        return re.sub(r'[^a-z0-9]+', '', str(name).lower())
+
+    def _resolve_pd_columns(df_local):
+        col_map = {}
+        available_cols = list(df_local.columns)
+        available_norm = {_normalize_col_name(c): c for c in available_cols}
+
+        for key, aliases in COLUMN_ALIASES.items():
+            match = None
+
+            # 1) exact case-insensitive alias match
+            for alias in aliases:
+                for actual in available_cols:
+                    if str(actual).strip().lower() == str(alias).strip().lower():
+                        match = actual
+                        break
+                if match is not None:
+                    break
+
+            # 2) normalized fallback match
+            if match is None:
+                for alias in aliases:
+                    norm_alias = _normalize_col_name(alias)
+                    if norm_alias in available_norm:
+                        match = available_norm[norm_alias]
+                        break
+
+            if match is not None:
+                col_map[key] = match
+
+        missing_required = [k for k in REQUIRED_KEYS if k not in col_map]
+        return col_map, missing_required
+
+    def _build_pd_signature(file_path, sheet_name):
+        file_path = os.path.abspath(file_path)
+        try:
+            mtime = os.path.getmtime(file_path)
+        except Exception:
+            mtime = None
+        return (file_path, sheet_name, mtime)
+
+    def _validate_pd_input(show_popup=False):
+        """Validate selected PD workbook + sheet and required columns; return dataframe on success."""
+        nonlocal resolved_cols, cached_pd_df, cached_pd_signature
+        pd_file = pd_file_var.get().strip()
+        if not pd_file or not os.path.isfile(pd_file):
+            status_var.set("Select a valid Proteome Discoverer Excel file.")
+            if show_popup:
+                messagebox.showwarning("Input Error", "Please select a valid Proteome Discoverer PeptideGroups Excel file.", parent=win)
+            return None
+
+        sheet_name = sheet_var.get().strip()
+        if not sheet_name:
+            status_var.set("Select a worksheet.")
+            if show_popup:
+                messagebox.showwarning("Input Error", "Please select a worksheet.", parent=win)
+            return None
+
+        signature = _build_pd_signature(pd_file, sheet_name)
+        if cached_pd_df is not None and cached_pd_signature == signature and resolved_cols:
+            return cached_pd_df
+
+        _refresh_sheet_names(pd_file)
+
+        try:
+            df_local = pd.read_excel(pd_file, sheet_name=sheet_name)
+        except Exception as exc:
+            status_var.set("Workbook/sheet read failed.")
+            if show_popup:
+                messagebox.showerror("File Error", f"Could not read the selected sheet:\n{exc}", parent=win)
+            return None
+
+        col_map, missing_keys = _resolve_pd_columns(df_local)
+        if missing_keys:
+            missing_text = []
+            for key in missing_keys:
+                aliases = COLUMN_ALIASES.get(key, [])
+                if aliases:
+                    missing_text.append(f"  - {aliases[0]} (or alias: {', '.join(aliases[1:3])})")
+                else:
+                    missing_text.append(f"  - {key}")
+            status_var.set("Selected sheet is missing required columns.")
+            if show_popup:
+                messagebox.showerror(
+                    "Column Error",
+                    "The selected sheet is missing required Proteome Discoverer PeptideGroups columns:\n\n" +
+                    "\n".join(missing_text),
+                    parent=win,
+                )
+            return None
+
+        resolved_cols = col_map
+        cached_pd_df = df_local
+        cached_pd_signature = signature
+
+        if 'xcorr' in resolved_cols:
+            status_var.set(f"Validated: {sheet_name} ({len(df_local)} rows)")
+        else:
+            status_var.set(f"Validated: {sheet_name} ({len(df_local)} rows) — XCorr not found (XCorr filter/ranking disabled)")
+        return df_local
+
+    def _generate_list():
+        """Read PD file, apply all filters, populate the Treeview."""
+        status_var.set("Applying filters...")
+        win.update_idletasks()
+
+        df = _validate_pd_input(show_popup=True)
+        if df is None:
+            return
+        c = resolved_cols
+
+        status_var.set(f"Loaded {len(df)} rows. Applying filters...")
+        win.update_idletasks()
+
+        # ── parse numeric filter values ──────────────────────────────────
+        try:
+            max_pep_per_prot = int(pep_per_prot_var.get())
+        except ValueError:
+            max_pep_per_prot = 999999
+        try:
+            total_limit = int(total_limit_var.get()) if total_limit_var.get().strip() else None
+        except ValueError:
+            total_limit = None
+        try:
+            min_len = int(min_len_var.get())
+        except ValueError:
+            min_len = 7
+        try:
+            max_len = int(max_len_var.get())
+        except ValueError:
+            max_len = 50
+        try:
+            max_mc = int(max_mc_var.get())
+        except ValueError:
+            max_mc = 0
+        try:
+            mz_lo = float(mz_min_var.get())
+        except ValueError:
+            mz_lo = 0.0
+        try:
+            mz_hi = float(mz_max_var.get())
+        except ValueError:
+            mz_hi = 99999.0
+        try:
+            rt_half_window = float(rt_window_var.get()) / 2.0
+        except ValueError:
+            rt_half_window = 5.0
+        try:
+            min_psms = int(min_psms_var.get())
+        except ValueError:
+            min_psms = 1
+        try:
+            min_xcorr = float(min_xcorr_var.get())
+        except ValueError:
+            min_xcorr = 0.0
+        try:
+            max_qval = float(max_qval_var.get())
+        except ValueError:
+            max_qval = 1.0
+
+        allowed_charges = {z for z, v in charge_vars.items() if v.get()}
+        if not allowed_charges:
+            messagebox.showwarning("Input Error", "Select at least one charge state.", parent=win)
+            status_var.set("")
+            return
+
+        # ── build target accession set ───────────────────────────────────
+        target_accessions = set()
+        acc_text = accessions_var.get().strip()
+        if acc_text:
+            for a in re.split(r'[,;\s]+', acc_text):
+                a = a.strip()
+                if a:
+                    target_accessions.add(a.upper())
+        fasta_path = fasta_var.get().strip()
+        if fasta_path and os.path.isfile(fasta_path):
+            try:
+                fasta_proteins = parse_fasta_file(fasta_path)
+                for acc in fasta_proteins:
+                    target_accessions.add(acc.upper())
+            except Exception as exc:
+                messagebox.showwarning("FASTA Error", f"Could not read FASTA file:\n{exc}", parent=win)
+
+        # ── apply filters ────────────────────────────────────────────────
+        filt = df.copy()
+
+        # Confidence
+        conf = confidence_var.get()
+        if conf != "Any":
+            conf_order = {"High": 3, "Medium": 2, "Low": 1}
+            min_conf = conf_order.get(conf, 1)
+            filt = filt[filt[c['confidence']].map(lambda x: conf_order.get(str(x), 0) >= min_conf)]
+
+        # Sequence length
+        filt = filt[(filt[c['sequence_length']] >= min_len) & (filt[c['sequence_length']] <= max_len)]
+
+        # Missed cleavages
+        filt = filt[filt[c['missed_cleavages']] <= max_mc]
+
+        # Charge
+        filt = filt[filt[c['charge']].isin(allowed_charges)]
+
+        # m/z range
+        filt = filt[(filt[c['mz']] >= mz_lo) &
+                     (filt[c['mz']] <= mz_hi)]
+
+        # # PSMs
+        filt = filt[filt[c['psms']] >= min_psms]
+
+        # XCorr (optional)
+        if 'xcorr' in c:
+            filt = filt[filt[c['xcorr']] >= min_xcorr]
+
+        # q-value
+        filt = filt[filt[c['qvalue']] <= max_qval]
+
+        # Unique peptides
+        if unique_only_var.get():
+            filt = filt[filt[c['protein_groups']] == 1]
+
+        # Exclude modified peptides (keep only unmodified or standard Carbamidomethyl)
+        if exclude_mods_var.get():
+            def _is_unmodified_or_cam(mod_val):
+                if pd.isna(mod_val) or str(mod_val).strip() == '':
+                    return True
+                mod_str = str(mod_val).lower()
+                # Keep Carbamidomethyl (standard alkylation, not a variable mod)
+                parts = [p.strip() for p in mod_str.split(';')]
+                return all('carbamidomethyl' in p for p in parts if p)
+            filt = filt[filt[c['modifications']].apply(_is_unmodified_or_cam)]
+
+        # Exclude methionine-containing peptides
+        if exclude_met_var.get():
+            filt = filt[~filt[c['sequence']].str.contains('M', case=True, na=False)]
+
+        # Exclude cysteine-containing peptides (oxidation / incomplete alkylation)
+        if exclude_cys_var.get():
+            filt = filt[~filt[c['sequence']].str.contains('C', case=True, na=False)]
+
+        # Exclude tryptophan-containing peptides (oxidation-prone)
+        if exclude_trp_var.get():
+            filt = filt[~filt[c['sequence']].str.contains('W', case=True, na=False)]
+
+        # Exclude peptides with N-terminal glutamine (pyroglutamate formation)
+        if exclude_nterm_gln_var.get():
+            filt = filt[~filt[c['sequence']].str.startswith('Q', na=False)]
+
+        # Exclude peptides containing DP or DG motifs (acid hydrolysis)
+        if exclude_dp_dg_var.get():
+            filt = filt[~filt[c['sequence']].str.contains('DP|DG', case=True, na=False, regex=True)]
+
+        # Exclude peptides containing NG or QG motifs (deamidation)
+        if exclude_deamid_var.get():
+            filt = filt[~filt[c['sequence']].str.contains('NG|QG', case=True, na=False, regex=True)]
+
+        # Filter by protein accessions
+        if target_accessions:
+            def _accession_match(master_acc):
+                if pd.isna(master_acc):
+                    return False
+                for acc in str(master_acc).split(';'):
+                    if acc.strip().upper() in target_accessions:
+                        return True
+                return False
+            filt = filt[filt[c['master_protein_accessions']].apply(_accession_match)]
+
+        if filt.empty:
+            messagebox.showinfo("No Results", "No peptides passed the selected filters.", parent=win)
+            status_var.set("No results.")
+            return
+
+        # ── determine RT: prefer Top Apex RT, fall back to search engine RT ─
+        filt = filt.copy()
+        filt['_rt'] = filt[c['top_apex_rt']]
+        mask_no_apex = filt['_rt'].isna()
+        filt.loc[mask_no_apex, '_rt'] = filt.loc[mask_no_apex, c['rt_search']]
+        # Drop rows with no RT at all
+        filt = filt.dropna(subset=['_rt'])
+
+        # ── rank and select best peptides per protein ────────────────────
+        rank_col = rank_var.get()
+        if rank_col == "XCorr" and 'xcorr' in c:
+            filt = filt.sort_values(c['xcorr'], ascending=False)
+        elif rank_col == "XCorr" and 'xcorr' not in c:
+            filt = filt.sort_values(c['psms'], ascending=False)
+            status_var.set("XCorr column not found; ranking by # PSMs instead.")
+        elif rank_col == "# PSMs":
+            filt = filt.sort_values(c['psms'], ascending=False)
+        elif rank_col == "Qvality PEP (ascending)":
+            filt = filt.sort_values(c['pep'], ascending=True)
+
+        # Deduplicate: keep best charge state per unique sequence
+        # (group by Sequence, keep the first = best-ranked row)
+        filt = filt.drop_duplicates(subset=[c['sequence']], keep='first')
+
+        # Select top N per protein (vectorized groupby instead of iterrows)
+        _master_col = c['master_protein_accessions']
+        _primary_acc = (
+            filt[_master_col].fillna('').astype(str)
+            .str.split(';').str[0].str.strip()
+        )
+        filt = filt[_primary_acc != ''].copy()
+        filt['_primary_acc'] = _primary_acc[_primary_acc != ''].values
+        result_df = filt.groupby('_primary_acc', sort=False).head(max_pep_per_prot).copy()
+        result_df = result_df.drop(columns=['_primary_acc'])
+
+        if result_df.empty:
+            messagebox.showinfo("No Results", "No peptides passed the per-protein limit.", parent=win)
+            status_var.set("No results.")
+            return
+
+        # Apply total limit
+        if total_limit and len(result_df) > total_limit:
+            result_df = result_df.head(total_limit)
+
+        # ── build output table data (vectorized) ─────────────────────────
+        _t_seqs = result_df[c['sequence']].values
+        _t_mods = result_df[c['modifications']].fillna('').astype(str).values
+        _t_masters = result_df[c['master_protein_accessions']].fillna('').astype(str).values
+        _t_mzs = np.round(result_df[c['mz']].astype(float).values, 4)
+        _t_charges = result_df[c['charge']].astype(int).values
+        _t_rts = np.round(result_df['_rt'].astype(float).values, 2)
+        _t_starts = np.maximum(np.round(_t_rts - rt_half_window, 2), 0.0)
+        _t_stops = np.round(_t_rts + rt_half_window, 2)
+        _has_xcorr = 'xcorr' in c
+        _t_xcorrs = result_df[c['xcorr']].values if _has_xcorr else [None] * len(result_df)
+        _t_psms = result_df[c['psms']].astype(int).values
+        _t_lens = result_df[c['sequence_length']].astype(int).values
+
+        table_data = []
+        for seq, mods, master, mz_val, charge, rt_apex, t_start, t_stop, xcorr_val, n_psms, seq_len in zip(
+            _t_seqs, _t_mods, _t_masters, _t_mzs, _t_charges,
+            _t_rts, _t_starts, _t_stops, _t_xcorrs, _t_psms, _t_lens
+        ):
+            primary_acc = str(master).split(';')[0].strip()
+            xcorr = round(float(xcorr_val), 2) if _has_xcorr and pd.notna(xcorr_val) else ''
+            table_data.append({
+                'Protein': primary_acc,
+                'Sequence': seq,
+                'Modifications': str(mods),
+                'Length': int(seq_len),
+                'm/z': float(mz_val),
+                'z': int(charge),
+                'RT (min)': float(rt_apex),
+                't start (min)': float(t_start),
+                't stop (min)': float(t_stop),
+                'XCorr': xcorr,
+                '# PSMs': int(n_psms),
+                'Co-eluting': '',
+                'Shared Fragments': '',
+                'Chimeric Risk': '',
+            })
+
+        # ── Chimeric spectra analysis ────────────────────────────────────
+        if chimeric_enabled_var.get() and len(table_data) > 1:
+            status_var.set("Analyzing chimeric risk (predicting spectra)...")
+            win.update_idletasks()
+
+            try:
+                _iso_window = float(isolation_window_var.get())
+            except ValueError:
+                _iso_window = 1.6
+            _iso_half = _iso_window / 2.0
+
+            try:
+                _chim_frag_tol = float(chimeric_frag_tol_var.get())
+            except ValueError:
+                _chim_frag_tol = 20.0
+
+            _frag_charges = sorted(fz for fz, v in frag_charge_vars.items() if v.get())
+            if not _frag_charges:
+                _frag_charges = [1, 2, 3]
+
+            _chim_frag_type = chimeric_frag_type_var.get()
+
+            # ── Build per-peptide fragment sets ──────────────────────────
+            # Strategy: use MS2PIP predicted spectra when available so that
+            # only fragments predicted to be *intense* (≥5% relative) are
+            # considered.  This avoids inflated shared-fragment counts from
+            # faint theoretical ions that would never be observed.
+            _PRED_INTENSITY_THRESHOLD = 0.05  # 5% of max in predicted spectrum
+
+            _use_ms2pip = False
+            _ms2pip_preds = {}
+            _ensure_ms2pip()
+            if not HAS_MS2PIP:
+                logging.info("Chimeric assessment: MS2PIP unavailable; using theoretical ions.")
+            elif _chim_frag_type not in _MS2PIP_SUPPORTED_FRAG_TYPES:
+                logging.warning(
+                    f"Chimeric assessment: MS2PIP does not support '{_chim_frag_type}' fragmentation; "
+                    f"using theoretical ions. Supported types: "
+                    f"{', '.join(sorted(_MS2PIP_SUPPORTED_FRAG_TYPES))}."
+                )
+            else:
+                try:
+                    _pep_infos = [
+                        (td['Sequence'], td['m/z'], td['z'], td['Modifications'])
+                        for td in table_data
+                    ]
+                    _ms2pip_preds = ms2pip_predict_all_peptides(
+                        _pep_infos, fragmentation_type=_chim_frag_type)
+                    if _ms2pip_preds and any(_ms2pip_preds.values()):
+                        _use_ms2pip = True
+                except Exception as exc:
+                    logging.warning(f"MS2PIP chimeric prediction failed: {exc}")
+
+            _all_pep_frags = []  # list of sets of (rounded m/z)
+            for i, td in enumerate(table_data):
+                seq = td['Sequence']
+                mods = td['Modifications']
+                charge_i = td['z']
+
+                if _use_ms2pip and i in _ms2pip_preds and _ms2pip_preds[i]:
+                    # Use predicted spectrum: only fragments above threshold
+                    pred = _ms2pip_preds[i]
+                    # pred: {(ion_type, position, charge): normalised_intensity}
+                    frag_mzs = []
+                    # Reconstruct m/z from ion type/position/charge using
+                    # theoretical ion table — but only keep those whose
+                    # predicted intensity exceeds the threshold.
+                    ions = generate_theoretical_ions_cached(
+                        seq, mods, _chim_frag_type, None)
+                    for ion_type, charges_dict in ions.items():
+                        for z, mzs in charges_dict.items():
+                            if z not in _frag_charges:
+                                continue
+                            for pos, mz in enumerate(mzs, start=1):
+                                if mz is None:
+                                    continue
+                                # Check if MS2PIP predicts this fragment
+                                # as intense enough to matter
+                                pred_int = pred.get((ion_type, pos, z), 0.0)
+                                if pred_int >= _PRED_INTENSITY_THRESHOLD:
+                                    frag_mzs.append(mz)
+                else:
+                    # Fallback: all theoretical fragments (unfiltered)
+                    ions = generate_theoretical_ions_cached(
+                        seq, mods, _chim_frag_type, None)
+                    frag_mzs = []
+                    for ion_type, charges_dict in ions.items():
+                        for z, mzs in charges_dict.items():
+                            if z not in _frag_charges:
+                                continue
+                            for mz in mzs:
+                                if mz is not None:
+                                    frag_mzs.append(mz)
+
+                _all_pep_frags.append(set(round(m, 4) for m in frag_mzs))
+
+            if _use_ms2pip:
+                status_var.set("Analyzing chimeric risk (MS2PIP-guided)...")
+            else:
+                status_var.set("Analyzing chimeric risk (theoretical ions)...")
+            win.update_idletasks()
+
+            # For each peptide, find co-eluting peptides (RT window overlap +
+            # precursor within isolation window) and count shared fragments
+            for i, td_i in enumerate(table_data):
+                mz_i = td_i['m/z']
+                rt_start_i = td_i['t start (min)']
+                rt_stop_i = td_i['t stop (min)']
+                frags_i = _all_pep_frags[i]
+
+                coeluting_names = []
+                total_shared = 0
+
+                for j, td_j in enumerate(table_data):
+                    if i == j:
+                        continue
+                    mz_j = td_j['m/z']
+                    rt_start_j = td_j['t start (min)']
+                    rt_stop_j = td_j['t stop (min)']
+
+                    # Check RT overlap (co-elution)
+                    if rt_stop_i < rt_start_j or rt_stop_j < rt_start_i:
+                        continue
+
+                    # Check if precursor j falls within isolation window of i
+                    if abs(mz_j - mz_i) > _iso_half:
+                        continue
+
+                    # Count shared fragments (within tolerance)
+                    frags_j = _all_pep_frags[j]
+                    shared_count = 0
+                    for mz_fi in frags_i:
+                        tol_da = mz_fi * _chim_frag_tol / 1e6
+                        for mz_fj in frags_j:
+                            if abs(mz_fi - mz_fj) <= tol_da:
+                                shared_count += 1
+                                break
+
+                    if shared_count > 0:
+                        coeluting_names.append(td_j['Sequence'])
+                        total_shared += shared_count
+
+                n_coeluting = len(coeluting_names)
+                td_i['Co-eluting'] = n_coeluting
+                td_i['Shared Fragments'] = total_shared
+
+                # Risk classification
+                if n_coeluting == 0:
+                    td_i['Chimeric Risk'] = 'None'
+                elif total_shared <= 2:
+                    td_i['Chimeric Risk'] = 'Low'
+                elif total_shared <= 5:
+                    td_i['Chimeric Risk'] = 'Medium'
+                else:
+                    td_i['Chimeric Risk'] = 'High'
+
+        # ── populate the Treeview ────────────────────────────────────────
+        # Clear existing rows
+        for item in tree.get_children():
+            tree.delete(item)
+
+        for td in table_data:
+            tree.insert('', 'end', values=(
+                td['Protein'], td['Sequence'], td['Modifications'], td['Length'],
+                td['m/z'], td['z'], td['RT (min)'],
+                td['t start (min)'], td['t stop (min)'],
+                td['XCorr'], td['# PSMs'],
+                td.get('Co-eluting', ''), td.get('Shared Fragments', ''),
+                td.get('Chimeric Risk', ''),
+            ))
+
+        n_proteins = len(set(d['Protein'] for d in table_data))
+        _chimeric_high = sum(1 for d in table_data if d.get('Chimeric Risk') == 'High')
+        _chimeric_msg = f" | {_chimeric_high} high chimeric risk" if chimeric_enabled_var.get() else ""
+        status_var.set(f"Generated {len(table_data)} entries from {n_proteins} proteins.{_chimeric_msg}")
+
+        # Store on window for export
+        win._inclusion_table_data = table_data
+
+    generate_btn = _green_rounded_button(gen_frame, "Generate Inclusion List", _generate_list)
+    generate_btn.grid(row=0, column=1, sticky='e', padx=10)
+
+    # ── bottom area: results Treeview + export ────────────────────────────
+    results_frame = ttk.LabelFrame(outer, text="Inclusion List Preview  (select rows and press Delete to remove)")
+    results_frame.grid(row=1, column=0, sticky='nsew', padx=10, pady=5)
+    results_frame.rowconfigure(0, weight=1)
+    results_frame.columnconfigure(0, weight=1)
+
+    tree_cols = ('Protein', 'Sequence', 'Modifications', 'Length', 'm/z', 'z',
+                 'RT (min)', 't start (min)', 't stop (min)', 'XCorr', '# PSMs',
+                 'Co-eluting', 'Shared Fragments', 'Chimeric Risk')
+
+    tree = ttk.Treeview(results_frame, columns=tree_cols, show='headings', selectmode='extended')
+
+    col_widths = {
+        'Protein': 100, 'Sequence': 190, 'Modifications': 160, 'Length': 55,
+        'm/z': 85, 'z': 40, 'RT (min)': 70,
+        't start (min)': 80, 't stop (min)': 80,
+        'XCorr': 60, '# PSMs': 60,
+        'Co-eluting': 75, 'Shared Fragments': 85, 'Chimeric Risk': 90,
+    }
+
+    sort_state = {'column': None, 'descending': False}
+
+    def _is_numeric_column(values):
+        non_empty = [str(v).strip() for v in values if str(v).strip() != '']
+        if not non_empty:
+            return False
+        for v in non_empty:
+            try:
+                float(v)
+            except Exception:
+                return False
+        return True
+
+    def _sort_treeview(col_name):
+        rows = [(tree.set(item, col_name), item) for item in tree.get_children('')]
+        if not rows:
+            return
+
+        descending = False
+        if sort_state['column'] == col_name:
+            descending = not sort_state['descending']
+
+        col_values = [value for value, _ in rows]
+        numeric_col = _is_numeric_column(col_values)
+
+        if numeric_col:
+            sorted_rows = sorted(
+                rows,
+                key=lambda x: float(str(x[0]).strip()) if str(x[0]).strip() != '' else float('inf'),
+                reverse=descending,
+            )
+        else:
+            sorted_rows = sorted(rows, key=lambda x: str(x[0]).lower(), reverse=descending)
+
+        for idx, (_, item) in enumerate(sorted_rows):
+            tree.move(item, '', idx)
+
+        sort_state['column'] = col_name
+        sort_state['descending'] = descending
+
+        for c in tree_cols:
+            label = c
+            if c == col_name:
+                label = f"{c} {'▼' if descending else '▲'}"
+            tree.heading(c, text=label, command=lambda _c=c: _sort_treeview(_c))
+
+    for col in tree_cols:
+        tree.heading(col, text=col, command=lambda _c=col: _sort_treeview(_c))
+        tree.column(col, width=col_widths.get(col, 80), minwidth=40)
+
+    tree.grid(row=0, column=0, sticky='nsew')
+
+    vsb = ttk.Scrollbar(results_frame, orient='vertical', command=tree.yview)
+    vsb.grid(row=0, column=1, sticky='ns')
+    hsb = ttk.Scrollbar(results_frame, orient='horizontal', command=tree.xview)
+    hsb.grid(row=1, column=0, sticky='ew')
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+    # ── keyboard delete ──────────────────────────────────────────────────
+    def _delete_selected(event=None):
+        selected = tree.selection()
+        if not selected:
+            return
+        for item in selected:
+            tree.delete(item)
+        # Update count
+        remaining = len(tree.get_children())
+        proteins_left = len(set(tree.item(i)['values'][0] for i in tree.get_children()))
+        status_var.set(f"{remaining} entries from {proteins_left} proteins remaining.")
+
+    tree.bind('<Delete>', _delete_selected)
+    tree.bind('<BackSpace>', _delete_selected)
+
+    # ── export buttons ───────────────────────────────────────────────────
+    export_frame = ttk.Frame(outer)
+    export_frame.grid(row=2, column=0, sticky='ew', padx=10, pady=(0, 10))
+
+    def _export_csv():
+        """Export the current Treeview contents as an instrument-ready CSV."""
+        items = tree.get_children()
+        if not items:
+            messagebox.showwarning("No Data", "Nothing to export. Generate an inclusion list first.", parent=win)
+            return
+
+        fp = filedialog.asksaveasfilename(
+            title="Export Inclusion List",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=win,
+        )
+        if not fp:
+            return
+
+        try:
+            with open(fp, 'w', newline='') as f:
+                f.write("Compound,Formula,Adduct,m/z,z,t start (min),t stop (min)\n")
+                for item in items:
+                    vals = tree.item(item)['values']
+                    # vals: Protein, Sequence, Modifications, Length, m/z, z, RT, t_start, t_stop, XCorr, #PSMs
+                    seq = vals[1]
+                    mz = vals[4]
+                    z = vals[5]
+                    t_start = vals[7]
+                    t_stop = vals[8]
+                    f.write(f"{seq},,(no adduct),{mz},{z},{t_start},{t_stop}\n")
+            messagebox.showinfo("Export Complete", f"Inclusion list exported to:\n{fp}", parent=win)
+        except Exception as exc:
+            messagebox.showerror("Export Error", f"Could not export file:\n{exc}", parent=win)
+
+    def _export_full_csv():
+        """Export the full table (all columns) for record-keeping."""
+        items = tree.get_children()
+        if not items:
+            messagebox.showwarning("No Data", "Nothing to export. Generate an inclusion list first.", parent=win)
+            return
+
+        fp = filedialog.asksaveasfilename(
+            title="Export Full Table",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=win,
+        )
+        if not fp:
+            return
+
+        try:
+            with open(fp, 'w', newline='') as f:
+                f.write(','.join(tree_cols) + '\n')
+                for item in items:
+                    vals = tree.item(item)['values']
+                    # Quote fields that may contain commas
+                    row_parts = []
+                    for v in vals:
+                        s = str(v)
+                        if ',' in s or '"' in s:
+                            s = '"' + s.replace('"', '""') + '"'
+                        row_parts.append(s)
+                    f.write(','.join(row_parts) + '\n')
+            messagebox.showinfo("Export Complete", f"Full table exported to:\n{fp}", parent=win)
+        except Exception as exc:
+            messagebox.showerror("Export Error", f"Could not export file:\n{exc}", parent=win)
+
+    ttk.Button(export_frame, text="Export Instrument CSV", command=_export_csv).pack(side='right', padx=5)
+    ttk.Button(export_frame, text="Export Full Table", command=_export_full_csv).pack(side='right', padx=5)
+    ttk.Button(export_frame, text="Delete Selected Rows", command=_delete_selected).pack(side='left', padx=5)
+
+    count_label = ttk.Label(export_frame, text="")
+    count_label.pack(side='left', padx=15)
+
+    
+def open_rt_predictor():
+    """
+    Retention-time predictor with multiple algorithm options:
+
+        - HistGradientBoosting / GradientBoosting:
+      sklearn-based models using ~150 hand-crafted physicochemical features.
+    - DeepLC (transfer learning):  deep-learning CNN from the DeepLC package.
+      Uses pre-trained weights and calibrates (transfer-learns) on user data
+      for state-of-the-art accuracy.
+
+    Training data  : Proteome Discoverer PeptideGroups Excel file (same
+                     format / column-alias logic as the Inclusion List tool).
+    Prediction data: CSV or XLSX with at least a 'Sequence' column (plus
+                     optional 'Modifications' and 'Charge').
+    """
+    from sklearn.ensemble import (
+        HistGradientBoostingRegressor,
+        GradientBoostingRegressor,
+    )
+    from sklearn.model_selection import cross_val_score, cross_val_predict
+    from sklearn.metrics import mean_absolute_error, r2_score, median_absolute_error
+    from sklearn.preprocessing import StandardScaler
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    # ── DeepLC availability check ─────────────────────────────────────────
+    _DEEPLC_AVAILABLE = False
+    try:
+        from deeplc import DeepLC as _DeepLC_Class
+        _DEEPLC_AVAILABLE = True
+    except ImportError:
+        _DeepLC_Class = None
+
+    # ── amino-acid physicochemical tables ─────────────────────────────────
+    AMINO_ACIDS = list('ACDEFGHIKLMNPQRSTVWY')
+
+    KD_HYDRO = {                          # Kyte-Doolittle
+        'I': 4.5, 'V': 4.2, 'L': 3.8, 'F': 2.8, 'C': 2.5, 'M': 1.9,
+        'A': 1.8, 'G': -0.4, 'T': -0.7, 'S': -0.8, 'Y': -1.3,
+        'W': -0.9, 'P': -1.6, 'H': -3.2, 'E': -3.5, 'Q': -3.5,
+        'D': -3.5, 'N': -3.5, 'K': -3.9, 'R': -4.5,
+    }
+    MEEK_RC = {                           # Meek RP-HPLC retention coefficients
+        'A':  7.3, 'R': -3.6, 'N': -5.7, 'D': -2.9, 'C': -9.2,
+        'E': -7.1, 'Q': -0.3, 'G': -1.2, 'H': -2.1, 'I':  6.6,
+        'L': 20.0, 'K': -3.7, 'M':  5.6, 'F': 19.2, 'P':  5.1,
+        'S': -4.1, 'T':  0.8, 'W': 16.3, 'Y':  5.9, 'V':  3.5,
+    }
+    BULKINESS = {
+        'A': 11.50, 'R': 14.28, 'N': 12.82, 'D': 11.68, 'C': 13.46,
+        'E': 13.57, 'Q': 14.45, 'G':  3.40, 'H': 13.69, 'I': 21.40,
+        'L': 21.40, 'K': 15.71, 'M': 16.25, 'F': 19.80, 'P': 17.43,
+        'S':  9.47, 'T': 15.77, 'W': 21.67, 'Y': 18.03, 'V': 21.57,
+    }
+    # Eisenberg consensus hydrophobicity (for hydrophobic moment)
+    EISENBERG = {
+        'A':  0.62, 'R': -2.53, 'N': -0.78, 'D': -0.90, 'C':  0.29,
+        'E': -0.74, 'Q': -0.85, 'G':  0.48, 'H': -0.40, 'I':  1.38,
+        'L':  1.06, 'K': -1.50, 'M':  0.64, 'F':  1.19, 'P':  0.12,
+        'S': -0.18, 'T': -0.05, 'W':  0.81, 'Y':  0.26, 'V':  1.08,
+    }
+
+    COMMON_DIPEPTIDES = [
+        'LL', 'AL', 'LA', 'EL', 'LE', 'VL', 'LV', 'GL', 'LG',
+        'AA', 'EE', 'AE', 'EA', 'AG', 'GA', 'GG', 'KL', 'LK',
+        'EK', 'KE', 'DL', 'LD', 'VV', 'AV', 'VA', 'SL', 'LS',
+        'TL', 'LT', 'FL', 'LF', 'IL', 'LI', 'PL', 'LP',
+    ]
+
+    # ── feature engineering ───────────────────────────────────────────────
+    def _compute_features(seq, mod_str='', charge=None):
+        """Return an OrderedDict of ~150 numeric features for one peptide."""
+        seq = str(seq).upper().strip()
+        length = len(seq)
+        if length == 0:
+            return None
+
+        f = collections.OrderedDict()
+
+        # 1  peptide length
+        f['length'] = length
+        f['log_length'] = np.log1p(length)
+
+        # 2  amino-acid counts & fractions
+        aa_cnt = {aa: 0 for aa in AMINO_ACIDS}
+        for ch in seq:
+            if ch in aa_cnt:
+                aa_cnt[ch] += 1
+        for aa in AMINO_ACIDS:
+            f[f'frac_{aa}'] = aa_cnt[aa] / length
+            f[f'cnt_{aa}'] = aa_cnt[aa]
+
+        # 3  Kyte-Doolittle hydrophobicity stats
+        hv = [KD_HYDRO.get(ch, 0.0) for ch in seq]
+        f['kd_mean']  = np.mean(hv)
+        f['kd_sum']   = np.sum(hv)
+        f['kd_std']   = np.std(hv) if length > 1 else 0.0
+        f['kd_max']   = np.max(hv)
+        f['kd_min']   = np.min(hv)
+        f['kd_range'] = f['kd_max'] - f['kd_min']
+
+        # 4  Meek RP-HPLC retention coefficient
+        rc = sum(MEEK_RC.get(ch, 0.0) for ch in seq)
+        f['rc_sum']  = rc
+        f['rc_mean'] = rc / length
+
+        # 5  bulkiness
+        bv = [BULKINESS.get(ch, 0.0) for ch in seq]
+        f['bulk_mean'] = np.mean(bv)
+        f['bulk_sum']  = np.sum(bv)
+
+        # 6  N/C-terminal AA identity (one-hot)
+        for aa in AMINO_ACIDS:
+            f[f'nt_{aa}'] = 1.0 if seq[0]  == aa else 0.0
+            f[f'ct_{aa}'] = 1.0 if seq[-1] == aa else 0.0
+
+        # 7  residue-class counts
+        f['n_basic']     = sum(1 for ch in seq if ch in 'KRH')
+        f['n_acidic']    = sum(1 for ch in seq if ch in 'DE')
+        f['n_aromatic']  = sum(1 for ch in seq if ch in 'FWY')
+        f['n_aliphatic'] = sum(1 for ch in seq if ch in 'ILV')
+        f['n_polar']     = sum(1 for ch in seq if ch in 'STNQ')
+        f['n_small']     = sum(1 for ch in seq if ch in 'AGS')
+        f['n_proline']   = aa_cnt.get('P', 0)
+
+        # 8  approx. net charge at pH 2 (all basic + N-term protonated)
+        f['charge_ph2'] = (
+            aa_cnt.get('K', 0) + aa_cnt.get('R', 0) + aa_cnt.get('H', 0) + 1
+        )
+
+        # 9  position-weighted hydrophobicity (first/last 3 residues)
+        for i, tag in enumerate(['h1', 'h2', 'h3']):
+            f[tag] = KD_HYDRO.get(seq[i], 0.0) if i < length else 0.0
+        for i, tag in enumerate(['hm3', 'hm2', 'hm1']):
+            idx = length - 3 + i
+            f[tag] = KD_HYDRO.get(seq[idx], 0.0) if 0 <= idx < length else 0.0
+
+        # 10  amphipathicity proxy
+        if length >= 4:
+            ev = [KD_HYDRO.get(seq[i], 0.0) for i in range(0, length, 2)]
+            ov = [KD_HYDRO.get(seq[i], 0.0) for i in range(1, length, 2)]
+            f['amphi'] = abs(np.mean(ev) - np.mean(ov))
+        else:
+            f['amphi'] = 0.0
+
+        # 11  hydrophobic moment (Eisenberg, alpha-helix 3.6 periodicity)
+        if length >= 4:
+            cs = [EISENBERG.get(seq[i], 0.0) * np.cos(2 * np.pi * i / 3.6) for i in range(length)]
+            sn = [EISENBERG.get(seq[i], 0.0) * np.sin(2 * np.pi * i / 3.6) for i in range(length)]
+            f['hmoment'] = np.sqrt(np.mean(cs)**2 + np.mean(sn)**2)
+        else:
+            f['hmoment'] = 0.0
+
+        # 12  sequence complexity
+        f['complexity'] = len(set(seq)) / length
+
+        # 13  modification flags
+        mod_str = str(mod_str) if pd.notna(mod_str) else ''
+        ml = mod_str.lower()
+        f['mod_ox']     = 1.0 if 'oxidation'        in ml else 0.0
+        f['mod_phos']   = 1.0 if 'phospho'          in ml else 0.0
+        f['mod_ac']     = 1.0 if 'acetyl'            in ml else 0.0
+        f['mod_deam']   = 1.0 if 'deamid'            in ml else 0.0
+        f['mod_cam']    = 1.0 if 'carbamidomethyl'   in ml else 0.0
+        f['mod_met']    = 1.0 if 'methyl' in ml and 'carbamidomethyl' not in ml else 0.0
+        f['n_mods']     = len([p for p in mod_str.split(';') if p.strip()]) if mod_str.strip() else 0
+
+        # 14  charge (if available)
+        if charge is not None:
+            try:
+                charge = float(charge)
+            except (ValueError, TypeError):
+                charge = np.nan
+        else:
+            charge = np.nan
+        f['charge'] = charge if not np.isnan(charge) else 0.0
+        f['has_charge'] = 0.0 if np.isnan(charge) else 1.0
+
+        # 15  common dipeptide frequencies
+        dp_cnt = {}
+        for i in range(length - 1):
+            dp = seq[i:i + 2]
+            dp_cnt[dp] = dp_cnt.get(dp, 0) + 1
+        nd = max(length - 1, 1)
+        for dp in COMMON_DIPEPTIDES:
+            f[f'dp_{dp}'] = dp_cnt.get(dp, 0) / nd
+
+        # 16  sliding-window (5-AA) max / min hydrophobicity
+        if length >= 5:
+            win_means = [np.mean(hv[i:i + 5]) for i in range(length - 4)]
+            f['kd_win5_max'] = max(win_means)
+            f['kd_win5_min'] = min(win_means)
+        else:
+            f['kd_win5_max'] = f['kd_mean']
+            f['kd_win5_min'] = f['kd_mean']
+
+        # 17  aliphatic index (weighted)
+        f['aliph_idx'] = (
+            aa_cnt.get('A', 0)
+            + 2.9 * aa_cnt.get('V', 0)
+            + 3.9 * (aa_cnt.get('I', 0) + aa_cnt.get('L', 0))
+        ) / length * 100
+
+        return f
+
+    def _features_to_matrix(feature_dicts):
+        """Convert list[OrderedDict] → (np.ndarray, list[str])."""
+        names = list(feature_dicts[0].keys())
+        X = np.array([[fd[k] for k in names] for fd in feature_dicts], dtype=np.float64)
+        return X, names
+
+    # ── column alias resolution (same scheme as inclusion-list tool) ──────
+    def _norm(name):
+        return re.sub(r'[^a-z0-9]+', '', str(name).lower())
+
+    def _resolve(df_local, aliases, required):
+        col_map, avail = {}, list(df_local.columns)
+        avail_n = {_norm(c): c for c in avail}
+        for key, al_list in aliases.items():
+            match = None
+            for al in al_list:
+                for act in avail:
+                    if str(act).strip().lower() == str(al).strip().lower():
+                        match = act; break
+                if match:
+                    break
+            if not match:
+                for al in al_list:
+                    n = _norm(al)
+                    if n in avail_n:
+                        match = avail_n[n]; break
+            if match:
+                col_map[key] = match
+        missing = [k for k in required if k not in col_map]
+        return col_map, missing
+
+    TRAIN_ALIASES = {
+        'sequence':     ['Sequence', 'Annotated Sequence', 'Peptide Sequence'],
+        'modifications': ['Modifications', 'Modification'],
+        'top_apex_rt':  ['Top Apex RT [min]', 'Top Apex RT', 'Apex RT [min]', 'Apex RT'],
+        'rt_search':    ['RT [min] (by Search Engine): Sequest HT', 'RT [min]', 'RT (min)', 'RT'],
+        'charge':       ['Charge (by Search Engine): Sequest HT', 'Charge'],
+        'confidence':   ['Confidence'],
+        'qvalue':       ['Qvality q-value', 'q-value', 'Q-value', 'FDR q-value'],
+    }
+
+    PRED_ALIASES = {
+        'sequence':      ['Sequence', 'Annotated Sequence', 'Peptide Sequence', 'Peptide'],
+        'modifications': ['Modifications', 'Modification', 'Mods'],
+        'charge':        ['Charge', 'z', 'Charge State'],
+    }
+
+    # ══════════════════════════════════════════════════════════════════════
+    # WINDOW  SETUP
+    # ══════════════════════════════════════════════════════════════════════
+    win = tk.Toplevel(root)
+    win.title("Retention Time Predictor")
+    win.geometry("1220x870")
+    win.minsize(960, 700)
+    win.rowconfigure(0, weight=1)
+    win.columnconfigure(0, weight=1)
+
+    outer = ttk.Frame(win)
+    outer.pack(fill='both', expand=True)
+    outer.rowconfigure(2, weight=1)          # results row expands
+    outer.columnconfigure(0, weight=1)
+
+    top_frame = ttk.Frame(outer)
+    top_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=(10, 0))
+    top_frame.columnconfigure(0, weight=1)
+
+    # ── training-data section ─────────────────────────────────────────────
+    train_lf = ttk.LabelFrame(top_frame, text="Training Data  (Proteome Discoverer PeptideGroups)")
+    train_lf.grid(row=0, column=0, sticky='ew', pady=(0, 5))
+    train_lf.columnconfigure(1, weight=1)
+
+    ttk.Label(train_lf, text="PD Excel File:").grid(row=0, column=0, sticky='w', padx=5, pady=4)
+    train_file_var = tk.StringVar()
+    train_entry = ttk.Entry(train_lf, textvariable=train_file_var, width=55)
+    train_entry.grid(row=0, column=1, sticky='ew', padx=5, pady=4)
+    ToolTip(train_entry,
+            "Proteome Discoverer PeptideGroups Excel export.\n\n"
+            "Required columns (case-insensitive, first alias matched):\n"
+            "  • Sequence — 'Annotated Sequence', 'Peptide Sequence'\n"
+            "  • RT (at least one) —\n"
+            "      'Top Apex RT [min]', 'Top Apex RT', 'Apex RT [min]', 'Apex RT'\n"
+            "      'RT [min] (by Search Engine): Sequest HT', 'RT [min]', 'RT (min)', 'RT'\n\n"
+            "Optional columns (improve model quality):\n"
+            "  • Modifications — 'Modification'\n"
+            "  • Charge — 'Charge (by Search Engine): Sequest HT'\n"
+            "  • Confidence\n"
+            "  • q-value — 'Qvality q-value', 'Q-value', 'FDR q-value'")
+
+    train_sheet_var = tk.StringVar(value="PeptideGroups")
+    ttk.Label(train_lf, text="Sheet:").grid(row=0, column=3, sticky='w', padx=(10, 2), pady=4)
+    train_sheet_combo = ttk.Combobox(train_lf, textvariable=train_sheet_var,
+                                     state='readonly', width=22)
+    train_sheet_combo['values'] = ['PeptideGroups']
+    train_sheet_combo.grid(row=0, column=4, padx=5, pady=4)
+
+    train_status_var = tk.StringVar(value="")
+    ttk.Label(train_lf, textvariable=train_status_var,
+              foreground='gray').grid(row=1, column=0, columnspan=5, sticky='w', padx=5, pady=2)
+
+    # closure-level state
+    _train_resolved = {}
+    _cached_train_df  = [None]
+    _cached_train_sig = [None]
+    _trained_model       = [None]
+    _trained_feat_names  = [[]]
+    _trained_scaler      = [None]
+    _trained_algorithm   = [None]
+    _model_metrics       = [{}]
+    _rt_norm_bounds      = [None]   # (rt_min, rt_max) for AlphaPeptDeep denormalization
+
+    def _pd_mods_to_deeplc(seq, mod_str):
+        """
+        Convert Proteome Discoverer / ProteoPRM modification strings
+        into the pipe-separated format DeepLC expects, e.g.
+          '2|Oxidation|3|Carbamidomethyl'
+        Returns '' if there are no modifications.
+        """
+        if pd.isna(mod_str) or not str(mod_str).strip():
+            return ''
+        parts = []
+        for chunk in str(mod_str).split(';'):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            m = re.match(r'(?:\d+x)?(.+?)\s*\[([A-Za-z])(\d+)\]', chunk)
+            if m:
+                mod_name = m.group(1).strip()
+                pos = int(m.group(3))
+                parts.extend([str(pos), mod_name])
+            else:
+                if 'n-term' in chunk.lower() or 'nterm' in chunk.lower():
+                    mod_name = re.sub(r'\[.*?\]', '', chunk).strip()
+                    mod_name = re.sub(r'^\d+x', '', mod_name).strip()
+                    parts.extend(['0', mod_name])
+                elif 'c-term' in chunk.lower() or 'cterm' in chunk.lower():
+                    mod_name = re.sub(r'\[.*?\]', '', chunk).strip()
+                    mod_name = re.sub(r'^\d+x', '', mod_name).strip()
+                    parts.extend([str(len(seq) + 1), mod_name])
+        return '|'.join(parts)
+
+    def _sig(fp, sheet=''):
+        fp = os.path.abspath(fp)
+        try:
+            mt = os.path.getmtime(fp)
+        except Exception:
+            mt = None
+        return (fp, sheet, mt)
+
+    def _refresh_train_sheets(fp):
+        fp = (fp or '').strip()
+        if not fp or not os.path.isfile(fp):
+            return
+        try:
+            xl = pd.ExcelFile(fp)
+            names = list(xl.sheet_names)
+        except Exception:
+            return
+        train_sheet_combo['values'] = names
+        cur = train_sheet_var.get().strip()
+        if cur in names:
+            pass
+        elif 'PeptideGroups' in names:
+            train_sheet_var.set('PeptideGroups')
+        elif names:
+            train_sheet_var.set(names[0])
+
+    def _validate_train(show_popup=False):
+        nonlocal _train_resolved
+        fp = train_file_var.get().strip()
+        if not fp or not os.path.isfile(fp):
+            train_status_var.set("Select a valid PD Excel file.")
+            if show_popup:
+                messagebox.showwarning("Input Error",
+                    "Please select a valid Proteome Discoverer PeptideGroups Excel file.",
+                    parent=win)
+            return None
+        sheet = train_sheet_var.get().strip()
+        if not sheet:
+            train_status_var.set("Select a worksheet.")
+            if show_popup:
+                messagebox.showwarning("Input Error", "Please select a worksheet.", parent=win)
+            return None
+
+        sig = _sig(fp, sheet)
+        if _cached_train_df[0] is not None and _cached_train_sig[0] == sig and _train_resolved:
+            return _cached_train_df[0]
+
+        _refresh_train_sheets(fp)
+        try:
+            df = pd.read_excel(fp, sheet_name=sheet)
+        except Exception as exc:
+            train_status_var.set("Could not read workbook/sheet.")
+            if show_popup:
+                messagebox.showerror("File Error",
+                    f"Could not read the selected sheet:\n{exc}", parent=win)
+            return None
+
+        cm, miss = _resolve(df, TRAIN_ALIASES, ['sequence'])
+        has_rt = 'top_apex_rt' in cm or 'rt_search' in cm
+        if 'sequence' in miss or not has_rt:
+            hints = []
+            if 'sequence' in miss:
+                hints.append("  - Sequence (or: Annotated Sequence, Peptide Sequence)")
+            if not has_rt:
+                hints.append("  - An RT column (Top Apex RT [min], RT [min], etc.)")
+            train_status_var.set("Missing required columns.")
+            if show_popup:
+                messagebox.showerror("Column Error",
+                    "The selected sheet is missing required columns:\n\n"
+                    + "\n".join(hints), parent=win)
+            return None
+
+        _train_resolved = cm
+        _cached_train_df[0]  = df
+        _cached_train_sig[0] = sig
+
+        rt_col = cm.get('top_apex_rt') or cm.get('rt_search')
+        n_valid = int(df[rt_col].notna().sum())
+        extra = []
+        if 'charge' in cm:
+            extra.append('Charge')
+        if 'modifications' in cm:
+            extra.append('Mods')
+        if 'confidence' in cm:
+            extra.append('Confidence')
+        extra_txt = f"  [+{', '.join(extra)}]" if extra else ''
+        train_status_var.set(
+            f"Validated: {sheet} — {len(df)} rows, {n_valid} with RT values{extra_txt}")
+        return df
+
+    def _browse_train():
+        fp = filedialog.askopenfilename(
+            title="Select PD PeptideGroups File for Training",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        )
+        if fp:
+            train_file_var.set(fp)
+            _refresh_train_sheets(fp)
+            _validate_train(show_popup=True)
+
+    ttk.Button(train_lf, text="Browse", command=_browse_train).grid(row=0, column=2, padx=5, pady=4)
+    train_entry.bind('<FocusOut>', lambda _e: _refresh_train_sheets(train_file_var.get()))
+    train_sheet_combo.bind('<<ComboboxSelected>>', lambda _e: _validate_train(show_popup=True))
+
+    ToolTip(train_sheet_combo,
+            "Select the worksheet that contains training peptides.\n"
+            "Needs at least a Sequence column and one RT column\n"
+            "(e.g. 'Top Apex RT [min]' or 'RT [min]').\n"
+            "Columns are matched case-insensitively with\n"
+            "the same alias support as the Inclusion List Generator.")
+
+    # ── prediction-peptides section ───────────────────────────────────────
+    pred_lf = ttk.LabelFrame(top_frame, text="Peptides to Predict  (CSV / Excel)")
+    pred_lf.grid(row=1, column=0, sticky='ew', pady=5)
+    pred_lf.columnconfigure(1, weight=1)
+
+    ttk.Label(pred_lf, text="Peptide File:").grid(row=0, column=0, sticky='w', padx=5, pady=4)
+    pred_file_var = tk.StringVar()
+    pred_entry = ttk.Entry(pred_lf, textvariable=pred_file_var, width=55)
+    pred_entry.grid(row=0, column=1, sticky='ew', padx=5, pady=4)
+    ToolTip(pred_entry,
+            "CSV or Excel file with peptides for RT prediction.\n\n"
+            "Required column (case-insensitive, first alias matched):\n"
+            "  • Sequence — 'Annotated Sequence', 'Peptide Sequence', 'Peptide'\n\n"
+            "Optional columns:\n"
+            "  • Modifications — 'Modification', 'Mods'\n"
+            "  • Charge — 'z', 'Charge State'")
+
+    pred_status_var = tk.StringVar(value="")
+    ttk.Label(pred_lf, textvariable=pred_status_var,
+              foreground='gray').grid(row=1, column=0, columnspan=3, sticky='w', padx=5, pady=2)
+
+    _cached_pred_df  = [None]
+    _cached_pred_sig = [None]
+    _pred_col_map    = [{}]
+
+    def _validate_pred(show_popup=False):
+        fp = pred_file_var.get().strip()
+        if not fp or not os.path.isfile(fp):
+            pred_status_var.set("Select a valid CSV or Excel file with peptide sequences.")
+            if show_popup:
+                messagebox.showwarning("Input Error",
+                    "Please select a valid peptide file.", parent=win)
+            return None
+
+        sig = _sig(fp)
+        if _cached_pred_df[0] is not None and _cached_pred_sig[0] == sig:
+            return _cached_pred_df[0]
+
+        ext = os.path.splitext(fp)[1].lower()
+        try:
+            if ext in ('.xlsx', '.xls'):
+                df = pd.read_excel(fp)
+            elif ext == '.csv':
+                df = pd.read_csv(fp)
+            elif ext in ('.tsv', '.txt'):
+                df = pd.read_csv(fp, sep='\t')
+            else:
+                df = pd.read_csv(fp)
+        except Exception as exc:
+            pred_status_var.set("Could not read file.")
+            if show_popup:
+                messagebox.showerror("File Error",
+                    f"Could not read the file:\n{exc}", parent=win)
+            return None
+
+        if len(df) == 0:
+            pred_status_var.set("File is empty.")
+            if show_popup:
+                messagebox.showwarning("Input Error",
+                    "The selected file contains no data rows.", parent=win)
+            return None
+
+        cm, miss = _resolve(df, PRED_ALIASES, ['sequence'])
+        if miss:
+            pred_status_var.set("Missing 'Sequence' column.")
+            if show_popup:
+                messagebox.showerror("Column Error",
+                    "The file must contain a 'Sequence' column "
+                    "(or alias: Peptide Sequence, Peptide, Annotated Sequence).",
+                    parent=win)
+            return None
+
+        # quick-validate sequences
+        seq_col = cm['sequence']
+        _seqs_clean = df[seq_col].astype(str).str.strip().str.upper()
+        _invalid_mask = (_seqs_clean == '') | ~_seqs_clean.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+        bad = [(int(idx) + 2, _seqs_clean.iat[idx][:30]) for idx in np.flatnonzero(_invalid_mask.values)]
+        if bad:
+            preview = bad[:5]
+            lines = [f"  Row {r}: '{s}'" for r, s in preview]
+            if len(bad) > 5:
+                lines.append(f"  … and {len(bad) - 5} more")
+            if show_popup:
+                messagebox.showwarning("Validation Warning",
+                    f"{len(bad)} sequence(s) contain invalid amino-acid characters "
+                    f"and will be skipped:\n\n" + "\n".join(lines), parent=win)
+
+        _pred_col_map[0] = cm
+        _cached_pred_df[0]  = df
+        _cached_pred_sig[0] = sig
+        pred_status_var.set(f"Loaded: {len(df)} peptides from {os.path.basename(fp)}")
+        return df
+
+    def _browse_pred():
+        fp = filedialog.askopenfilename(
+            title="Select Peptide File for Prediction",
+            filetypes=[("Excel / CSV", "*.xlsx *.xls *.csv *.tsv"),
+                       ("All files", "*.*")]
+        )
+        if fp:
+            pred_file_var.set(fp)
+            _validate_pred(show_popup=True)
+
+    ttk.Button(pred_lf, text="Browse", command=_browse_pred).grid(row=0, column=2, padx=5, pady=4)
+
+    # ── model options ─────────────────────────────────────────────────────
+    opts_lf = ttk.LabelFrame(top_frame, text="Model Options")
+    opts_lf.grid(row=2, column=0, sticky='ew', pady=5)
+    # 6 option columns
+    for ci in range(6):
+        opts_lf.columnconfigure(ci, weight=0)
+
+    r = 0
+    ttk.Label(opts_lf, text="Algorithm:").grid(row=r, column=0, sticky='w', padx=5, pady=2)
+    _algo_choices = [
+        "HistGradientBoosting",
+        "GradientBoosting",
+        "DeepLC (transfer learning)",
+        "AlphaPeptDeep (transfer learning)",
+    ]
+
+    algo_var = tk.StringVar(value="HistGradientBoosting")
+    algo_combo = ttk.Combobox(opts_lf, textvariable=algo_var,
+                              values=_algo_choices,
+                              state='readonly', width=28)
+    algo_combo.grid(row=r, column=1, sticky='w', padx=5, pady=2)
+    _dlc_tip = (
+        "\nDeepLC (transfer learning): deep-learning CNN, state-of-the-art accuracy."
+        if _DEEPLC_AVAILABLE
+        else "\nDeepLC: not installed — pip install deeplc to enable."
+    )
+    _apd_rt_tip = (
+        "\nAlphaPeptDeep (transfer learning): LSTM-based RT prediction with\n"
+        "  instrument-aware calibration.  Can be calibrated with your own\n"
+        "  data.  GPU-accelerated when CUDA PyTorch is available."
+        if _ALPHAPEPTDEEP_AVAILABLE
+        else "\nAlphaPeptDeep: not installed — pip install peptdeep to enable."
+    )
+    ToolTip(algo_combo,
+            "HistGradientBoosting (recommended): fast & accurate, handles NaN natively.\n"
+            "GradientBoosting: classical sklearn GBR."
+            + _dlc_tip + _apd_rt_tip)
+
+    ttk.Label(opts_lf, text="Confidence Filter:").grid(row=r, column=2, sticky='w', padx=(15, 5), pady=2)
+    train_conf_var = tk.StringVar(value="High")
+    conf_combo = ttk.Combobox(opts_lf, textvariable=train_conf_var,
+                              values=["High", "Medium", "Low", "Any"],
+                              state='readonly', width=10)
+    conf_combo.grid(row=r, column=3, sticky='w', padx=5, pady=2)
+    ToolTip(conf_combo,
+            "Filter training peptides by Proteome Discoverer confidence level.\n"
+            "'High' is recommended for best accuracy.")
+
+    ttk.Label(opts_lf, text="Max q-value:").grid(row=r, column=4, sticky='w', padx=(15, 5), pady=2)
+    train_qval_var = tk.StringVar(value="0.01")
+    ttk.Entry(opts_lf, textvariable=train_qval_var, width=8).grid(row=r, column=5, sticky='w', padx=5, pady=2)
+
+    r += 1
+    ttk.Label(opts_lf, text="RT Window ± (min):").grid(row=r, column=0, sticky='w', padx=5, pady=2)
+    pred_rt_window_var = tk.StringVar(value="5")
+    rw_entry = ttk.Entry(opts_lf, textvariable=pred_rt_window_var, width=8)
+    rw_entry.grid(row=r, column=1, sticky='w', padx=5, pady=2)
+    ToolTip(rw_entry,
+            "Half-window added/subtracted from predicted RT to produce\n"
+            "t start / t stop columns for instrument scheduling.")
+
+    cv_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(opts_lf, text="5-fold cross-validation",
+                    variable=cv_var).grid(row=r, column=2, columnspan=2,
+                                          sticky='w', padx=15, pady=2)
+    ToolTip(rw_entry,
+            "When enabled, reports R², MAE, and Median AE on held-out folds\n"
+            "so you can judge model quality before using predictions.")
+
+    dedup_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(opts_lf, text="Deduplicate training sequences",
+                    variable=dedup_var).grid(row=r, column=4, columnspan=2,
+                                             sticky='w', padx=15, pady=2)
+
+    # ── action row ────────────────────────────────────────────────────────
+    action_frame = ttk.Frame(top_frame)
+    action_frame.grid(row=3, column=0, sticky='ew', pady=5)
+    action_frame.columnconfigure(0, weight=1)
+
+    status_var = tk.StringVar(value="")
+    ttk.Label(action_frame, textvariable=status_var,
+              foreground='gray').grid(row=0, column=0, sticky='w', padx=10)
+
+    # ── notebook for results (table + diagnostics) ────────────────────────
+    nb = ttk.Notebook(outer)
+    nb.grid(row=2, column=0, sticky='nsew', padx=10, pady=5)
+
+    # --- tab 1: predicted RT table ---
+    tab_table = ttk.Frame(nb)
+    nb.add(tab_table, text="Predicted RTs")
+    tab_table.rowconfigure(0, weight=1)
+    tab_table.columnconfigure(0, weight=1)
+
+    tree_cols = ('Sequence', 'Modifications', 'Charge', 'Length',
+                 'Predicted RT (min)', 't start (min)', 't stop (min)')
+    tree = ttk.Treeview(tab_table, columns=tree_cols, show='headings',
+                        selectmode='extended')
+
+    col_w = {'Sequence': 210, 'Modifications': 170, 'Charge': 55,
+             'Length': 55, 'Predicted RT (min)': 120,
+             't start (min)': 90, 't stop (min)': 90}
+
+    _sort_st = {'column': None, 'descending': False}
+
+    def _is_num_col(values):
+        for v in values:
+            s = str(v).strip()
+            if s == '':
+                continue
+            try:
+                float(s)
+            except Exception:
+                return False
+        return True
+
+    def _sort_tv(col):
+        rows = [(tree.set(it, col), it) for it in tree.get_children('')]
+        if not rows:
+            return
+        desc = not _sort_st['descending'] if _sort_st['column'] == col else False
+        numeric = _is_num_col([v for v, _ in rows])
+        if numeric:
+            rows.sort(key=lambda x: float(x[0]) if x[0].strip() else float('inf'),
+                      reverse=desc)
+        else:
+            rows.sort(key=lambda x: x[0].lower(), reverse=desc)
+        for idx, (_, it) in enumerate(rows):
+            tree.move(it, '', idx)
+        _sort_st['column'] = col
+        _sort_st['descending'] = desc
+        for c in tree_cols:
+            lbl = c
+            if c == col:
+                lbl = f"{c} {'▼' if desc else '▲'}"
+            tree.heading(c, text=lbl, command=lambda _c=c: _sort_tv(_c))
+
+    for c in tree_cols:
+        tree.heading(c, text=c, command=lambda _c=c: _sort_tv(_c))
+        tree.column(c, width=col_w.get(c, 80), minwidth=40)
+
+    tree.grid(row=0, column=0, sticky='nsew')
+    vsb = ttk.Scrollbar(tab_table, orient='vertical', command=tree.yview)
+    vsb.grid(row=0, column=1, sticky='ns')
+    hsb = ttk.Scrollbar(tab_table, orient='horizontal', command=tree.xview)
+    hsb.grid(row=1, column=0, sticky='ew')
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+    def _delete_selected(event=None):
+        for it in tree.selection():
+            tree.delete(it)
+        remaining = len(tree.get_children())
+        status_var.set(f"{remaining} predictions remaining.")
+    tree.bind('<Delete>', _delete_selected)
+    tree.bind('<BackSpace>', _delete_selected)
+
+    # --- tab 2: model diagnostics ---
+    tab_diag = ttk.Frame(nb)
+    nb.add(tab_diag, text="Model Diagnostics")
+    tab_diag.rowconfigure(1, weight=1)
+    tab_diag.columnconfigure(0, weight=1)
+
+    diag_metrics_var = tk.StringVar(value="Train a model to see diagnostics.")
+    ttk.Label(tab_diag, textvariable=diag_metrics_var,
+              font=('Consolas', 10)).grid(row=0, column=0, sticky='w', padx=10, pady=8)
+
+    diag_canvas_frame = ttk.Frame(tab_diag)
+    diag_canvas_frame.grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
+    diag_canvas_frame.rowconfigure(0, weight=1)
+    diag_canvas_frame.columnconfigure(0, weight=1)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  CORE: TRAIN  &  PREDICT
+    # ══════════════════════════════════════════════════════════════════════
+    def _train_and_predict(run_prediction=True):
+        # ── 1. validate training file ──
+        status_var.set("Validating training data…")
+        win.update_idletasks()
+        train_df = _validate_train(show_popup=True)
+        if train_df is None:
+            return
+        tc = _train_resolved
+
+        # ── 2. prepare training set ──
+        status_var.set("Preparing training data…")
+        win.update_idletasks()
+
+        tr = train_df.copy()
+
+        # confidence filter
+        if 'confidence' in tc and train_conf_var.get() != "Any":
+            conf_order = {"High": 3, "Medium": 2, "Low": 1}
+            min_c = conf_order.get(train_conf_var.get(), 1)
+            tr = tr[tr[tc['confidence']].map(
+                lambda x: conf_order.get(str(x), 0) >= min_c)]
+
+        # q-value filter
+        if 'qvalue' in tc:
+            try:
+                qmax = float(train_qval_var.get())
+            except ValueError:
+                qmax = 1.0
+            tr = tr[pd.to_numeric(tr[tc['qvalue']], errors='coerce') <= qmax]
+
+        # build RT column (prefer apex, fall back to search-engine RT)
+        if 'top_apex_rt' in tc:
+            tr['_rt'] = pd.to_numeric(tr[tc['top_apex_rt']], errors='coerce')
+        else:
+            tr['_rt'] = np.nan
+        if 'rt_search' in tc:
+            mask = tr['_rt'].isna()
+            tr.loc[mask, '_rt'] = pd.to_numeric(
+                tr.loc[mask, tc['rt_search']], errors='coerce')
+        tr = tr.dropna(subset=['_rt'])
+
+        if len(tr) < 10:
+            messagebox.showwarning("Insufficient Data",
+                f"Only {len(tr)} peptides with valid RT remain after filtering.\n"
+                "Need at least 10 for training. Relax your filters.",
+                parent=win)
+            status_var.set("Insufficient training data.")
+            return
+
+        # deduplicate by sequence (keep first = arbitrary best)
+        seq_col = tc['sequence']
+        if dedup_var.get():
+            tr = tr.drop_duplicates(subset=[seq_col], keep='first')
+
+        algo = algo_var.get()
+        is_deeplc = algo.startswith("DeepLC")
+        is_alphapeptdeep = algo.startswith("AlphaPeptDeep")
+
+        # ══════════════════════════════════════════════════════════════════
+        #  PATH A0:  AlphaPeptDeep  (transfer learning — RT prediction)
+        # ══════════════════════════════════════════════════════════════════
+        if is_alphapeptdeep:
+            _ensure_peptdeep()
+            if not _ALPHAPEPTDEEP_AVAILABLE:
+                messagebox.showerror("AlphaPeptDeep Not Found",
+                    "AlphaPeptDeep (peptdeep) is not installed.\n\n"
+                    "Install it with:\n  pip install peptdeep\n\n"
+                    "Then restart the application.",
+                    parent=win)
+                status_var.set("AlphaPeptDeep not installed.")
+                return
+
+            status_var.set(f"Initializing AlphaPeptDeep RT model…")
+            win.update_idletasks()
+
+            try:
+                model_dir = _alphapeptdeep_model_dir()
+
+                # Detect device
+                _use_gpu = False
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        _use_gpu = True
+                except ImportError:
+                    pass
+
+                mgr = _APD_ModelManager(device='gpu' if _use_gpu else 'cpu')
+
+                rt_model_path  = os.path.join(model_dir, 'generic', 'rt.pth')
+                ms2_model_path = os.path.join(model_dir, 'generic', 'ms2.pth')
+                ccs_model_path = os.path.join(model_dir, 'generic', 'ccs.pth')
+                chg_model_path = os.path.join(model_dir, 'generic', 'charge.pth')
+
+                if os.path.exists(rt_model_path):
+                    try:
+                        mgr.load_external_models(
+                            ms2_model_file=ms2_model_path if os.path.exists(ms2_model_path) else '',
+                            rt_model_file=rt_model_path,
+                            ccs_model_file=ccs_model_path if os.path.exists(ccs_model_path) else '',
+                            charge_model_file=chg_model_path if os.path.exists(chg_model_path) else '',
+                        )
+                        logging.info(f"AlphaPeptDeep RT model loaded from bundled models (device={'gpu' if _use_gpu else 'cpu'})")
+                    except Exception as exc:
+                        logging.warning(
+                            f"AlphaPeptDeep RT: failed to load bundled external models ({exc}); "
+                            f"falling back to installed/default models"
+                        )
+                        mgr.load_installed_models(model_type='generic')
+                        logging.info(f"AlphaPeptDeep RT model loaded from defaults after fallback (device={'gpu' if _use_gpu else 'cpu'})")
+                    _patch_apd_predict_bug(mgr)
+                else:
+                    _patch_apd_predict_bug(mgr)
+                    logging.info(f"AlphaPeptDeep RT model loaded from defaults (device={'gpu' if _use_gpu else 'cpu'})")
+
+            except Exception as exc:
+                messagebox.showerror("AlphaPeptDeep Error",
+                    f"Failed to load AlphaPeptDeep models:\n{exc}",
+                    parent=win)
+                status_var.set(f"AlphaPeptDeep model load failed: {exc}")
+                return
+
+            # Build calibration DataFrame
+            status_var.set(f"Building AlphaPeptDeep calibration set from {len(tr)} peptides…")
+            win.update_idletasks()
+
+            mod_col = tc.get('modifications')
+            chg_col = tc.get('charge')
+            cal_rows = []
+            # Vectorized sequence filter + zip over column arrays
+            _apd_seqs = tr[seq_col].astype(str).str.strip().str.upper()
+            _apd_valid = _apd_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+            _apd_idx = np.flatnonzero(_apd_valid.values)
+            _apd_s = _apd_seqs.values[_apd_idx]
+            _apd_m = tr[mod_col].values[_apd_idx] if mod_col else [''] * len(_apd_idx)
+            _apd_z = tr[chg_col].values[_apd_idx] if chg_col else [2] * len(_apd_idx)
+            _apd_rt = tr['_rt'].values[_apd_idx]
+            for s, m, z, rt_val in zip(_apd_s, _apd_m, _apd_z, _apd_rt):
+                try:
+                    z = int(z) if z and not (isinstance(z, float) and np.isnan(z)) else 2
+                except (ValueError, TypeError):
+                    z = 2
+
+                mods_str, mod_sites_str = _convert_pd_mods_to_alphapeptdeep(s, m)
+                cal_rows.append({
+                    'sequence': s,
+                    'mods': mods_str,
+                    'mod_sites': mod_sites_str,
+                    'charge': z,
+                    'nce': 30.0,
+                    'instrument': 'Lumos',
+                    'rt_norm': float(rt_val),
+                })
+
+            if len(cal_rows) < 10:
+                messagebox.showwarning("Insufficient Data",
+                    f"Only {len(cal_rows)} valid peptides for AlphaPeptDeep calibration.\n"
+                    "Need at least 10.", parent=win)
+                status_var.set("Insufficient valid calibration peptides.")
+                return
+
+            cal_df = pd.DataFrame(cal_rows)
+            y_train_raw = cal_df['rt_norm'].values.copy()  # actual RT in minutes
+
+            # Normalize RT to 0-1 range for AlphaPeptDeep transfer learning
+            _rt_min = float(y_train_raw.min())
+            _rt_max = float(y_train_raw.max())
+            if _rt_max - _rt_min < 1e-6:
+                _rt_max = _rt_min + 1.0  # avoid division by zero
+            cal_df['rt_norm'] = (cal_df['rt_norm'] - _rt_min) / (_rt_max - _rt_min)
+            _rt_norm_bounds[0] = (_rt_min, _rt_max)
+            y_train = y_train_raw  # keep raw minutes for diagnostics
+
+            # Calibrate (transfer learn) RT model
+            status_var.set(f"Calibrating AlphaPeptDeep RT on {len(cal_df)} peptides…")
+            win.update_idletasks()
+
+            try:
+                # Paper-recommended RT TL params: epoch=30, warmup=10,
+                # lr=1e-4, dropout=0.1, batch_size=256.
+                try:
+                    mgr.rt_model.model.dropout.p = 0.1
+                except Exception:
+                    pass
+                mgr.rt_model.train(
+                    cal_df,
+                    batch_size=256,
+                    epoch=30,
+                    warmup_epoch=10,
+                    lr=1e-4,
+                )
+                logging.info(f"AlphaPeptDeep RT model calibrated on {len(cal_df)} peptides")
+            except Exception as exc:
+                logging.warning(f"AlphaPeptDeep RT calibration failed ({exc}). "
+                                f"Using uncalibrated pretrained model.")
+
+            _trained_model[0] = mgr
+            _trained_feat_names[0] = []
+            _trained_algorithm[0] = "AlphaPeptDeep (transfer learning)"
+            _set_model_ready(True)
+
+            # Cross-validation via calibration residuals
+            cv_text = ""
+            y_cv_pred = None
+            if cv_var.get():
+                status_var.set("Computing AlphaPeptDeep calibration residuals…")
+                win.update_idletasks()
+                try:
+                    pred_result = mgr.predict_rt(cal_df)
+                    if isinstance(pred_result, pd.DataFrame) and 'rt_pred' in pred_result.columns:
+                        y_cv_pred = pred_result['rt_pred'].values
+                    elif isinstance(pred_result, np.ndarray):
+                        y_cv_pred = pred_result.flatten()
+                    else:
+                        y_cv_pred = np.array(pred_result).flatten()
+
+                    # Denormalize predictions back to minutes
+                    if _rt_norm_bounds[0] is not None:
+                        _bmin, _bmax = _rt_norm_bounds[0]
+                        y_cv_pred = y_cv_pred * (_bmax - _bmin) + _bmin
+
+                    cv_r2    = r2_score(y_train, y_cv_pred)
+                    cv_mae   = mean_absolute_error(y_train, y_cv_pred)
+                    cv_medae = median_absolute_error(y_train, y_cv_pred)
+                    cv_p95   = np.percentile(np.abs(y_cv_pred - y_train), 95)
+                    _model_metrics[0] = {
+                        'R²': cv_r2, 'MAE': cv_mae, 'MedAE': cv_medae,
+                        'P95_window': cv_p95,
+                        'n_train': len(y_train), 'algorithm': 'AlphaPeptDeep',
+                    }
+                    cv_text = (
+                        f"AlphaPeptDeep (calibrated)  ▸  R² = {cv_r2:.4f}   "
+                        f"MAE = {cv_mae:.2f} min   "
+                        f"Median AE = {cv_medae:.2f} min   "
+                        f"P95 = ±{cv_p95:.2f} min   "
+                        f"(n = {len(y_train)})"
+                    )
+                except Exception as exc:
+                    cv_text = f"AlphaPeptDeep residual check failed: {exc}"
+            else:
+                cv_text = "Cross-validation disabled."
+
+            # Diagnostics plot
+            diag_metrics_var.set(cv_text)
+            for w in diag_canvas_frame.winfo_children():
+                w.destroy()
+            if y_cv_pred is not None:
+                fig = Figure(figsize=(10, 4), dpi=100)
+                ax1 = fig.add_subplot(1, 2, 1)
+                ax1.scatter(y_train, y_cv_pred, alpha=0.35, s=12, edgecolors='none')
+                lo = min(y_train.min(), y_cv_pred.min()) - 1
+                hi = max(y_train.max(), y_cv_pred.max()) + 1
+                ax1.plot([lo, hi], [lo, hi], 'r--', lw=1)
+                ax1.set_xlabel('Observed RT (min)')
+                ax1.set_ylabel('AlphaPeptDeep Predicted RT (min)')
+                ax1.set_title('Actual vs Predicted (calibration)')
+                ax2 = fig.add_subplot(1, 2, 2)
+                residuals = y_cv_pred - y_train
+                ax2.hist(residuals, bins=50, edgecolor='black', alpha=0.7)
+                ax2.axvline(0, color='red', linestyle='--', lw=1)
+                _p95 = np.percentile(np.abs(residuals), 95)
+                ax2.axvline(-_p95, color='orange', linestyle=':', lw=1.2)
+                ax2.axvline( _p95, color='orange', linestyle=':', lw=1.2)
+                ax2.set_xlabel('Residual (min)')
+                ax2.set_ylabel('Count')
+                ax2.set_title(f'Residuals  (median = {np.median(residuals):.2f} min,  P95 = ±{_p95:.2f} min)')
+                fig.tight_layout()
+                canvas = FigureCanvasTkAgg(fig, master=diag_canvas_frame)
+                canvas.draw()
+                canvas.get_tk_widget().pack(fill='both', expand=True)
+
+            if not run_prediction:
+                status_var.set(f"AlphaPeptDeep model trained.  {cv_text}")
+                return
+
+            # Validate & load prediction file
+            status_var.set("Validating prediction file…")
+            win.update_idletasks()
+            pred_df = _validate_pred(show_popup=True)
+            if pred_df is None:
+                status_var.set(f"AlphaPeptDeep calibrated ({cv_text}).  Load a prediction file to continue.")
+                return
+            pc = _pred_col_map[0]
+
+            p_seq_col = pc['sequence']
+            p_mod_col = pc.get('modifications')
+            p_chg_col = pc.get('charge')
+
+            pred_apd_rows = []
+            pred_meta = []
+            # Vectorized sequence filter + zip
+            _pa_seqs = pred_df[p_seq_col].astype(str).str.strip().str.upper()
+            _pa_valid = _pa_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+            _pa_idx = np.flatnonzero(_pa_valid.values)
+            _pa_s = _pa_seqs.values[_pa_idx]
+            _pa_m = pred_df[p_mod_col].values[_pa_idx] if p_mod_col else [''] * len(_pa_idx)
+            _pa_z = pred_df[p_chg_col].values[_pa_idx] if p_chg_col else [2] * len(_pa_idx)
+            for s, m, z in zip(_pa_s, _pa_m, _pa_z):
+                try:
+                    z_int = int(z) if z and not (isinstance(z, float) and np.isnan(z)) else 2
+                except (ValueError, TypeError):
+                    z_int = 2
+                mods_str, mod_sites_str = _convert_pd_mods_to_alphapeptdeep(s, m)
+                pred_apd_rows.append({
+                    'sequence': s,
+                    'mods': mods_str,
+                    'mod_sites': mod_sites_str,
+                    'charge': z_int,
+                    'nce': 30.0,
+                    'instrument': 'Lumos',
+                })
+                mod_display = str(m) if pd.notna(m) and str(m).strip() else ''
+                pred_meta.append((s, mod_display, str(z_int), len(s)))
+
+            if not pred_apd_rows:
+                messagebox.showwarning("No Valid Peptides",
+                    "No valid peptide sequences found in the prediction file.",
+                    parent=win)
+                status_var.set("No valid peptides to predict.")
+                return
+
+            pred_apd_df = pd.DataFrame(pred_apd_rows)
+
+            status_var.set(f"AlphaPeptDeep predicting RT for {len(pred_apd_df)} peptides…")
+            win.update_idletasks()
+            try:
+                pred_result = mgr.predict_rt(pred_apd_df)
+                if isinstance(pred_result, pd.DataFrame) and 'rt_pred' in pred_result.columns:
+                    y_pred = pred_result['rt_pred'].values
+                elif isinstance(pred_result, np.ndarray):
+                    y_pred = pred_result.flatten()
+                else:
+                    y_pred = np.array(pred_result).flatten()
+
+                # Denormalize predictions back to minutes
+                if _rt_norm_bounds[0] is not None:
+                    _bmin, _bmax = _rt_norm_bounds[0]
+                    y_pred = y_pred * (_bmax - _bmin) + _bmin
+            except Exception as exc:
+                messagebox.showerror("AlphaPeptDeep Error",
+                    f"AlphaPeptDeep RT prediction failed:\n{exc}", parent=win)
+                status_var.set(f"AlphaPeptDeep prediction failed: {exc}")
+                return
+
+            try:
+                rt_half = float(pred_rt_window_var.get())
+            except ValueError:
+                rt_half = 5.0
+
+            for it in tree.get_children():
+                tree.delete(it)
+
+            table_data = []
+            for idx, (s, mod_display, z_display, length) in enumerate(pred_meta):
+                rt = round(float(y_pred[idx]), 2)
+                t_start = round(max(rt - rt_half, 0.0), 2)
+                t_stop  = round(rt + rt_half, 2)
+                tree.insert('', 'end', values=(
+                    s, mod_display, z_display, length,
+                    rt, t_start, t_stop,
+                ))
+                table_data.append({
+                    'Sequence': s,
+                    'Modifications': mod_display,
+                    'Charge': z_display,
+                    'Length': length,
+                    'Predicted RT (min)': rt,
+                    't start (min)': t_start,
+                    't stop (min)': t_stop,
+                })
+
+            win._rt_pred_table_data = table_data
+            nb.select(tab_table)
+            status_var.set(
+                f"AlphaPeptDeep predicted RT for {len(table_data)} peptides.  {cv_text}")
+            return
+        # ── end AlphaPeptDeep RT path ─────────────────────────────────────
+
+        # ══════════════════════════════════════════════════════════════════
+        #  PATH A:  DeepLC  (transfer learning)
+        # ══════════════════════════════════════════════════════════════════
+        if is_deeplc:
+            if not _DEEPLC_AVAILABLE:
+                messagebox.showerror("DeepLC Not Found",
+                    "DeepLC is not installed.\n\n"
+                    "Install it with:\n  pip install deeplc\n\n"
+                    "Then restart the application.",
+                    parent=win)
+                status_var.set("DeepLC not installed.")
+                return
+
+            # ── build calibration DataFrame for DeepLC ──
+            status_var.set(f"Building DeepLC calibration set from {len(tr)} peptides…")
+            win.update_idletasks()
+
+            mod_col = tc.get('modifications')
+            cal_rows = []
+            # Vectorized sequence filter + zip
+            _dlc_seqs = tr[seq_col].astype(str).str.strip().str.upper()
+            _dlc_valid = _dlc_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+            _dlc_idx = np.flatnonzero(_dlc_valid.values)
+            _dlc_s = _dlc_seqs.values[_dlc_idx]
+            _dlc_m = tr[mod_col].values[_dlc_idx] if mod_col else [''] * len(_dlc_idx)
+            _dlc_rt = tr['_rt'].values[_dlc_idx]
+            for s, m, rt_val in zip(_dlc_s, _dlc_m, _dlc_rt):
+                dlc_mod = _pd_mods_to_deeplc(s, m)
+                cal_rows.append({
+                    'seq': s,
+                    'modifications': dlc_mod,
+                    'tr': float(rt_val),
+                })
+
+            if len(cal_rows) < 10:
+                messagebox.showwarning("Insufficient Data",
+                    f"Only {len(cal_rows)} valid peptides for DeepLC calibration.\n"
+                    "Need at least 10.", parent=win)
+                status_var.set("Insufficient valid calibration peptides.")
+                return
+
+            cal_df = pd.DataFrame(cal_rows)
+            y_train = cal_df['tr'].values
+
+            # ── instantiate & calibrate DeepLC ──
+            status_var.set(f"Calibrating DeepLC on {len(cal_df)} peptides (transfer learning)…")
+            win.update_idletasks()
+
+            try:
+                dlc = _DeepLC_Class(
+                    split_cal=10,     # 10-part calibration
+                    n_jobs=1,
+                    verbose=False,
+                )
+                dlc.calibrate_preds(seq_df=cal_df)
+            except Exception as exc:
+                messagebox.showerror("DeepLC Error",
+                    f"DeepLC calibration failed:\n{exc}",
+                    parent=win)
+                status_var.set(f"DeepLC calibration failed: {exc}")
+                return
+
+            _trained_model[0] = dlc
+            _trained_feat_names[0] = []  # not used for DeepLC
+            _trained_algorithm[0] = "DeepLC (transfer learning)"
+            _set_model_ready(True)
+
+            # ── cross-validation via calibration residuals ──
+            cv_text = ""
+            y_cv_pred = None
+            if cv_var.get():
+                status_var.set("Computing DeepLC calibration residuals…")
+                win.update_idletasks()
+                try:
+                    y_cv_pred = np.array(dlc.make_preds(seq_df=cal_df))
+                    cv_r2    = r2_score(y_train, y_cv_pred)
+                    cv_mae   = mean_absolute_error(y_train, y_cv_pred)
+                    cv_medae = median_absolute_error(y_train, y_cv_pred)
+                    cv_p95   = np.percentile(np.abs(y_cv_pred - y_train), 95)
+                    _model_metrics[0] = {
+                        'R²': cv_r2, 'MAE': cv_mae, 'MedAE': cv_medae,
+                        'P95_window': cv_p95,
+                        'n_train': len(y_train), 'algorithm': 'DeepLC',
+                    }
+                    cv_text = (
+                        f"DeepLC (calibrated)  ▸  R² = {cv_r2:.4f}   "
+                        f"MAE = {cv_mae:.2f} min   "
+                        f"Median AE = {cv_medae:.2f} min   "
+                        f"P95 = ±{cv_p95:.2f} min   "
+                        f"(n = {len(y_train)})"
+                    )
+                except Exception as exc:
+                    cv_text = f"DeepLC residual check failed: {exc}"
+            else:
+                cv_text = "Cross-validation disabled."
+
+            # diagnostics
+            diag_metrics_var.set(cv_text)
+            for w in diag_canvas_frame.winfo_children():
+                w.destroy()
+            if y_cv_pred is not None:
+                fig = Figure(figsize=(10, 4), dpi=100)
+                ax1 = fig.add_subplot(1, 2, 1)
+                ax1.scatter(y_train, y_cv_pred, alpha=0.35, s=12, edgecolors='none')
+                lo = min(y_train.min(), y_cv_pred.min()) - 1
+                hi = max(y_train.max(), y_cv_pred.max()) + 1
+                ax1.plot([lo, hi], [lo, hi], 'r--', lw=1)
+                ax1.set_xlabel('Observed RT (min)')
+                ax1.set_ylabel('DeepLC Predicted RT (min)')
+                ax1.set_title('Actual vs Predicted (calibration)')
+                ax2 = fig.add_subplot(1, 2, 2)
+                residuals = y_cv_pred - y_train
+                ax2.hist(residuals, bins=50, edgecolor='black', alpha=0.7)
+                ax2.axvline(0, color='red', linestyle='--', lw=1)
+                _p95 = np.percentile(np.abs(residuals), 95)
+                ax2.axvline(-_p95, color='orange', linestyle=':', lw=1.2)
+                ax2.axvline( _p95, color='orange', linestyle=':', lw=1.2)
+                ax2.set_xlabel('Residual (min)')
+                ax2.set_ylabel('Count')
+                ax2.set_title(f'Residuals  (median = {np.median(residuals):.2f} min,  P95 = ±{_p95:.2f} min)')
+                fig.tight_layout()
+                canvas = FigureCanvasTkAgg(fig, master=diag_canvas_frame)
+                canvas.draw()
+                canvas.get_tk_widget().pack(fill='both', expand=True)
+
+            if not run_prediction:
+                status_var.set(f"DeepLC model trained.  {cv_text}")
+                return
+
+            # ── validate & load prediction file ──
+            status_var.set("Validating prediction file…")
+            win.update_idletasks()
+            pred_df = _validate_pred(show_popup=True)
+            if pred_df is None:
+                status_var.set(f"DeepLC calibrated ({cv_text}).  Load a prediction file to continue.")
+                return
+            pc = _pred_col_map[0]
+
+            p_seq_col = pc['sequence']
+            p_mod_col = pc.get('modifications')
+
+            pred_dlc_rows = []
+            pred_meta = []  # (seq, mod_display, z_display, length)
+            # Vectorized sequence filter + zip
+            _pd_seqs = pred_df[p_seq_col].astype(str).str.strip().str.upper()
+            _pd_valid = _pd_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+            _pd_idx = np.flatnonzero(_pd_valid.values)
+            _pd_s = _pd_seqs.values[_pd_idx]
+            _pd_m = pred_df[p_mod_col].values[_pd_idx] if p_mod_col else [''] * len(_pd_idx)
+            _pd_z = pred_df[pc['charge']].values[_pd_idx] if 'charge' in pc else [None] * len(_pd_idx)
+            for s, m, z in zip(_pd_s, _pd_m, _pd_z):
+                dlc_mod = _pd_mods_to_deeplc(s, m)
+                pred_dlc_rows.append({'seq': s, 'modifications': dlc_mod})
+                mod_display = str(m) if pd.notna(m) and str(m).strip() else ''
+                try:
+                    z_display = str(int(z)) if z is not None and not (isinstance(z, float) and np.isnan(z)) else ''
+                except (ValueError, TypeError):
+                    z_display = ''
+                pred_meta.append((s, mod_display, z_display, len(s)))
+
+            if not pred_dlc_rows:
+                messagebox.showwarning("No Valid Peptides",
+                    "No valid peptide sequences found in the prediction file.",
+                    parent=win)
+                status_var.set("No valid peptides to predict.")
+                return
+
+            pred_dlc_df = pd.DataFrame(pred_dlc_rows)
+
+            status_var.set(f"DeepLC predicting RT for {len(pred_dlc_df)} peptides…")
+            win.update_idletasks()
+            try:
+                y_pred = np.array(dlc.make_preds(seq_df=pred_dlc_df))
+            except Exception as exc:
+                messagebox.showerror("DeepLC Error",
+                    f"DeepLC prediction failed:\n{exc}", parent=win)
+                status_var.set(f"DeepLC prediction failed: {exc}")
+                return
+
+            try:
+                rt_half = float(pred_rt_window_var.get())
+            except ValueError:
+                rt_half = 5.0
+
+            for it in tree.get_children():
+                tree.delete(it)
+
+            table_data = []
+            for idx, (s, mod_display, z_display, length) in enumerate(pred_meta):
+                rt = round(float(y_pred[idx]), 2)
+                t_start = round(max(rt - rt_half, 0.0), 2)
+                t_stop  = round(rt + rt_half, 2)
+                tree.insert('', 'end', values=(
+                    s, mod_display, z_display, length,
+                    rt, t_start, t_stop,
+                ))
+                table_data.append({
+                    'Sequence': s,
+                    'Modifications': mod_display,
+                    'Charge': z_display,
+                    'Length': length,
+                    'Predicted RT (min)': rt,
+                    't start (min)': t_start,
+                    't stop (min)': t_stop,
+                })
+
+            win._rt_pred_table_data = table_data
+            nb.select(tab_table)
+            status_var.set(
+                f"DeepLC predicted RT for {len(table_data)} peptides.  {cv_text}")
+            return
+        # ── end DeepLC path ───────────────────────────────────────────────
+
+        # ══════════════════════════════════════════════════════════════════
+        #  PATH B:  sklearn feature-based models
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── 3. compute features ──
+        status_var.set(f"Computing features for {len(tr)} training peptides…")
+        win.update_idletasks()
+
+        mod_col = tc.get('modifications')
+        chg_col = tc.get('charge')
+        feat_dicts = []
+        y_vals = []
+        skipped = 0
+        # Vectorized sequence filter + zip
+        _sk_seqs = tr[seq_col].astype(str).str.strip().str.upper()
+        _sk_valid = _sk_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+        _sk_idx = np.flatnonzero(_sk_valid.values)
+        _sk_s = _sk_seqs.values[_sk_idx]
+        _sk_m = tr[mod_col].values[_sk_idx] if mod_col else [''] * len(_sk_idx)
+        _sk_z = tr[chg_col].values[_sk_idx] if chg_col else [None] * len(_sk_idx)
+        _sk_rt = tr['_rt'].values[_sk_idx]
+        skipped += int((~_sk_valid).sum())
+        for s, m, z, rt_val in zip(_sk_s, _sk_m, _sk_z, _sk_rt):
+            fd = _compute_features(s, m, z)
+            if fd is None:
+                skipped += 1
+                continue
+            feat_dicts.append(fd)
+            y_vals.append(float(rt_val))
+
+        if len(feat_dicts) < 10:
+            messagebox.showwarning("Insufficient Data",
+                f"Only {len(feat_dicts)} valid peptides for training.\n"
+                "Need at least 10.",
+                parent=win)
+            status_var.set("Insufficient valid training peptides.")
+            return
+
+        X_train, feat_names = _features_to_matrix(feat_dicts)
+        y_train = np.array(y_vals, dtype=np.float64)
+
+        # handle any NaN in features (fill with 0 — HistGBR handles natively)
+        nan_mask = np.isnan(X_train)
+        if nan_mask.any():
+            X_train = np.nan_to_num(X_train, nan=0.0)
+
+        # ── 4. select & train model ──
+        status_var.set(f"Training {algo} model on {len(y_train)} peptides…")
+        win.update_idletasks()
+
+        if algo == "HistGradientBoosting":
+            model = HistGradientBoostingRegressor(
+                max_iter=500, max_depth=8, learning_rate=0.05,
+                min_samples_leaf=5, l2_regularization=0.1,
+                random_state=42)
+        else:
+            model = GradientBoostingRegressor(
+                n_estimators=500, max_depth=6, learning_rate=0.05,
+                min_samples_leaf=5, subsample=0.8,
+                random_state=42)
+
+        model.fit(X_train, y_train)
+        _trained_model[0]      = model
+        _trained_feat_names[0] = feat_names
+        _trained_algorithm[0]  = algo
+        _set_model_ready(True)
+
+        # ── 5. cross-validate ──
+        cv_text = ""
+        y_cv_pred = None
+        if cv_var.get() and len(y_train) >= 20:
+            status_var.set("Running 5-fold cross-validation…")
+            win.update_idletasks()
+            try:
+                y_cv_pred = cross_val_predict(model, X_train, y_train, cv=5)
+                cv_r2    = r2_score(y_train, y_cv_pred)
+                cv_mae   = mean_absolute_error(y_train, y_cv_pred)
+                cv_medae = median_absolute_error(y_train, y_cv_pred)
+                cv_p95   = np.percentile(np.abs(y_cv_pred - y_train), 95)
+                _model_metrics[0] = {
+                    'R²': cv_r2, 'MAE': cv_mae, 'MedAE': cv_medae,
+                    'P95_window': cv_p95,
+                    'n_train': len(y_train), 'n_features': X_train.shape[1],
+                }
+                cv_text = (
+                    f"5-Fold CV  ▸  R² = {cv_r2:.4f}   "
+                    f"MAE = {cv_mae:.2f} min   "
+                    f"Median AE = {cv_medae:.2f} min   "
+                    f"P95 = ±{cv_p95:.2f} min   "
+                    f"(n = {len(y_train)}, {X_train.shape[1]} features)"
+                )
+            except Exception as exc:
+                cv_text = f"Cross-validation failed: {exc}"
+        elif cv_var.get():
+            cv_text = "Fewer than 20 training samples — CV skipped."
+        else:
+            cv_text = "Cross-validation disabled."
+
+        # show diagnostics
+        diag_metrics_var.set(cv_text)
+
+        # ── 5b. diagnostic plots ──
+        for w in diag_canvas_frame.winfo_children():
+            w.destroy()
+
+        if y_cv_pred is not None:
+            fig = Figure(figsize=(10, 4), dpi=100)
+
+            # actual vs predicted scatter
+            ax1 = fig.add_subplot(1, 2, 1)
+            ax1.scatter(y_train, y_cv_pred, alpha=0.35, s=12, edgecolors='none')
+            lo = min(y_train.min(), y_cv_pred.min()) - 1
+            hi = max(y_train.max(), y_cv_pred.max()) + 1
+            ax1.plot([lo, hi], [lo, hi], 'r--', lw=1)
+            ax1.set_xlabel('Observed RT (min)')
+            ax1.set_ylabel('Predicted RT (min)')
+            ax1.set_title('Actual vs Predicted (CV)')
+
+            # residual distribution
+            ax2 = fig.add_subplot(1, 2, 2)
+            residuals = y_cv_pred - y_train
+            ax2.hist(residuals, bins=50, edgecolor='black', alpha=0.7)
+            ax2.axvline(0, color='red', linestyle='--', lw=1)
+            _p95 = np.percentile(np.abs(residuals), 95)
+            ax2.axvline(-_p95, color='orange', linestyle=':', lw=1.2)
+            ax2.axvline( _p95, color='orange', linestyle=':', lw=1.2)
+            ax2.set_xlabel('Residual (min)')
+            ax2.set_ylabel('Count')
+            ax2.set_title(f'Residuals  (median = {np.median(residuals):.2f} min,  P95 = ±{_p95:.2f} min)')
+            fig.tight_layout()
+
+            canvas = FigureCanvasTkAgg(fig, master=diag_canvas_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        if not run_prediction:
+            status_var.set(f"Model trained ({algo}).  {cv_text}")
+            return
+
+        # ── 6. validate prediction file ──
+        status_var.set("Validating prediction file…")
+        win.update_idletasks()
+        pred_df = _validate_pred(show_popup=True)
+        if pred_df is None:
+            status_var.set(f"Model trained ({cv_text}).  Load a prediction file to continue.")
+            return
+        pc = _pred_col_map[0]
+
+        # ── 7. compute features for prediction peptides ──
+        status_var.set(f"Computing features for {len(pred_df)} prediction peptides…")
+        win.update_idletasks()
+
+        p_seq_col = pc['sequence']
+        p_mod_col = pc.get('modifications')
+        p_chg_col = pc.get('charge')
+
+        pred_rows = []  # (seq, mod, charge, feat_dict)
+        # Vectorized sequence filter + zip
+        _sp_seqs = pred_df[p_seq_col].astype(str).str.strip().str.upper()
+        _sp_valid = _sp_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+        _sp_idx = np.flatnonzero(_sp_valid.values)
+        _sp_s = _sp_seqs.values[_sp_idx]
+        _sp_m = pred_df[p_mod_col].values[_sp_idx] if p_mod_col else [''] * len(_sp_idx)
+        _sp_z = pred_df[p_chg_col].values[_sp_idx] if p_chg_col else [None] * len(_sp_idx)
+        for s, m, z in zip(_sp_s, _sp_m, _sp_z):
+            fd = _compute_features(s, m, z)
+            if fd is None:
+                continue
+            pred_rows.append((s, m, z, fd))
+
+        if not pred_rows:
+            messagebox.showwarning("No Valid Peptides",
+                "No valid peptide sequences found in the prediction file.",
+                parent=win)
+            status_var.set("No valid peptides to predict.")
+            return
+
+        # build feature matrix aligned to training feature order
+        X_pred = np.zeros((len(pred_rows), len(feat_names)), dtype=np.float64)
+        for i, (_, _, _, fd) in enumerate(pred_rows):
+            for j, fn in enumerate(feat_names):
+                X_pred[i, j] = fd.get(fn, 0.0)
+        X_pred = np.nan_to_num(X_pred, nan=0.0)
+
+        # ── 8. predict ──
+        status_var.set("Predicting retention times…")
+        win.update_idletasks()
+        y_pred = model.predict(X_pred)
+
+        try:
+            rt_half = float(pred_rt_window_var.get())
+        except ValueError:
+            rt_half = 5.0
+
+        # ── 9. populate treeview ──
+        for it in tree.get_children():
+            tree.delete(it)
+
+        table_data = []
+        for idx, (s, m, z, _) in enumerate(pred_rows):
+            rt = round(float(y_pred[idx]), 2)
+            t_start = round(max(rt - rt_half, 0.0), 2)
+            t_stop  = round(rt + rt_half, 2)
+            mod_display = str(m) if pd.notna(m) and str(m).strip() else ''
+            z_display = str(int(z)) if z is not None and not (isinstance(z, float) and np.isnan(z)) else ''
+            length = len(s)
+            tree.insert('', 'end', values=(
+                s, mod_display, z_display, length,
+                rt, t_start, t_stop,
+            ))
+            table_data.append({
+                'Sequence': s,
+                'Modifications': mod_display,
+                'Charge': z_display,
+                'Length': length,
+                'Predicted RT (min)': rt,
+                't start (min)': t_start,
+                't stop (min)': t_stop,
+            })
+
+        win._rt_pred_table_data = table_data
+        nb.select(tab_table)
+
+        status_var.set(
+            f"Predicted RT for {len(table_data)} peptides.  {cv_text}")
+
+    def _predict_with_trained_model():
+        trained = _trained_model[0]
+        trained_algo = _trained_algorithm[0]
+        if trained is None or not trained_algo:
+            messagebox.showwarning("Model Not Trained",
+                "Train a model first, then click Predict.", parent=win)
+            status_var.set("No trained model available.")
+            return
+
+        status_var.set("Validating prediction file…")
+        win.update_idletasks()
+        pred_df = _validate_pred(show_popup=True)
+        if pred_df is None:
+            return
+        pc = _pred_col_map[0]
+
+        p_seq_col = pc['sequence']
+        p_mod_col = pc.get('modifications')
+        p_chg_col = pc.get('charge')
+
+        try:
+            rt_half = float(pred_rt_window_var.get())
+        except ValueError:
+            rt_half = 5.0
+
+        for it in tree.get_children():
+            tree.delete(it)
+
+        table_data = []
+
+        if str(trained_algo).startswith("DeepLC"):
+            status_var.set(f"DeepLC predicting RT for {len(pred_df)} peptides…")
+            win.update_idletasks()
+
+            pred_dlc_rows = []
+            pred_meta = []
+            # Vectorized sequence filter + zip
+            _rd_seqs = pred_df[p_seq_col].astype(str).str.strip().str.upper()
+            _rd_valid = _rd_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+            _rd_idx = np.flatnonzero(_rd_valid.values)
+            _rd_s = _rd_seqs.values[_rd_idx]
+            _rd_m = pred_df[p_mod_col].values[_rd_idx] if p_mod_col else [''] * len(_rd_idx)
+            _rd_z = pred_df[p_chg_col].values[_rd_idx] if p_chg_col else [None] * len(_rd_idx)
+            for s, m, z in zip(_rd_s, _rd_m, _rd_z):
+                dlc_mod = _pd_mods_to_deeplc(s, m)
+                pred_dlc_rows.append({'seq': s, 'modifications': dlc_mod})
+                mod_display = str(m) if pd.notna(m) and str(m).strip() else ''
+                try:
+                    z_display = str(int(z)) if z is not None and not (isinstance(z, float) and np.isnan(z)) else ''
+                except (ValueError, TypeError):
+                    z_display = ''
+                pred_meta.append((s, mod_display, z_display, len(s)))
+
+            if not pred_dlc_rows:
+                messagebox.showwarning("No Valid Peptides",
+                    "No valid peptide sequences found in the prediction file.",
+                    parent=win)
+                status_var.set("No valid peptides to predict.")
+                return
+
+            try:
+                y_pred = np.array(trained.make_preds(seq_df=pd.DataFrame(pred_dlc_rows)))
+            except Exception as exc:
+                messagebox.showerror("DeepLC Error",
+                    f"DeepLC prediction failed:\n{exc}", parent=win)
+                status_var.set(f"DeepLC prediction failed: {exc}")
+                return
+
+            for idx, (s, mod_display, z_display, length) in enumerate(pred_meta):
+                rt = round(float(y_pred[idx]), 2)
+                t_start = round(max(rt - rt_half, 0.0), 2)
+                t_stop  = round(rt + rt_half, 2)
+                tree.insert('', 'end', values=(s, mod_display, z_display, length, rt, t_start, t_stop))
+                table_data.append({
+                    'Sequence': s,
+                    'Modifications': mod_display,
+                    'Charge': z_display,
+                    'Length': length,
+                    'Predicted RT (min)': rt,
+                    't start (min)': t_start,
+                    't stop (min)': t_stop,
+                })
+
+            win._rt_pred_table_data = table_data
+            nb.select(tab_table)
+            status_var.set(f"DeepLC predicted RT for {len(table_data)} peptides using trained model.")
+            return
+
+        if str(trained_algo).startswith("AlphaPeptDeep"):
+            status_var.set(f"AlphaPeptDeep predicting RT for {len(pred_df)} peptides…")
+            win.update_idletasks()
+
+            pred_apd_rows = []
+            pred_meta = []
+            # Vectorized sequence filter + zip
+            _ra_seqs = pred_df[p_seq_col].astype(str).str.strip().str.upper()
+            _ra_valid = _ra_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+            _ra_idx = np.flatnonzero(_ra_valid.values)
+            _ra_s = _ra_seqs.values[_ra_idx]
+            _ra_m = pred_df[p_mod_col].values[_ra_idx] if p_mod_col else [''] * len(_ra_idx)
+            _ra_z = pred_df[p_chg_col].values[_ra_idx] if p_chg_col else [2] * len(_ra_idx)
+            for s, m, z in zip(_ra_s, _ra_m, _ra_z):
+                try:
+                    z_int = int(z) if z and not (isinstance(z, float) and np.isnan(z)) else 2
+                except (ValueError, TypeError):
+                    z_int = 2
+                mods_str, mod_sites_str = _convert_pd_mods_to_alphapeptdeep(s, m)
+                pred_apd_rows.append({
+                    'sequence': s,
+                    'mods': mods_str,
+                    'mod_sites': mod_sites_str,
+                    'charge': z_int,
+                    'nce': 30.0,
+                    'instrument': 'Lumos',
+                })
+                mod_display = str(m) if pd.notna(m) and str(m).strip() else ''
+                z_display = str(z_int)
+                pred_meta.append((s, mod_display, z_display, len(s)))
+
+            if not pred_apd_rows:
+                messagebox.showwarning("No Valid Peptides",
+                    "No valid peptide sequences found in the prediction file.",
+                    parent=win)
+                status_var.set("No valid peptides to predict.")
+                return
+
+            try:
+                pred_result = trained.predict_rt(pd.DataFrame(pred_apd_rows))
+                if isinstance(pred_result, pd.DataFrame) and 'rt_pred' in pred_result.columns:
+                    y_pred = pred_result['rt_pred'].values
+                elif isinstance(pred_result, np.ndarray):
+                    y_pred = pred_result.flatten()
+                else:
+                    y_pred = np.array(pred_result).flatten()
+
+                # Denormalize predictions back to minutes
+                if _rt_norm_bounds[0] is not None:
+                    _bmin, _bmax = _rt_norm_bounds[0]
+                    y_pred = y_pred * (_bmax - _bmin) + _bmin
+            except Exception as exc:
+                messagebox.showerror("AlphaPeptDeep Error",
+                    f"AlphaPeptDeep RT prediction failed:\n{exc}", parent=win)
+                status_var.set(f"AlphaPeptDeep prediction failed: {exc}")
+                return
+
+            for idx, (s, mod_display, z_display, length) in enumerate(pred_meta):
+                rt = round(float(y_pred[idx]), 2)
+                t_start = round(max(rt - rt_half, 0.0), 2)
+                t_stop  = round(rt + rt_half, 2)
+                tree.insert('', 'end', values=(s, mod_display, z_display, length, rt, t_start, t_stop))
+                table_data.append({
+                    'Sequence': s,
+                    'Modifications': mod_display,
+                    'Charge': z_display,
+                    'Length': length,
+                    'Predicted RT (min)': rt,
+                    't start (min)': t_start,
+                    't stop (min)': t_stop,
+                })
+
+            win._rt_pred_table_data = table_data
+            nb.select(tab_table)
+            status_var.set(f"AlphaPeptDeep predicted RT for {len(table_data)} peptides using trained model.")
+            return
+
+        feat_names = _trained_feat_names[0] or []
+        if not feat_names:
+            messagebox.showwarning("Model State Error",
+                "Trained model is missing feature metadata. Retrain and try again.",
+                parent=win)
+            status_var.set("Missing trained feature metadata.")
+            return
+
+        status_var.set(f"Computing features for {len(pred_df)} prediction peptides…")
+        win.update_idletasks()
+
+        pred_rows = []
+        # Vectorized sequence filter + zip
+        _rs_seqs = pred_df[p_seq_col].astype(str).str.strip().str.upper()
+        _rs_valid = _rs_seqs.str.fullmatch(r'[ACDEFGHIKLMNPQRSTVWY]+')
+        _rs_idx = np.flatnonzero(_rs_valid.values)
+        _rs_s = _rs_seqs.values[_rs_idx]
+        _rs_m = pred_df[p_mod_col].values[_rs_idx] if p_mod_col else [''] * len(_rs_idx)
+        _rs_z = pred_df[p_chg_col].values[_rs_idx] if p_chg_col else [None] * len(_rs_idx)
+        for s, m, z in zip(_rs_s, _rs_m, _rs_z):
+            fd = _compute_features(s, m, z)
+            if fd is None:
+                continue
+            pred_rows.append((s, m, z, fd))
+
+        if not pred_rows:
+            messagebox.showwarning("No Valid Peptides",
+                "No valid peptide sequences found in the prediction file.",
+                parent=win)
+            status_var.set("No valid peptides to predict.")
+            return
+
+        X_pred = np.zeros((len(pred_rows), len(feat_names)), dtype=np.float64)
+        for i, (_, _, _, fd) in enumerate(pred_rows):
+            for j, fn in enumerate(feat_names):
+                X_pred[i, j] = fd.get(fn, 0.0)
+        X_pred = np.nan_to_num(X_pred, nan=0.0)
+
+        status_var.set("Predicting retention times…")
+        win.update_idletasks()
+        y_pred = trained.predict(X_pred)
+
+        for idx, (s, m, z, _) in enumerate(pred_rows):
+            rt = round(float(y_pred[idx]), 2)
+            t_start = round(max(rt - rt_half, 0.0), 2)
+            t_stop  = round(rt + rt_half, 2)
+            mod_display = str(m) if pd.notna(m) and str(m).strip() else ''
+            z_display = str(int(z)) if z is not None and not (isinstance(z, float) and np.isnan(z)) else ''
+            length = len(s)
+            tree.insert('', 'end', values=(s, mod_display, z_display, length, rt, t_start, t_stop))
+            table_data.append({
+                'Sequence': s,
+                'Modifications': mod_display,
+                'Charge': z_display,
+                'Length': length,
+                'Predicted RT (min)': rt,
+                't start (min)': t_start,
+                't stop (min)': t_stop,
+            })
+
+        win._rt_pred_table_data = table_data
+        nb.select(tab_table)
+        status_var.set(f"Predicted RT for {len(table_data)} peptides using trained model ({trained_algo}).")
+
+    def _set_model_ready(is_ready):
+        if is_ready:
+            predict_btn.set_enabled(True)
+            predict_btn.configure(bg='#2e7d32', hover_bg='#388e3c')
+        else:
+            predict_btn.set_enabled(False)
+            predict_btn.configure(bg='#2e7d32', hover_bg='#2e7d32', disabled_bg='#2e7d32', disabled_fg='#c8e6c9')
+
+    def _save_trained_model():
+        trained = _trained_model[0]
+        trained_algo = _trained_algorithm[0]
+        if trained is None or not trained_algo:
+            messagebox.showwarning("No Model", "Train or load a model first.", parent=win)
+            return
+
+        fp = filedialog.asksaveasfilename(
+            title="Save Trained RT Model",
+            defaultextension=".rtmodel",
+            filetypes=[("RT Model", "*.rtmodel"), ("Pickle files", "*.pkl"), ("All files", "*.*")],
+            parent=win,
+        )
+        if not fp:
+            return
+
+        payload = {
+            'model_type': 'proteoprm_rt_model_v1',
+            'algorithm': trained_algo,
+            'trained_model': trained,
+            'feature_names': list(_trained_feat_names[0]) if _trained_feat_names[0] is not None else [],
+            'metrics': dict(_model_metrics[0]) if _model_metrics[0] else {},
+            'saved_at': datetime.datetime.now().isoformat(),
+        }
+
+        try:
+            with open(fp, 'wb') as fh:
+                pickle.dump(payload, fh)
+            status_var.set(f"Model saved: {os.path.basename(fp)}")
+            messagebox.showinfo("Model Saved", f"Trained model saved to:\n{fp}", parent=win)
+        except Exception as exc:
+            messagebox.showerror("Save Error", f"Could not save model:\n{exc}", parent=win)
+
+    def _load_trained_model():
+        fp = filedialog.askopenfilename(
+            title="Load Trained RT Model",
+            filetypes=[("RT Model", "*.rtmodel *.pkl"), ("All files", "*.*")],
+            parent=win,
+        )
+        if not fp:
+            return
+
+        try:
+            with open(fp, 'rb') as fh:
+                payload = pickle.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not load model:\n{exc}", parent=win)
+            return
+
+        if not isinstance(payload, dict) or payload.get('model_type') != 'proteoprm_rt_model_v1':
+            messagebox.showerror("Load Error", "Invalid or unsupported model file.", parent=win)
+            return
+
+        loaded_algo = payload.get('algorithm')
+        loaded_model = payload.get('trained_model')
+        loaded_feats = payload.get('feature_names', [])
+        loaded_metrics = payload.get('metrics', {})
+
+        if loaded_model is None or not loaded_algo:
+            messagebox.showerror("Load Error", "Model file is missing required fields.", parent=win)
+            return
+
+        _trained_model[0] = loaded_model
+        _trained_algorithm[0] = loaded_algo
+        _trained_feat_names[0] = list(loaded_feats) if loaded_feats is not None else []
+        _model_metrics[0] = dict(loaded_metrics) if isinstance(loaded_metrics, dict) else {}
+
+        if loaded_algo in _algo_choices:
+            algo_var.set(loaded_algo)
+
+        if _model_metrics[0]:
+            m = _model_metrics[0]
+            if {'R²', 'MAE', 'MedAE'}.issubset(m.keys()):
+                diag_metrics_var.set(
+                    f"Loaded model ({loaded_algo})  ▸  R² = {m['R²']:.4f}   MAE = {m['MAE']:.2f} min   Median AE = {m['MedAE']:.2f} min"
+                )
+            else:
+                diag_metrics_var.set(f"Loaded model ({loaded_algo}).")
+        else:
+            diag_metrics_var.set(f"Loaded model ({loaded_algo}).")
+
+        _set_model_ready(True)
+        status_var.set(f"Loaded trained model: {os.path.basename(fp)}")
+
+    def _train_model_only():
+        _train_and_predict(run_prediction=False)
+
+    def _run_threaded(target_func):
+        """Run work on a background thread and surface failures."""
+        def _ui_call(func, *args, **kwargs):
+            if threading.current_thread() is threading.main_thread():
+                return func(*args, **kwargs)
+
+            done = threading.Event()
+            box = {}
+
+            def _invoke():
+                try:
+                    box['value'] = func(*args, **kwargs)
+                except Exception as err:
+                    box['error'] = err
+                finally:
+                    done.set()
+
+            win.after(0, _invoke)
+            done.wait()
+            if 'error' in box:
+                raise box['error']
+            return box.get('value')
+
+        orig_status_set = status_var.set
+        orig_update_idle = win.update_idletasks
+        orig_get_children = tree.get_children
+        orig_tree_delete = tree.delete
+        orig_tree_insert = tree.insert
+        orig_nb_select = nb.select
+        orig_showwarning = messagebox.showwarning
+        orig_showerror = messagebox.showerror
+        orig_showinfo = messagebox.showinfo
+        orig_canvas_cls = FigureCanvasTkAgg
+
+        def _safe_canvas_ctor(*args, **kwargs):
+            canvas_obj = _ui_call(orig_canvas_cls, *args, **kwargs)
+            _orig_draw = canvas_obj.draw
+            _orig_get_widget = canvas_obj.get_tk_widget
+            canvas_obj.draw = lambda *a, **k: _ui_call(_orig_draw, *a, **k)
+            canvas_obj.get_tk_widget = lambda *a, **k: _ui_call(_orig_get_widget, *a, **k)
+            return canvas_obj
+
+        status_var.set = lambda *a, **k: _ui_call(orig_status_set, *a, **k)
+        win.update_idletasks = lambda *a, **k: _ui_call(orig_update_idle, *a, **k)
+        tree.get_children = lambda *a, **k: _ui_call(orig_get_children, *a, **k)
+        tree.delete = lambda *a, **k: _ui_call(orig_tree_delete, *a, **k)
+        tree.insert = lambda *a, **k: _ui_call(orig_tree_insert, *a, **k)
+        nb.select = lambda *a, **k: _ui_call(orig_nb_select, *a, **k)
+        messagebox.showwarning = lambda *a, **k: _ui_call(orig_showwarning, *a, **k)
+        messagebox.showerror = lambda *a, **k: _ui_call(orig_showerror, *a, **k)
+        messagebox.showinfo = lambda *a, **k: _ui_call(orig_showinfo, *a, **k)
+        globals()['FigureCanvasTkAgg'] = _safe_canvas_ctor
+
+        try:
+            target_func()
+        except Exception as exc:
+            logging.exception("RT predictor background task failed")
+            win.after(0, lambda: status_var.set(f"Error: {exc}"))
+            win.after(
+                0,
+                lambda: messagebox.showerror(
+                    "RT Predictor Error",
+                    f"An error occurred while running the RT task:\n{exc}\n\n"
+                    f"See log for details:\n{temp_log_file}",
+                    parent=win,
+                ),
+            )
+        finally:
+            status_var.set = orig_status_set
+            win.update_idletasks = orig_update_idle
+            tree.get_children = orig_get_children
+            tree.delete = orig_tree_delete
+            tree.insert = orig_tree_insert
+            nb.select = orig_nb_select
+            messagebox.showwarning = orig_showwarning
+            messagebox.showerror = orig_showerror
+            messagebox.showinfo = orig_showinfo
+            globals()['FigureCanvasTkAgg'] = orig_canvas_cls
+
+    # action buttons
+    train_btn = RoundedCanvasButton(
+        action_frame, text="Train Model",
+        bg='#ef6c00', fg='white', hover_bg='#f57c00',
+        font=('Segoe UI', 10, 'bold'), corner_radius=8, height=34,
+        command=lambda: threading.Thread(
+            target=lambda: _run_threaded(_train_model_only), daemon=True).start(),
+    )
+    train_btn.grid(row=0, column=1, sticky='e', padx=10)
+
+    predict_btn = RoundedCanvasButton(
+        action_frame, text="Predict",
+        bg='#2e7d32', fg='white', hover_bg='#388e3c',
+        disabled_bg='#2e7d32', disabled_fg='#c8e6c9',
+        font=('Segoe UI', 10, 'bold'), corner_radius=8, height=34,
+        command=lambda: threading.Thread(
+            target=lambda: _run_threaded(_predict_with_trained_model), daemon=True).start(),
+    )
+    predict_btn.grid(row=0, column=2, sticky='e', padx=(0, 10))
+
+    # --- tab 3: model management ---
+    tab_mgmt = ttk.Frame(nb)
+    nb.add(tab_mgmt, text="Model Management")
+    tab_mgmt.columnconfigure(0, weight=1)
+
+    mgmt_inner = ttk.LabelFrame(tab_mgmt, text="Trained Model")
+    mgmt_inner.pack(fill='x', padx=12, pady=12)
+    mgmt_inner.columnconfigure(0, weight=1)
+
+    ttk.Label(
+        mgmt_inner,
+        text="Save the current trained model to disk or load a previously saved model.",
+        foreground='gray'
+    ).grid(row=0, column=0, columnspan=2, sticky='w', padx=10, pady=(8, 6))
+
+    ttk.Button(mgmt_inner, text="Save Model", command=_save_trained_model).grid(
+        row=1, column=0, sticky='w', padx=10, pady=(0, 10)
+    )
+    ttk.Button(mgmt_inner, text="Load Model", command=_load_trained_model).grid(
+        row=1, column=1, sticky='w', padx=10, pady=(0, 10)
+    )
+
+    _set_model_ready(False)
+
+    # ── export buttons ────────────────────────────────────────────────────
+    export_frame = ttk.Frame(outer)
+    export_frame.grid(row=3, column=0, sticky='ew', padx=10, pady=(0, 10))
+
+    def _export_instrument_csv():
+        items = tree.get_children()
+        if not items:
+            messagebox.showwarning("No Data",
+                "Nothing to export — run Train & Predict first.", parent=win)
+            return
+        fp = filedialog.asksaveasfilename(
+            title="Export Instrument-Ready CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=win)
+        if not fp:
+            return
+        try:
+            with open(fp, 'w', newline='') as fh:
+                fh.write("Compound,Formula,Adduct,m/z,z,t start (min),t stop (min)\n")
+                for it in items:
+                    v = tree.item(it)['values']
+                    seq, z, t0, t1 = v[0], v[2], v[5], v[6]
+                    fh.write(f"{seq},,(no adduct),,{z},{t0},{t1}\n")
+            messagebox.showinfo("Export Complete",
+                f"Instrument CSV exported to:\n{fp}", parent=win)
+        except Exception as exc:
+            messagebox.showerror("Export Error",
+                f"Could not export file:\n{exc}", parent=win)
+
+    def _export_full_csv():
+        items = tree.get_children()
+        if not items:
+            messagebox.showwarning("No Data",
+                "Nothing to export — run Train & Predict first.", parent=win)
+            return
+        fp = filedialog.asksaveasfilename(
+            title="Export Full Predicted Table",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=win)
+        if not fp:
+            return
+        try:
+            with open(fp, 'w', newline='') as fh:
+                fh.write(','.join(tree_cols) + '\n')
+                for it in items:
+                    vals = tree.item(it)['values']
+                    parts = []
+                    for v in vals:
+                        s = str(v)
+                        if ',' in s or '"' in s:
+                            s = '"' + s.replace('"', '""') + '"'
+                        parts.append(s)
+                    fh.write(','.join(parts) + '\n')
+            messagebox.showinfo("Export Complete",
+                f"Full table exported to:\n{fp}", parent=win)
+        except Exception as exc:
+            messagebox.showerror("Export Error",
+                f"Could not export file:\n{exc}", parent=win)
+
+    def _export_for_inclusion():
+        """Export predictions in a format directly loadable by the
+        PRM Inclusion List Generator (Sequence + Modifications + Charge + RT cols)."""
+        items = tree.get_children()
+        if not items:
+            messagebox.showwarning("No Data",
+                "Nothing to export — run Train & Predict first.", parent=win)
+            return
+        fp = filedialog.asksaveasfilename(
+            title="Export for Inclusion List Generator",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=win)
+        if not fp:
+            return
+        try:
+            with open(fp, 'w', newline='') as fh:
+                fh.write("Sequence,Modifications,Charge,Predicted RT (min),"
+                         "t start (min),t stop (min)\n")
+                for it in items:
+                    v = tree.item(it)['values']
+                    seq, mods, z = v[0], v[1], v[2]
+                    rt, t0, t1 = v[4], v[5], v[6]
+                    mods_safe = f'"{mods}"' if ',' in str(mods) else str(mods)
+                    fh.write(f"{seq},{mods_safe},{z},{rt},{t0},{t1}\n")
+            messagebox.showinfo("Export Complete",
+                f"Inclusion-list-ready CSV exported to:\n{fp}", parent=win)
+        except Exception as exc:
+            messagebox.showerror("Export Error",
+                f"Could not export file:\n{exc}", parent=win)
+
+    ttk.Button(export_frame, text="Export Instrument CSV",
+               command=_export_instrument_csv).pack(side='right', padx=5)
+    ttk.Button(export_frame, text="Export Full Table",
+               command=_export_full_csv).pack(side='right', padx=5)
+    ttk.Button(export_frame, text="Export for Inclusion List",
+               command=_export_for_inclusion).pack(side='right', padx=5)
+    ttk.Button(export_frame, text="Delete Selected Rows",
+               command=_delete_selected).pack(side='left', padx=5)
+
+def validate_modifications_from_file(prm_path):
+    """
+    Validate PRM file structure and content for Excel, CSV, or TSV files.
+    
+    Expected column order (strict positional, column names are ignored):
+    - Column 0: Peptide sequence (amino acid letters only: A-Z)
+    - Column 1: Modifications (format: NxModName [residue_positions]; can be empty)
+    - Column 2: Precursor m/z (positive numeric value)
+    - Column 3: Precursor charge (positive integer, typically 1-6)
+    - Column 4: Start RT (non-negative numeric value)
+    - Column 5: Stop RT (non-negative numeric value, must be >= Start RT)
+    - Column 6: Known RT (optional, non-negative numeric value)
+    
+    Parameters:
+    -----------
+    prm_path : str
+        Path to the PRM input file (Excel, CSV, or TSV)
+        
+    Returns:
+    --------
+    bool
+        True if all validations pass, False otherwise
+    """
+    try:
+        if prm_path.lower().endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(prm_path)
+        elif prm_path.lower().endswith('.csv'):
+            df = pd.read_csv(prm_path)
+        elif prm_path.lower().endswith('.tsv'):
+            df = pd.read_csv(prm_path, sep='\t')
+        else:
+            raise ValueError(f"Unsupported file format: {prm_path}")
+        
+        # Call the existing validation logic
+        return validate_modifications_from_dataframe(df, prm_path)
+            
+    except pd.errors.EmptyDataError:
+        messagebox.showerror("Error", "The PRM input file appears to be empty.")
+        prm_file_valid = False
+        return False
+    except Exception as e:
+        logging.error(f"Error validating PRM file: {e}")
+        messagebox.showerror("Error", f"Could not validate PRM input file: {str(e)}")
+        prm_file_valid = False
+        return False
+
+def validate_modifications_from_excel(prm_path):
+    """
+    Legacy function for Excel files - now calls the unified validation.
+    """
+    return validate_modifications_from_file(prm_path)
+
+def validate_modifications_from_dataframe(df, file_path=""):
+    """
+    Validate PRM DataFrame structure and content.
+    
+    Expected column order (strict positional, column names are ignored):
+    - Column 0: Peptide sequence (amino acid letters only: A-Z)
+    - Column 1: Modifications (format: NxModName [residue_positions]; can be empty)
+    - Column 2: Precursor m/z (positive numeric value)
+    - Column 3: Precursor charge (positive integer, typically 1-6)
+    - Column 4: Start RT (non-negative numeric value)
+    - Column 5: Stop RT (non-negative numeric value, must be >= Start RT)
+    - Column 6: Known RT (optional, non-negative numeric value)
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame containing PRM data
+    file_path : str
+        File path for error messages
+        
+    Returns:
+    --------
+    bool
+        True if all validations pass, False otherwise
+    """
+    global prm_file_valid
+    from tkinter import messagebox
+
+    try:
+        errors = []
+        
+        # Check minimum column count
+        if df.shape[1] < 6:
+            messagebox.showerror(
+                "Invalid PRM File Structure",
+                f"PRM input file must have at least 6 columns. Found {df.shape[1]} columns.\n\n"
+                f"Expected column order:\n"
+                f"1. Peptide sequence\n"
+                f"2. Modifications\n"
+                f"3. Precursor m/z\n"
+                f"4. Precursor charge\n"
+                f"5. Start RT\n"
+                f"6. Stop RT\n"
+                f"7. Known RT (optional)"
+            )
+            prm_file_valid = False
+            return False
+        
+        # Check for completely duplicate rows (exact duplicates across all columns)
+        # This helps identify unintended data entry errors or copy-paste mistakes
+        duplicates = df.duplicated(keep=False)
+        if duplicates.any():
+            duplicate_indices = df[duplicates].index.tolist()
+            duplicate_rows_display = [f"Row {idx + 2}" for idx in duplicate_indices]
+            
+            # Ask user if they want to remove duplicates
+            response = messagebox.askyesno(
+                "Duplicate Rows Detected",
+                f"Found {len(duplicate_rows_display)} duplicate row(s) in the input file:\n\n"
+                f"{', '.join(duplicate_rows_display[:10])}"
+                f"{f' ... and {len(duplicate_rows_display) - 10} more' if len(duplicate_rows_display) > 10 else ''}\n\n"
+                f"Click 'Yes' to remove duplicates and continue validation.\n"
+                f"Click 'No' to stop and fix the file manually."
+            )
+            
+            if response:
+                # Remove duplicate rows, keeping only the first occurrence
+                df = df.drop_duplicates(keep='first')
+                logging.info(f"Removed {duplicates.sum()} duplicate rows from PRM input file")
+            else:
+                prm_file_valid = False
+                return False
+        
+        # Validate Column 0: Peptide sequence (must contain only valid amino acid letters)
+        valid_aa = set('ACDEFGHIKLMNPQRSTVWY')
+        for idx, peptide in enumerate(df.iloc[:, 0]):
+            if pd.isna(peptide) or not str(peptide).strip():
+                errors.append(f"Row {idx + 2}: Peptide sequence is empty")
+            else:
+                peptide_str = str(peptide).strip().upper()
+                
+                # Check peptide length (minimum 5 amino acids)
+                if len(peptide_str) < 5:
+                    errors.append(f"Row {idx + 2}: Peptide '{peptide_str}' is too short (must be ≥5 amino acids, found {len(peptide_str)})")
+                
+                # Check for invalid amino acid characters
+                invalid_chars = set(peptide_str) - valid_aa
+                if invalid_chars:
+                    errors.append(f"Row {idx + 2}: Invalid characters in peptide '{peptide_str}': {', '.join(sorted(invalid_chars))}")
+        
+        # Validate Column 1: Modifications (can be empty, but if present must follow format)
+        valid_mods = set(m['name'].lower() for m in FIXED_MODIFICATIONS + VARIABLE_MODIFICATIONS)
+        id_to_name = {}
+        for name, mod_info in UNIMOD_MODIFICATIONS.items():
+            if 'id' in mod_info:
+                id_to_name[str(mod_info['id'])] = name
+        
+        invalid_mods = set()
+        for idx, mod_entry in enumerate(df.iloc[:, 1]):
+            if pd.isna(mod_entry) or not str(mod_entry).strip():
+                continue  # Empty modifications are allowed
+            
+            mod_str = str(mod_entry).strip()
+            
+            # Split by semicolons outside brackets
+            mods = []
+            current_mod = ""
+            in_brackets = False
+            
+            for char in mod_str:
+                if char == '[':
+                    in_brackets = True
+                    current_mod += char
+                elif char == ']':
+                    in_brackets = False
+                    current_mod += char
+                elif char == ';' and not in_brackets:
+                    if current_mod.strip():
+                        mods.append(current_mod.strip())
+                    current_mod = ""
+                else:
+                    current_mod += char
+            
+            if current_mod.strip():
+                mods.append(current_mod.strip())
+            
+            # Validate each modification
+            for mod in mods:
+                # Check format: should have brackets with position info
+                if '[' in mod and ']' in mod:
+                    name_part = mod.split('[')[0].strip()
+                else:
+                    name_part = mod.strip()
+                
+                # Extract modification name (handling "NxModName" format)
+                if 'x' in name_part:
+                    parts = name_part.split('x', 1)
+                    try:
+                        int(parts[0])
+                        mod_name = parts[1].strip().lower()
+                    except ValueError:
+                        mod_name = name_part.lower()
+                else:
+                    mod_name = name_part.lower()
+                
+                if mod_name and mod_name not in valid_mods:
+                    resolved_name = id_to_name.get(mod_name, name_part.strip())
+                    if resolved_name != name_part.strip():
+                        invalid_mods.add(f"{name_part.strip()} (Unimod: {resolved_name})")
+                    else:
+                        invalid_mods.add(f"{name_part.strip()}")
+        
+        # Validate Column 2: Precursor m/z (must be positive numeric)
+        for idx, mz in enumerate(df.iloc[:, 2]):
+            if pd.isna(mz):
+                errors.append(f"Row {idx + 2}: Precursor m/z is empty")
+            else:
+                try:
+                    mz_val = float(mz)
+                    if mz_val <= 0:
+                        errors.append(f"Row {idx + 2}: Precursor m/z must be positive, got {mz_val}")
+                except (ValueError, TypeError):
+                    errors.append(f"Row {idx + 2}: Precursor m/z '{mz}' is not a valid number")
+        
+        # Validate Column 3: Precursor charge (must be positive integer)
+        for idx, charge in enumerate(df.iloc[:, 3]):
+            if pd.isna(charge):
+                errors.append(f"Row {idx + 2}: Precursor charge is empty")
+            else:
+                try:
+                    charge_val = int(float(charge))
+                    if charge_val <= 0 or charge_val > 10:
+                        errors.append(f"Row {idx + 2}: Precursor charge must be between 1-10, got {charge_val}")
+                except (ValueError, TypeError):
+                    errors.append(f"Row {idx + 2}: Precursor charge '{charge}' is not a valid integer")
+        
+        # Validate Column 4: Start RT (must be non-negative numeric)
+        for idx, start_rt in enumerate(df.iloc[:, 4]):
+            if pd.isna(start_rt):
+                errors.append(f"Row {idx + 2}: Start RT is empty")
+            else:
+                try:
+                    rt_val = float(start_rt)
+                    if rt_val < 0:
+                        errors.append(f"Row {idx + 2}: Start RT must be non-negative, got {rt_val}")
+                except (ValueError, TypeError):
+                    errors.append(f"Row {idx + 2}: Start RT '{start_rt}' is not a valid number")
+        
+        # Validate Column 5: Stop RT (must be non-negative numeric and >= Start RT)
+        for idx, (start_rt, stop_rt) in enumerate(zip(df.iloc[:, 4], df.iloc[:, 5])):
+            if pd.isna(stop_rt):
+                errors.append(f"Row {idx + 2}: Stop RT is empty")
+            else:
+                try:
+                    stop_val = float(stop_rt)
+                    if stop_val < 0:
+                        errors.append(f"Row {idx + 2}: Stop RT must be non-negative, got {stop_val}")
+                    elif not pd.isna(start_rt):
+                        start_val = float(start_rt)
+                        if stop_val < start_val:
+                            errors.append(f"Row {idx + 2}: Stop RT ({stop_val}) must be >= Start RT ({start_val})")
+                except (ValueError, TypeError):
+                    errors.append(f"Row {idx + 2}: Stop RT '{stop_rt}' is not a valid number")
+        
+        # Validate Column 6: Known RT (optional, but if present must be non-negative numeric)
+        if df.shape[1] > 6:
+            for idx, known_rt in enumerate(df.iloc[:, 6]):
+                if pd.isna(known_rt) or str(known_rt).strip() == '':
+                    continue  # Known RT is optional
+                try:
+                    rt_val = float(known_rt)
+                    if rt_val < 0:
+                        errors.append(f"Row {idx + 2}: Known RT must be non-negative, got {rt_val}")
+                except (ValueError, TypeError):
+                    errors.append(f"Row {idx + 2}: Known RT '{known_rt}' is not a valid number")
+        
+        # Report invalid modifications
+        if invalid_mods:
+            errors.insert(0, f"Undefined modifications: {', '.join(sorted(invalid_mods))}\n"
+                          f"Please add these in Settings > Manage Chemical Modifications.")
+        
+        # Show errors if any
+        if errors:
+            # Limit error display to first 20 errors
+            display_errors = errors[:20]
+            if len(errors) > 20:
+                display_errors.append(f"... and {len(errors) - 20} more errors")
+            
+            messagebox.showerror(
+                "PRM Input File Validation Failed",
+                f"Found {len(errors)} validation error(s):\n\n" + "\n".join(display_errors)
+            )
+            prm_file_valid = False
+            return False
+        
+        # All validations passed
+        prm_file_valid = True
+        logging.debug(f"PRM input file validated successfully: {len(df)} peptides")
+        return True
+            
+    except Exception as e:
+        logging.error(f"Error validating PRM DataFrame: {e}")
+        messagebox.showerror("Error", f"Could not validate PRM input file: {str(e)}")
+        prm_file_valid = False
+        return False
+    
+def cache_eic_data(output_folder):
+    """Load and cache EIC data from the output folder's EICs.csv file."""
+    global cached_eic_data
+    try:
+        eic_file = _output_path(output_folder, 'EICs')
+        if os.path.isfile(eic_file):
+            # Use a dictionary to store data by peptide+file for faster lookups
+            cached_eic_data = {}
+            eic_df = pd.read_csv(eic_file)
+            
+            # Pre-organize data by peptide and file for quick access
+            _eic_keys = eic_df['peptide'].astype(str) + '_' + eic_df['file'].astype(str)
+            for key, grp in eic_df.groupby(_eic_keys, sort=False):
+                cached_eic_data[key] = [r for r in grp.itertuples(index=False)]
+                
+            logging.info(f"Cached EIC data for {len(cached_eic_data)} peptide-file combinations")
+            return True
+    except Exception as e:
+        logging.error(f"Error caching EIC data: {str(e)}")
+        cached_eic_data = None
+    return False
+
+def cache_eic_data_hdf5(output_folder):
+    """Load and cache EIC data using HDF5 for better performance"""
+    global cached_eic_data_index
+    eic_file = _output_path(output_folder, 'EICs')
+    hdf_cache_file = os.path.join(output_folder, 'eic_cache.h5')
+    
+    try:
+        # If Excel file is newer than cache or cache doesn't exist, regenerate
+        if (not os.path.exists(hdf_cache_file) or 
+            (os.path.isfile(eic_file) and os.path.getmtime(eic_file) > os.path.getmtime(hdf_cache_file))):
+            
+            # Read from CSV and save to HDF5
+            eic_df = pd.read_csv(eic_file)
+            eic_df.to_hdf(hdf_cache_file, key='eics', mode='w')
+            
+            # Create an index of available peptides and files
+            cached_eic_data_index = set(
+                eic_df['peptide'].astype(str) + '_' + eic_df['modification'].astype(str) + '_' + eic_df['file'].astype(str)
+            )
+            logging.info(f"Created HDF5 cache with {len(cached_eic_data_index)} entries")
+        else:
+            # Just load the index but not the data
+            with pd.HDFStore(hdf_cache_file, mode='r') as store:
+                sample = store.select('eics', start=0, stop=5)
+                cached_eic_data_index = set(
+                    sample['peptide'].astype(str) + '_' + sample['file'].astype(str)
+                )
+            logging.info(f"Using existing HDF5 cache")
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error creating HDF5 cache: {str(e)}")
+        return False
+
+# Create an LRU cache for most recently used EICs
+from functools import lru_cache
+
+@lru_cache(maxsize=50)  # Cache the last 50 EICs
+def get_eic_data(peptide, mzml_file, hdf_cache_file):
+    """Get EIC data with in-memory caching for frequently accessed items"""
+    cache_key = f"{peptide}_{mzml_file}"
+    try:
+        with pd.HDFStore(hdf_cache_file, mode='r') as store:
+            query = f"peptide == '{peptide}' & file == '{mzml_file}'"
+            return store.select('eics', where=query)
+    except Exception as e:
+        logging.error(f"Error retrieving EIC from cache: {str(e)}")
+        return pd.DataFrame()
+        
+# Call this when loading results or changing files
+cache_eic_data(output_file_entry.get())
+    
+initialize_modifications()
+
+# Initialize log display
+toggle_logs(log_widget, show_logs, buffer_handler, widget_handler)
+
+root.mainloop()
