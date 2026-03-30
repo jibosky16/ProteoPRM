@@ -1,7 +1,114 @@
+import warnings
+warnings.filterwarnings('ignore')
+
 import numpy as np
-from scipy.signal import find_peaks
-from scipy.integrate import trapezoid
-import pandas as pd
+import importlib
+
+
+class _LazyModule:
+    """Load heavy modules on first attribute access."""
+
+    def __init__(self, module_name):
+        self._module_name = module_name
+        self._module = None
+
+    def _load(self):
+        if self._module is None:
+            self._module = importlib.import_module(self._module_name)
+        return self._module
+
+    def __getattr__(self, item):
+        return getattr(self._load(), item)
+
+    def __dir__(self):
+        return dir(self._load())
+
+
+_scipy_signal_mod = None
+_scipy_integrate_mod = None
+_scipy_ndimage_mod = None
+
+
+def _get_scipy_signal_mod():
+    global _scipy_signal_mod
+    if _scipy_signal_mod is None:
+        _scipy_signal_mod = importlib.import_module('scipy.signal')
+    return _scipy_signal_mod
+
+
+def _get_scipy_integrate_mod():
+    global _scipy_integrate_mod
+    if _scipy_integrate_mod is None:
+        _scipy_integrate_mod = importlib.import_module('scipy.integrate')
+    return _scipy_integrate_mod
+
+
+def _get_scipy_ndimage_mod():
+    global _scipy_ndimage_mod
+    if _scipy_ndimage_mod is None:
+        _scipy_ndimage_mod = importlib.import_module('scipy.ndimage')
+    return _scipy_ndimage_mod
+
+
+def find_peaks(*args, **kwargs):
+    return _get_scipy_signal_mod().find_peaks(*args, **kwargs)
+
+
+def savgol_filter(*args, **kwargs):
+    return _get_scipy_signal_mod().savgol_filter(*args, **kwargs)
+
+
+def trapezoid(*args, **kwargs):
+    return _get_scipy_integrate_mod().trapezoid(*args, **kwargs)
+
+
+def gaussian_filter1d(*args, **kwargs):
+    return _get_scipy_ndimage_mod().gaussian_filter1d(*args, **kwargs)
+
+
+pd = _LazyModule('pandas')
+_startup_warmup_started = False
+
+
+def _warmup_startup_modules():
+    """Preload common heavy modules after UI appears, in background."""
+    warmup_steps = [
+        ("pandas", lambda: pd.DataFrame({'_': [1]})),
+        ("scipy.signal", _get_scipy_signal_mod),
+        ("scipy.cluster.hierarchy", lambda: hierarchy.linkage(np.array([[0.0], [1.0]]), method='single')),
+        ("openpyxl", lambda: importlib.import_module('openpyxl')),
+        ("pyteomics.mzml", lambda: importlib.import_module('pyteomics.mzml')),
+    ]
+
+    print("[startup] Warm-up started (background).", flush=True)
+    t0 = time.perf_counter()
+    for step_name, step_fn in warmup_steps:
+        step_t0 = time.perf_counter()
+        try:
+            step_fn()
+            print(
+                f"[startup] {step_name} ready in "
+                f"{time.perf_counter() - step_t0:.2f}s",
+                flush=True)
+        except Exception as exc:
+            logging.debug(f"Startup warm-up skipped for {step_name}: {exc}")
+        # Yield between imports to keep the UI responsive.
+        time.sleep(0.05)
+
+    print(
+        f"[startup] Warm-up finished in {time.perf_counter() - t0:.2f}s",
+        flush=True)
+
+
+def _start_background_module_warmup():
+    """Start one-time background warm-up of common analysis imports."""
+    global _startup_warmup_started
+    if _startup_warmup_started:
+        return
+    _startup_warmup_started = True
+    threading.Thread(target=_warmup_startup_modules, daemon=True).start()
+
+
 import gc  # For garbage collection in batch processing
 # psutil — lazily imported where needed (system memory detection)
 import os
@@ -20,13 +127,11 @@ import tempfile
 # sklearn, seaborn, matplotlib, PIL, pyteomics, openpyxl, requests,
 # mokapot, ms2pip, peptdeep — lazily imported in the functions that need
 # them to speed up application startup.
-from scipy import stats
-from scipy.cluster import hierarchy
+stats = _LazyModule('scipy.stats')
+hierarchy = _LazyModule('scipy.cluster.hierarchy')
 import io
 import collections
 import traceback
-from scipy.ndimage import gaussian_filter1d
-from scipy.signal import savgol_filter
 import json
 import sv_ttk
 import shutil, subprocess
@@ -57,20 +162,29 @@ def _ensure_ms2pip():
     global _ms2pip_sp, _ms2pip_core, _MS2PIP_BACKEND, HAS_MS2PIP
     if _MS2PIP_BACKEND is not None:
         return  # already loaded
+    warnings.filterwarnings('ignore')
+    # Prefer the modern core backend (ms2pip >= 4.0) for batch prediction
+    _core_err = None
     try:
-        from ms2pip import single_prediction as _sp
-        _ms2pip_sp = _sp
-        _MS2PIP_BACKEND = 'legacy'
-    except (ImportError, ModuleNotFoundError, AttributeError):
-        pass
+        from ms2pip import core as _core
+        _ms2pip_core = _core
+        _MS2PIP_BACKEND = 'core'
+    except Exception as _exc:
+        _core_err = _exc
+    _legacy_err = None
     if _MS2PIP_BACKEND is None:
         try:
-            from ms2pip import core as _core
-            _ms2pip_core = _core
-            _MS2PIP_BACKEND = 'core'
-        except (ImportError, ModuleNotFoundError):
-            pass
+            from ms2pip import single_prediction as _sp
+            _ms2pip_sp = _sp
+            _MS2PIP_BACKEND = 'legacy'
+        except Exception as _exc:
+            _legacy_err = _exc
     HAS_MS2PIP = _MS2PIP_BACKEND is not None
+    if HAS_MS2PIP:
+        logging.info(f"MS2PIP backend loaded: {_MS2PIP_BACKEND}")
+    else:
+        logging.warning(f"MS2PIP: no backend available. "
+                        f"core error: {_core_err}; legacy error: {_legacy_err}")
 
 def _ensure_mokapot():
     """Import mokapot on first use."""
@@ -101,16 +215,25 @@ def _ensure_peptdeep():
             'ignore',
             message='mask_modloss is deprecated',
         )
-        # Snapshot root handlers before import; alphabase's set_logger()
-        # injects a StreamHandler(sys.stdout) that causes duplicate output.
-        _pre_handlers = set(logging.getLogger().handlers)
+        # Snapshot root logger state before import; alphabase's set_logger()
+        # may add/replace handlers, which can disconnect the GUI log widget.
+        _root_logger = logging.getLogger()
+        _pre_handlers = list(_root_logger.handlers)
+        _pre_level = _root_logger.level
+        _pre_disabled = _root_logger.disabled
         import peptdeep  # noqa: F811
         from peptdeep.pretrained_models import ModelManager as _MM
-        # Remove any StreamHandler that alphabase silently added to root
-        for _h in list(logging.getLogger().handlers):
+        # Remove any StreamHandler that alphabase silently added to root.
+        for _h in list(_root_logger.handlers):
             if _h not in _pre_handlers and isinstance(_h, logging.StreamHandler) \
                     and not isinstance(_h, logging.FileHandler):
-                logging.getLogger().removeHandler(_h)
+                _root_logger.removeHandler(_h)
+        # If peptdeep replaced root handlers entirely, restore ours.
+        for _h in _pre_handlers:
+            if _h not in _root_logger.handlers:
+                _root_logger.addHandler(_h)
+        _root_logger.setLevel(_pre_level)
+        _root_logger.disabled = _pre_disabled
         _APD_ModelManager = _MM
         _ALPHAPEPTDEEP_AVAILABLE = True
     except (ImportError, ModuleNotFoundError):
@@ -1144,6 +1267,27 @@ def _invalidate_excel_cache(output_folder=None):
         _excel_sheet_cache.clear()
     else:
         _excel_sheet_cache = {k: v for k, v in _excel_sheet_cache.items() if k[0] != output_folder}
+
+
+def _warmup_eic_lookup_cache_async(eic_df_cache):
+    """Build cached EIC peptide/file lookup in a background thread.
+
+    This is intentionally asynchronous so post-run viewer launch is not blocked.
+    """
+    global cached_eic_data
+    try:
+        _t0 = time.time()
+        _cache = {}
+        _grp_key = eic_df_cache['peptide'].astype(str) + '_' + eic_df_cache['file'].astype(str)
+        for key, group_df in eic_df_cache.groupby(_grp_key, sort=False):
+            _cache[key] = [row for row in group_df.itertuples(index=False)]
+        cached_eic_data = _cache
+        logging.info(
+            f"Background EIC lookup warmup complete: {len(_cache):,} peptide/file groups "
+            f"from {len(eic_df_cache):,} rows in {time.time() - _t0:.2f}s"
+        )
+    except Exception as e:
+        logging.debug(f"Background EIC cache warmup skipped: {e}")
 
 def _cache_plot_figure(cache_key, fig):
     """Store a rendered figure as PNG bytes in the LRU cache."""
@@ -2835,6 +2979,13 @@ class _StdStreamToLogger:
             self._reentrant = False
 
     def isatty(self):
+        return False
+
+    def close(self):
+        self.flush()
+
+    @property
+    def closed(self):
         return False
 
 
@@ -4618,10 +4769,16 @@ def calculate_complementarity_score(matched_fragments, peptide_length):
 _ms2pip_cache = {}          # key=(peptide, modification, charge, frag_type) -> {ion_key: pred_intensity}
 _ms2pip_cache_lock = threading.Lock()   # thread-safety for concurrent file workers
 _MS2PIP_MODEL_MAP = {
-    'HCD':  'HCD',
-    'CID':  'CID',
+    'HCD':  'HCDch2',
+    'CID':  'CIDch2',
     # ETD, EThcD, and UVPD are NOT supported by MS2PIP — no entry here.
     # The calling code must check membership before requesting predictions.
+}
+
+# Expected MS2 mass analyzer for each fragmentation type (training data provenance)
+_MS2PIP_FRAG_ANALYZER_MAP = {
+    'HCD': 'Orbitrap',
+    'CID': 'Linear Ion Trap',
 }
 
 # Fragmentation types that MS2PIP can model (used for user-facing validation)
@@ -4651,7 +4808,7 @@ def ms2pip_predict_intensities(peptide, modification, charge, fragmentation_type
         if cache_key in _ms2pip_cache:
             return _ms2pip_cache[cache_key]
 
-    model = _MS2PIP_MODEL_MAP.get(fragmentation_type, 'HCD')
+    model = _MS2PIP_MODEL_MAP.get(fragmentation_type, _MS2PIP_MODEL_MAP['HCD'])
 
     # Build MS2PIP modification string  "2|Oxidation|5|Phospho"  (1-based positions)
     ms2pip_mod_str = ''
@@ -4800,7 +4957,7 @@ def ms2pip_predict_all_peptides(peptides_info, fragmentation_type='HCD'):
     if _MS2PIP_BACKEND == 'core':
         try:
             from psm_utils import PSMList, Peptidoform as _PF
-            model = _MS2PIP_MODEL_MAP.get(fragmentation_type, 'HCD')
+            model = _MS2PIP_MODEL_MAP.get(fragmentation_type, _MS2PIP_MODEL_MAP['HCD'])
             model_dir = _ms2pip_model_dir()
 
             # Build list of (peptidoform_str, original_index) deduplicating by cache key
@@ -4835,21 +4992,34 @@ def ms2pip_predict_all_peptides(peptides_info, fragmentation_type='HCD'):
                 results = _ms2pip_core.predict_batch(
                     psm_list, model=model, model_dir=model_dir, processes=1
                 )
-                # Parse results
+                # Parse results — iterate over PSMList (predict_batch modifies in-place)
+                _n_parsed = 0
                 for r_idx, result in enumerate(results):
                     pf_str, pidx, cache_key = need_prediction[r_idx]
                     preds = _parse_processing_result(result)
+                    if r_idx == 0:
+                        _pi = getattr(result, 'predicted_intensity', None)
+                        logging.info(f"MS2PIP first result: type={type(result).__name__}, "
+                                     f"predicted_intensity type={type(_pi).__name__}, "
+                                     f"keys={list(_pi.keys())[:6] if isinstance(_pi, dict) else 'N/A'}, "
+                                     f"parsed {len(preds)} ion predictions")
                     with _ms2pip_cache_lock:
                         _ms2pip_cache[cache_key] = preds
                     all_preds[pidx] = preds
+                    if preds:
+                        _n_parsed += 1
 
                 batch_ok = True
                 logging.info(f"MS2PIP batch prediction complete — "
-                             f"{sum(1 for v in all_preds.values() if v)}/{n_total} successful")
+                             f"{_n_parsed}/{n_total} peptides have predictions")
+                if _n_parsed == 0:
+                    logging.warning("MS2PIP batch returned 0 successful predictions. "
+                                    "Model files may be missing or result format unrecognised.")
 
         except Exception as exc:
             logging.warning(f"MS2PIP batch prediction failed ({exc}); "
                             f"falling back to sequential predict_single.")
+            logging.debug(f"MS2PIP batch traceback: {traceback.format_exc()}")
             batch_ok = False
 
     # ---- Fallback: sequential predict_single ------------------------------
@@ -4893,10 +5063,20 @@ def _to_proforma_standalone(sequence, mods, precursor_charge):
     return f"{''.join(out)}/{int(precursor_charge)}"
 
 
+_parse_result_logged_once = False
+
 def _parse_processing_result(result):
     """Parse a ms2pip ProcessingResult into our {(ion_type, pos, charge): intensity} dict."""
+    global _parse_result_logged_once
     preds = {}
     pred_map = getattr(result, 'predicted_intensity', None)
+
+    if pred_map is None and not _parse_result_logged_once:
+        _parse_result_logged_once = True
+        _attrs = [a for a in dir(result) if not a.startswith('_')]
+        logging.info(f"MS2PIP result has no predicted_intensity; type={type(result).__name__}, "
+                     f"attrs={_attrs[:15]}")
+
     if isinstance(pred_map, dict):
         for ion_key, intensities in pred_map.items():
             ion_key_str = str(ion_key).lower()
@@ -4906,14 +5086,46 @@ def _parse_processing_result(result):
             ion_type = m.group(1)
             ion_charge = int(m.group(2)) if m.group(2) else 1
             if not isinstance(intensities, (list, tuple, np.ndarray)):
+                if isinstance(intensities, (int, float)):
+                    preds[(ion_type, 1, ion_charge)] = float(intensities)
                 continue
             for frag_pos, pred_int in enumerate(intensities, start=1):
                 preds[(ion_type, frag_pos, ion_charge)] = float(pred_int)
+    elif pred_map is not None and not isinstance(pred_map, dict):
+        if not _parse_result_logged_once:
+            _parse_result_logged_once = True
+        logging.info(f"MS2PIP predicted_intensity is {type(pred_map).__name__}, not dict. "
+                     f"Attempting fallback parsing.")
+        try:
+            if hasattr(pred_map, 'items'):
+                for ion_key, intensities in pred_map.items():
+                    ion_key_str = str(ion_key).lower()
+                    m = re.match(r'([a-z]+?)(\d*)$', ion_key_str)
+                    if not m:
+                        continue
+                    ion_type = m.group(1)
+                    ion_charge = int(m.group(2)) if m.group(2) else 1
+                    if hasattr(intensities, '__iter__'):
+                        for frag_pos, pred_int in enumerate(intensities, start=1):
+                            preds[(ion_type, frag_pos, ion_charge)] = float(pred_int)
+            elif hasattr(pred_map, '__iter__'):
+                for ion_key, intensities in pred_map:
+                    ion_key_str = str(ion_key).lower()
+                    m = re.match(r'([a-z]+?)(\d*)$', ion_key_str)
+                    if not m:
+                        continue
+                    ion_type = m.group(1)
+                    ion_charge = int(m.group(2)) if m.group(2) else 1
+                    if hasattr(intensities, '__iter__'):
+                        for frag_pos, pred_int in enumerate(intensities, start=1):
+                            preds[(ion_type, frag_pos, ion_charge)] = float(pred_int)
+        except Exception as _fe:
+            logging.debug(f"Fallback parsing failed: {_fe}")
+
     # MS2PIP models return log2-transformed intensities; convert to linear
     if preds:
         if any(v < 0 for v in preds.values()):
             preds = {k: 2.0 ** v for k, v in preds.items()}
-        # Normalise to [0, 1]
         max_val = max(preds.values())
         if max_val > 0:
             preds = {k: v / max_val for k, v in preds.items()}
@@ -5061,21 +5273,27 @@ def _get_apd_model_manager(
                             psm_df = psm_df.loc[_valid_seq].copy()
 
                     if len(psm_df) >= 10:
-                        # ── Subsample BEFORE predict_all to cap computation ──
                         _MAX_CAL_PSMS = 5_000
-                        if len(psm_df) > _MAX_CAL_PSMS:
-                            try:
-                                from peptdeep.pretrained_models import psm_sampling_with_important_mods
-                                psm_df = psm_sampling_with_important_mods(
-                                    psm_df, n_sample=_MAX_CAL_PSMS,
-                                    top_n_mods=10, n_sample_each_mod=100,
-                                ).reset_index(drop=True)
-                            except ImportError:
-                                psm_df = psm_df.sample(
-                                    n=_MAX_CAL_PSMS, random_state=42
-                                ).reset_index(drop=True)
-                            logging.info(f"AlphaPeptDeep: subsampled to {len(psm_df):,} PSMs "
-                                         f"(mod-aware) for transfer learning")
+                        _n_psm = len(psm_df)
+                        if _n_psm > _MAX_CAL_PSMS:
+                            _rts = psm_df['rt'].fillna(0).values.astype(float)
+                            _mods_l = psm_df['mods'].fillna('').astype(str).tolist()
+                            _seqs = psm_df['sequence'].astype(str).tolist()
+                            _z = psm_df['charge'].fillna(2).astype(int).tolist()
+                            _sel = _apd_select_training_indices(
+                                _rts, _mods_l, _seqs, charges=_z,
+                                max_n=_MAX_CAL_PSMS,
+                                rng=np.random.RandomState(42))
+                            psm_df = psm_df.iloc[_sel].reset_index(drop=True)
+                            logging.info(
+                                f"AlphaPeptDeep: subsampled {_n_psm:,} → {len(psm_df):,} PSMs "
+                                f"for MS2 transfer learning (mods + RT + length + KD + "
+                                f"charged-aa% + z, cap={_MAX_CAL_PSMS}); "
+                                f"RT in sample [{_rts[_sel].min():.2f}, {_rts[_sel].max():.2f}] min")
+                        else:
+                            logging.info(
+                                f"AlphaPeptDeep: using all {len(psm_df):,} PSMs "
+                                f"for MS2 transfer learning (≤{_MAX_CAL_PSMS:,} cap)")
 
                         # ── Step 1: predict fragments to get m/z positions ──
                         cal_df = psm_df[['sequence', 'mods', 'mod_sites',
@@ -5101,53 +5319,63 @@ def _get_apd_model_manager(
                             frag_tol_ppm=20.0,
                         )
 
-                        # ── Diagnostics: verify alignment & matching ──
-                        _nonzero_frag = (frag_mz_df.values > 0).sum()
-                        _nonzero_match = (matched_intensity_df.values > 0).sum()
-                        logging.info(
-                            f"AlphaPeptDeep diag: frag_mz_df shape={frag_mz_df.shape}, "
-                            f"non-zero m/z={_nonzero_frag:,}; "
-                            f"matched_intensity_df non-zero={_nonzero_match:,}")
-                        # Spot-check alignment: first 3 PSMs
-                        for _si in range(min(3, len(cal_df))):
-                            _seq = cal_df.iloc[_si].get('sequence', '?')
-                            _fs = int(cal_df.iloc[_si]['frag_start_idx'])
-                            _fe = int(cal_df.iloc[_si]['frag_stop_idx'])
-                            _obs_n = len(psm_df.iloc[_si]['spec_mzs']) if psm_df.iloc[_si]['spec_mzs'] is not None else 0
-                            _pred_nz = (frag_mz_df.values[_fs:_fe] > 0).sum()
-                            _match_nz = (matched_intensity_df.values[_fs:_fe] > 0).sum()
-                            logging.info(
-                                f"  PSM[{_si}] seq={_seq[:20]}, frag[{_fs}:{_fe}], "
-                                f"obs_peaks={_obs_n}, pred_mz_nonzero={_pred_nz}, "
-                                f"matched={_match_nz}")
-                        # Check column consistency
-                        _model_types = set(mgr.ms2_model.charged_frag_types)
-                        _frag_cols = set(frag_mz_df.columns)
-                        _match_cols = set(matched_intensity_df.columns)
-                        if _frag_cols != _model_types:
+                        _qf = _apd_ms2_apply_matched_quality_filter(
+                            cal_df, psm_df, frag_mz_df, matched_intensity_df)
+                        if _qf is None or len(_qf[0]) < 10:
                             logging.warning(
-                                f"AlphaPeptDeep diag: column mismatch! "
-                                f"model expects {sorted(_model_types)}, "
-                                f"frag_mz has {sorted(_frag_cols)}")
-                        if _frag_cols != _match_cols:
-                            logging.warning(
-                                f"AlphaPeptDeep diag: matched cols "
-                                f"{sorted(_match_cols)} != frag cols "
-                                f"{sorted(_frag_cols)}")
+                                "AlphaPeptDeep: matched-peak quality filter left "
+                                f"{0 if _qf is None else len(_qf[0])} PSMs (<10); "
+                                "skipping MS2 transfer learning. "
+                                f"Adjust _APD_MS2_CAL_MIN_MATCHED_FRAGMENTS="
+                                f"{_APD_MS2_CAL_MIN_MATCHED_FRAGMENTS} or "
+                                f"_APD_MS2_CAL_MIN_MATCHED_FRAC_OF_PRED if needed.")
+                        else:
+                            cal_df, psm_df, frag_mz_df, matched_intensity_df = _qf
 
-                        # ── Step 3: train (transfer-learn) the MS2 model ──
-                        # Paper-recommended TL params: epoch=10, warmup=5,
-                        # lr=1e-5, dropout=0.1, batch_size=256.
-                        mgr.epoch_to_train_ms2 = 10
-                        mgr.warmup_epoch_to_train_ms2 = 5
-                        mgr.lr_to_train_ms2 = 1e-5
-                        mgr.batch_size_to_train_ms2 = 256
-                        mgr.psm_num_to_train_ms2 = _MAX_CAL_PSMS
-                        mgr.top_n_mods_to_train = 10
-                        mgr.psm_num_per_mod_to_train_ms2 = 100
-                        mgr.ms2_model.model.dropout.p = 0.1
-                        mgr.train_ms2_model(cal_df, matched_intensity_df)
-                        logging.info(f"AlphaPeptDeep: MS2 model calibrated on {len(cal_df)} PSMs")
+                            # ── Diagnostics: verify alignment & matching ──
+                            _nonzero_frag = (frag_mz_df.values > 0).sum()
+                            _nonzero_match = (matched_intensity_df.values > 0).sum()
+                            logging.info(
+                                f"AlphaPeptDeep diag: frag_mz_df shape={frag_mz_df.shape}, "
+                                f"non-zero m/z={_nonzero_frag:,}; "
+                                f"matched_intensity_df non-zero={_nonzero_match:,}")
+                            for _si in range(min(3, len(cal_df))):
+                                _seq = cal_df.iloc[_si].get('sequence', '?')
+                                _fs = int(cal_df.iloc[_si]['frag_start_idx'])
+                                _fe = int(cal_df.iloc[_si]['frag_stop_idx'])
+                                _obs_n = len(psm_df.iloc[_si]['spec_mzs']) if psm_df.iloc[_si]['spec_mzs'] is not None else 0
+                                _pred_nz = (frag_mz_df.values[_fs:_fe] > 0).sum()
+                                _match_nz = (matched_intensity_df.values[_fs:_fe] > 0).sum()
+                                logging.info(
+                                    f"  PSM[{_si}] seq={_seq[:20]}, frag[{_fs}:{_fe}], "
+                                    f"obs_peaks={_obs_n}, pred_mz_nonzero={_pred_nz}, "
+                                    f"matched={_match_nz}")
+                            _model_types = set(mgr.ms2_model.charged_frag_types)
+                            _frag_cols = set(frag_mz_df.columns)
+                            _match_cols = set(matched_intensity_df.columns)
+                            if _frag_cols != _model_types:
+                                logging.warning(
+                                    f"AlphaPeptDeep diag: column mismatch! "
+                                    f"model expects {sorted(_model_types)}, "
+                                    f"frag_mz has {sorted(_frag_cols)}")
+                            if _frag_cols != _match_cols:
+                                logging.warning(
+                                    f"AlphaPeptDeep diag: matched cols "
+                                    f"{sorted(_match_cols)} != frag cols "
+                                    f"{sorted(_frag_cols)}")
+
+                            # ── Step 3: train (transfer-learn) the MS2 model ──
+                            mgr.epoch_to_train_ms2 = 10
+                            mgr.warmup_epoch_to_train_ms2 = 5
+                            mgr.lr_to_train_ms2 = 1e-5
+                            mgr.batch_size_to_train_ms2 = 256
+                            mgr.psm_num_to_train_ms2 = min(len(cal_df), _MAX_CAL_PSMS)
+                            mgr.top_n_mods_to_train = 10
+                            mgr.psm_num_per_mod_to_train_ms2 = 100
+                            mgr.ms2_model.model.dropout.p = 0.1
+                            mgr.train_ms2_model(cal_df, matched_intensity_df)
+                            logging.info(
+                                f"AlphaPeptDeep: MS2 model calibrated on {len(cal_df)} PSMs")
                     else:
                         logging.warning(f"AlphaPeptDeep: only {len(psm_df)} PSMs in MGF — "
                                         f"need ≥10 for calibration. Using uncalibrated model.")
@@ -5601,6 +5829,217 @@ def _parse_mgf_for_alphapeptdeep(mgf_path, nce, instrument, psm_file=None):
     return df
 
 
+# Kyte–Doolittle hydrophobicity (used for APD training subsample stratification).
+_APD_KD_KYTE_DOOLITTLE = {
+    'A': 1.8, 'R': -4.5, 'N': -3.5, 'D': -3.5, 'C': 2.5, 'Q': -3.5,
+    'E': -3.5, 'G': -0.4, 'H': -3.2, 'I': 4.5, 'L': 3.8, 'K': -3.9,
+    'M': 1.9, 'F': 2.8, 'P': -1.6, 'S': -0.8, 'T': -0.7, 'W': -0.9,
+    'Y': -1.3, 'V': 4.2,
+}
+_APD_CHARGED_AA = frozenset('RKHDE')
+
+
+def _apd_physicochemical_arrays(sequences):
+    """
+    Per-sequence: mean Kyte–Doolittle (hydrophobicity) and fraction of
+    charged residues (R,K,H,D,E) — orthogonal to mean KD for stratification.
+    """
+    n = len(sequences)
+    kd_mean = np.zeros(n, dtype=np.float64)
+    frac_charged = np.zeros(n, dtype=np.float64)
+    kd = _APD_KD_KYTE_DOOLITTLE
+    ch = _APD_CHARGED_AA
+    for i, raw in enumerate(sequences):
+        s = str(raw or '').strip().upper()
+        L = len(s)
+        if L == 0:
+            continue
+        vals = [kd[c] for c in s if c in kd]
+        kd_mean[i] = float(np.mean(vals)) if vals else 0.0
+        frac_charged[i] = sum(1 for c in s if c in ch) / float(L)
+    return kd_mean, frac_charged
+
+
+def _apd_precursor_charge_numeric(charges, n):
+    """Map precursor charge to 2.0, 3.0, or 4.0 (4+ merged) for binning."""
+    out = np.full(n, 2.0, dtype=np.float64)
+    if charges is None:
+        return out
+    for i in range(n):
+        c = charges[i] if i < len(charges) else 2
+        try:
+            z = int(float(c))
+        except (TypeError, ValueError):
+            z = 2
+        if z < 1:
+            z = 2
+        out[i] = 4.0 if z >= 4 else float(z)
+    return out
+
+
+def _apd_stratified_sample_pool(pool, z_values, n_bins, n_target, rng):
+    """
+    Pick up to ``n_target`` indices from ``pool`` with roughly equal counts
+    across quantile bins of ``z_values[i]`` for i in pool.
+    """
+    pool = np.asarray(pool, dtype=int)
+    if pool.size == 0 or n_target <= 0:
+        return []
+    vals = np.asarray([float(z_values[i]) for i in pool], dtype=float)
+    order = np.argsort(vals, kind='mergesort')
+    ranks = np.empty_like(order, dtype=int)
+    ranks[order] = np.arange(len(order))
+    nb = int(min(max(1, n_bins), len(pool)))
+    bin_ids = np.minimum((ranks * nb) // max(len(ranks), 1), nb - 1)
+    base = n_target // nb
+    rem = n_target % nb
+    out = []
+    for b in range(nb):
+        in_bin = pool[bin_ids == b]
+        if in_bin.size == 0:
+            continue
+        want = base + (1 if b < rem else 0)
+        want = min(int(want), int(in_bin.size))
+        if want > 0:
+            out.extend(
+                rng.choice(in_bin, size=want, replace=False).tolist())
+    return out
+
+
+def _apd_select_training_indices(
+    rt_minutes,
+    mods_list,
+    sequences,
+    charges=None,
+    max_n=5000,
+    top_n_mods=10,
+    max_per_mod=100,
+    n_rt_bins=10,
+    n_len_bins=10,
+    n_kd_bins=10,
+    n_fc_bins=8,
+    n_charge_bins=3,
+    rng=None,
+):
+    """
+    Select up to ``max_n`` row indices for AlphaPeptDeep RT fine-tuning or
+    MS2 calibration.
+
+    **Layers (in order)** — each layer fills remaining budget with quantile
+    stratification where applicable:
+
+    1. **Modifications** — up to ``max_per_mod`` rows for each of the
+       ``top_n_mods`` most frequent modification names (peptdeep-style).
+    2. **Retention time** — spread across ``n_rt_bins`` RT quantiles (minutes).
+    3. **Peptide length** — ``n_len_bins`` quantiles of sequence length.
+    4. **Hydrophobicity** — mean Kyte–Doolittle per sequence, ``n_kd_bins``
+       quantiles (overall sequence hydrophobic character).
+    5. **Charged-residue fraction** — fraction of R,K,H,D,E per sequence,
+       ``n_fc_bins`` quantiles (partially orthogonal to mean KD).
+    6. **Precursor charge** — if ``charges`` is provided (same length as input),
+       balance 2+ / 3+ / 4+ using up to ``n_charge_bins`` strata.
+    7. **Random** — fill any remaining slots.
+
+    ``rt_minutes``: PD apex/search RT (RT tool) or MGF-based RT / 0 (MS2).
+
+    **Other quality levers** (apply in your experiment design / filters, not
+    in this function): high-confidence and q-value cuts on training PSMs;
+    deduplication policy; miss-cleavage limits; instrument/grant consistency;
+    excluding low-MS2-quality scans; balancing runs or fractions when pooling;
+    minimum observations per peptidoform for RT labels.
+
+    If the input has ``max_n`` or fewer rows, returns ``arange(n)``.
+    """
+    rng = np.random.RandomState(42) if rng is None else rng
+    n = len(rt_minutes)
+    if n == 0:
+        return np.array([], dtype=int)
+    if n <= max_n:
+        return np.arange(n, dtype=int)
+
+    rt_arr = np.asarray(rt_minutes, dtype=float)
+    if len(mods_list) != n or len(sequences) != n:
+        raise ValueError("_apd_select_training_indices: length mismatch")
+    if charges is not None and len(charges) != n:
+        raise ValueError("_apd_select_training_indices: charges length mismatch")
+
+    lens = np.array([len(str(sequences[i] or "")) for i in range(n)], dtype=int)
+    kd_mean, frac_charged = _apd_physicochemical_arrays(sequences)
+    z_numeric = _apd_precursor_charge_numeric(charges, n)
+
+    selected = set()
+    mod_groups = {}
+    for i in range(n):
+        m = mods_list[i]
+        if m is None or (isinstance(m, float) and np.isnan(m)):
+            m = ""
+        else:
+            m = str(m).strip()
+        if not m:
+            continue
+        seen = set()
+        for part in m.split(';'):
+            part = part.strip()
+            if not part:
+                continue
+            mn = part.split('@')[0].strip()
+            if mn and mn not in seen:
+                mod_groups.setdefault(mn, []).append(i)
+                seen.add(mn)
+
+    sorted_mods = sorted(
+        mod_groups.keys(), key=lambda k: len(mod_groups[k]), reverse=True)
+    for mod_name in sorted_mods[:top_n_mods]:
+        idxs = mod_groups[mod_name]
+        take = min(max_per_mod, len(idxs))
+        picked = rng.choice(np.asarray(idxs, dtype=int), size=take, replace=False)
+        selected.update(int(x) for x in picked)
+
+    def _fill_strat(coord_array, n_bins):
+        nonlocal selected
+        need = max_n - len(selected)
+        if need <= 0:
+            return
+        pool = [i for i in range(n) if i not in selected]
+        if not pool:
+            return
+        nb = max(1, int(n_bins))
+        picks = _apd_stratified_sample_pool(pool, coord_array, nb, need, rng)
+        selected.update(picks)
+
+    _fill_strat(rt_arr, n_rt_bins)
+    _fill_strat(lens, n_len_bins)
+    _fill_strat(kd_mean, n_kd_bins)
+    _fill_strat(frac_charged, n_fc_bins)
+
+    if charges is not None:
+        need = max_n - len(selected)
+        if need > 0:
+            pool = [i for i in range(n) if i not in selected]
+            n_z_bins = min(
+                n_charge_bins,
+                max(1, len(np.unique(z_numeric[np.array(pool, dtype=int)]))))
+            picks = _apd_stratified_sample_pool(
+                pool, z_numeric, n_z_bins, need, rng)
+            selected.update(picks)
+
+    while len(selected) < max_n:
+        pool = [i for i in range(n) if i not in selected]
+        if not pool:
+            break
+        take = min(max_n - len(selected), len(pool))
+        more = rng.choice(np.asarray(pool, dtype=int), size=take, replace=False)
+        selected.update(int(x) for x in more)
+
+    if len(selected) > max_n:
+        trim = rng.choice(
+            np.asarray(list(selected), dtype=int),
+            size=max_n, replace=False)
+        selected = set(int(x) for x in trim)
+
+    return np.sort(np.asarray(list(selected), dtype=int))
+
+
 def _pd_mods_to_peptdeep_format(mod_string, sequence):
     """
     Convert Proteome Discoverer-style modification strings to peptdeep format.
@@ -5742,6 +6181,124 @@ def _match_observed_to_predicted(cal_df, frag_mz_df, psm_df, frag_tol_ppm=20.0):
 
     matched_df = pd.DataFrame(matched, columns=frag_cols)
     return matched_df
+
+
+# MS2 calibration: drop weak peptide–spectrum pairs; balance pooled MGFs.
+_APD_MS2_CAL_MIN_MATCHED_FRAGMENTS = 8
+_APD_MS2_CAL_MIN_MATCHED_FRAC_OF_PRED = 0.02
+_APD_MS2_MAX_PSM_PER_MGF = 1250
+
+
+def _apd_cap_psms_per_mgf_pool(psm_df, max_per_mgf=None, rng_seed=42):
+    """
+    When multiple MGF sources are pooled (``_mgf_source`` column), cap each
+    file's contribution so one run cannot dominate the global subsample.
+    Single-source data is returned unchanged.
+    """
+    if max_per_mgf is None:
+        max_per_mgf = _APD_MS2_MAX_PSM_PER_MGF
+    if psm_df.empty or '_mgf_source' not in psm_df.columns:
+        return psm_df
+    if psm_df['_mgf_source'].nunique() <= 1:
+        return psm_df
+    rng = np.random.RandomState(rng_seed)
+    pieces = []
+    for _src, grp in psm_df.groupby('_mgf_source', sort=False):
+        if len(grp) <= max_per_mgf:
+            pieces.append(grp)
+            continue
+        g = grp.reset_index(drop=True)
+        _rts = g['rt'].fillna(0).values.astype(float)
+        _mods_l = g['mods'].fillna('').astype(str).tolist()
+        _seqs = g['sequence'].astype(str).tolist()
+        _z = g['charge'].fillna(2).astype(int).tolist()
+        _sel = _apd_select_training_indices(
+            _rts, _mods_l, _seqs, charges=_z, max_n=max_per_mgf, rng=rng)
+        pieces.append(g.iloc[_sel])
+    out = pd.concat(pieces, ignore_index=True)
+    logging.info(
+        f"AlphaPeptDeep: per-MGF cap ({max_per_mgf:,} PSMs/file) "
+        f"→ {len(out):,} pooled PSMs from {psm_df['_mgf_source'].nunique()} files "
+        f"(was {len(psm_df):,})")
+    return out
+
+
+def _apd_ms2_apply_matched_quality_filter(
+    cal_df,
+    psm_df,
+    frag_mz_df,
+    matched_intensity_df,
+    min_matched_fragments=None,
+    min_matched_frac_of_pred=None,
+):
+    """
+    Keep precursors with enough observed peaks mapped to predicted fragments;
+    rebuild contiguous ``frag_mz`` / matched-intensity blocks and
+    ``frag_start_idx`` / ``frag_stop_idx``.
+
+    Returns ``(cal_df, psm_df, frag_mz_df, matched_intensity_df)`` or ``None``
+    if no rows pass.
+    """
+    if min_matched_fragments is None:
+        min_matched_fragments = _APD_MS2_CAL_MIN_MATCHED_FRAGMENTS
+    if min_matched_frac_of_pred is None:
+        min_matched_frac_of_pred = _APD_MS2_CAL_MIN_MATCHED_FRAC_OF_PRED
+
+    n = len(cal_df)
+    if n == 0:
+        return None
+    fz = np.asarray(frag_mz_df.values, dtype=np.float64)
+    mt = np.asarray(matched_intensity_df.values, dtype=np.float64)
+    keep = []
+    for i in range(n):
+        fs = int(cal_df['frag_start_idx'].iloc[i])
+        fe = int(cal_df['frag_stop_idx'].iloc[i])
+        pred = fz[fs:fe]
+        mblk = mt[fs:fe]
+        n_pred = int((pred > 0).sum())
+        n_match = int((mblk > 0).sum())
+        need = int(min_matched_fragments)
+        if min_matched_frac_of_pred > 0 and n_pred > 0:
+            need = max(need, int(np.ceil(n_pred * float(min_matched_frac_of_pred))))
+        if n_match >= need:
+            keep.append(i)
+    if not keep:
+        logging.warning(
+            "AlphaPeptDeep: matched-peak quality filter removed all PSMs "
+            f"(threshold: ≥{min_matched_fragments} matches"
+            + (f", ≥{min_matched_frac_of_pred:.0%} of predicted fragments"
+               if min_matched_frac_of_pred > 0 else "")
+            + ").")
+        return None
+    if len(keep) < n:
+        logging.info(
+            f"AlphaPeptDeep: matched-peak quality filter kept {len(keep)}/{n} PSMs "
+            f"(≥{min_matched_fragments} matched fragment cells"
+            + (f", ≥{min_matched_frac_of_pred:.0%} of pred. m/z>0 cells when applicable"
+               if min_matched_frac_of_pred > 0 else "")
+            + ")")
+
+    keep = np.asarray(keep, dtype=int)
+    blocks_mz = []
+    blocks_mt = []
+    cursor = 0
+    cal_kept = cal_df.iloc[keep].copy().reset_index(drop=True)
+    psm_kept = psm_df.iloc[keep].copy().reset_index(drop=True)
+    for j in range(len(keep)):
+        i = int(keep[j])
+        fs = int(cal_df['frag_start_idx'].iloc[i])
+        fe = int(cal_df['frag_stop_idx'].iloc[i])
+        blocks_mz.append(fz[fs:fe].copy())
+        blocks_mt.append(mt[fs:fe].copy())
+        L = fe - fs
+        cal_kept.loc[j, 'frag_start_idx'] = cursor
+        cal_kept.loc[j, 'frag_stop_idx'] = cursor + L
+        cursor += L
+    frag_out = pd.DataFrame(
+        np.vstack(blocks_mz), columns=frag_mz_df.columns)
+    matched_out = pd.DataFrame(
+        np.vstack(blocks_mt), columns=matched_intensity_df.columns)
+    return cal_kept, psm_kept, frag_out, matched_out
 
 
 def _validate_calibration_mgf(mgf_path, expected_frag_type, expected_nce,
@@ -6272,12 +6829,9 @@ def alphapeptdeep_predict_all_peptides(
                          f"({n_total - len(batch_rows)} cached)")
 
             batch_df = pd.DataFrame(batch_rows)
+            batch_df['_orig_batch_idx'] = np.arange(len(batch_df))
 
             try:
-                # Use predict_all for multiprocessing support on CPU
-                # peptdeep default threshold is 3000 precursors before
-                # spawning sub-processes — keep that default so small
-                # batches (< 3000) avoid heavy per-process model-loading.
                 # Force single-process to avoid multiprocessing deadlocks
                 # on Windows (spawn start-method inside daemon threads) and to
                 # prevent loading the ~2 GB model in multiple child processes.
@@ -6288,16 +6842,20 @@ def alphapeptdeep_predict_all_peptides(
                 )
                 frag_int_df = pred_result.get('fragment_intensity_df')
 
-                # Parse batch results using frag_start_idx / frag_stop_idx
+                # predict_all sorts batch_df by nAA (peptide length) via
+                # refine_precursor_df — use _orig_batch_idx to map each
+                # sorted row back to its original position in idx_map.
                 if frag_int_df is not None and 'frag_start_idx' in batch_df.columns:
-                    for batch_idx, pidx in enumerate(idx_map):
+                    for sorted_pos in range(len(batch_df)):
+                        orig_bi = int(batch_df.iloc[sorted_pos]['_orig_batch_idx'])
+                        pidx = idx_map[orig_bi]
                         pinfo = peptides_info[pidx]
                         pep, _pmz, pch, pmod = pinfo[0], pinfo[1], pinfo[2], pinfo[3]
                         seq = pep[6:] if pep.startswith('DECOY_') else pep
 
                         try:
-                            frag_start = int(batch_df.iloc[batch_idx]['frag_start_idx'])
-                            frag_stop = int(batch_df.iloc[batch_idx]['frag_stop_idx'])
+                            frag_start = int(batch_df.iloc[sorted_pos]['frag_start_idx'])
+                            frag_stop = int(batch_df.iloc[sorted_pos]['frag_stop_idx'])
                             pep_frag_df = frag_int_df.iloc[frag_start:frag_stop]
                             preds = _parse_alphapeptdeep_fragment_block(pep_frag_df)
                         except Exception:
@@ -6473,8 +7031,9 @@ def compute_spectral_similarity(matched_ions, predicted_intensities, method='SA'
             continue                       # skip neutral-loss ions (not modelled by MS2PIP)
         key = (ion_type, frag_pos, ion_charge)
         if key not in predicted_intensities and ion_charge > 1:
-            # MS2PIP only predicts charge-1 fragment intensities;
-            # fall back to charge-1 prediction for higher-charge ions.
+            # HCDch2/CIDch2 models predict charge 1 and 2 fragments natively;
+            # fall back to charge-1 prediction for charge 3+ ions or
+            # if the charge-2 key is missing from predictions.
             key = (ion_type, frag_pos, 1)
         if key in predicted_intensities:
             obs_vec.append(intensity)
@@ -6835,8 +7394,8 @@ def assign_shared_intensities(matched_ions_all, ambiguous_set, peptide_idx,
         n_cand = len(cand_list)
         logits = np.empty(n_cand)
         our_pos = -1
-        # MS2PIP only predicts charge-1 fragment intensities.
-        # For charge 2+ ions, fall back to the charge-1 prediction so the
+        # HCDch2/CIDch2 models predict charge 1 and 2 fragments natively.
+        # For charge 3+ ions, fall back to the charge-1 prediction so the
         # deconvolution is guided by predicted relative intensity rather
         # than defaulting to an uninformative equal split.
         pred_key = (ion_type, frag_pos, ion_charge)
@@ -8193,8 +8752,10 @@ def process_raw_file(
                         # Determine if the predicted base peak (overall most intense
                         # predicted fragment) was among the matched ions, and
                         # whether any of the top-3 predicted peaks were matched.
-                        _pred_base_peak_matched = False
-                        _pred_top3_matched = False
+                        # Default to True when no predictions are available so the
+                        # spurious-PSM filter does not discard every PSM.
+                        _pred_base_peak_matched = not bool(_pred_for_sa)
+                        _pred_top3_matched = not bool(_pred_for_sa)
                         if _pred_for_sa:
                             _all_pred_vals = list(_pred_for_sa.values())
                             _all_pred_vals_sorted = sorted(_all_pred_vals, reverse=True)
@@ -8877,6 +9438,9 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                          fragment_unit, fragmentation_type, fdr_threshold, quant_method="Both", generate_eics=False, selected_neutral_losses=None,
                          fragment_mz_lower=None, fragment_mz_upper=None):
     """Modified function to collect all PSMs once and track execution time"""
+    global _parse_result_logged_once
+    _parse_result_logged_once = False
+    clear_ms2pip_cache()
     start_time = time.time()
     _ensure_gpu_detected()   # lazy GPU detection on first processing run
     logging.info(f"Starting peptide diagnosis with {fragmentation_type} fragmentation")
@@ -9192,14 +9756,26 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                         f"{', '.join(sorted(_MS2PIP_SUPPORTED_FRAG_TYPES))}."
                     )
                 else:
-                    logging.info("=== MS2PIP Global Pre-computation Phase ===")
+                    _ms2pip_model_used = _MS2PIP_MODEL_MAP.get(
+                        fragmentation_type, _MS2PIP_MODEL_MAP['HCD']
+                    )
+                    logging.info(f"=== MS2PIP Global Pre-computation Phase "
+                                 f"(model={_ms2pip_model_used}, frag={fragmentation_type}) ===")
                     precomputed_predictions = ms2pip_predict_all_peptides(
                         _all_pep_info, fragmentation_type
                     )
                     if precomputed_predictions:
                         _n_ok = sum(1 for v in precomputed_predictions.values() if v)
-                        logging.debug(f"MS2PIP pre-computation done: {_n_ok}/{len(_all_pep_info)} "
+                        logging.info(f"MS2PIP pre-computation done: {_n_ok}/{len(_all_pep_info)} "
                                      f"peptides have predictions")
+                        if _n_ok == 0:
+                            logging.warning(
+                                "MS2PIP returned predictions for 0 peptides. "
+                                "Prediction-based quality filters will be skipped."
+                            )
+                    else:
+                        logging.warning("MS2PIP returned empty predictions dict. "
+                                        "Check that ms2pip is installed correctly.")
 
             if _pred_engine is None and _frag_usage == "probabilistic":
                 logging.warning("No prediction engine available (ms2pip / peptdeep). "
@@ -9521,23 +10097,38 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
             # For criteria 2 & 3, check per-PSM boolean fields computed
             # during scan processing (compare matched ions against the FULL
             # predicted spectrum, not just matched-ion intensities).
-            # Only apply when probabilistic deconv is active (predictions available).
+            # Only apply when probabilistic deconv is active AND predictions
+            # actually succeeded (at least some PSMs have True values).
             _base_peak_mask = pd.Series(True, index=results_df.index)
             _top3_mask = pd.Series(True, index=results_df.index)
+            _pred_filter_applied = False
             if _frag_usage == "probabilistic":
-                if 'predicted_base_peak_matched' in results_df.columns:
-                    _base_peak_mask = results_df['predicted_base_peak_matched'].astype(bool)
-                if 'predicted_top3_matched' in results_df.columns:
-                    _top3_mask = results_df['predicted_top3_matched'].astype(bool)
+                _has_bp = 'predicted_base_peak_matched' in results_df.columns
+                _has_t3 = 'predicted_top3_matched' in results_df.columns
+                _bp_any_true = _has_bp and results_df['predicted_base_peak_matched'].astype(bool).any()
+                _t3_any_true = _has_t3 and results_df['predicted_top3_matched'].astype(bool).any()
+                if _bp_any_true or _t3_any_true:
+                    if _has_bp:
+                        _base_peak_mask = results_df['predicted_base_peak_matched'].astype(bool)
+                    if _has_t3:
+                        _top3_mask = results_df['predicted_top3_matched'].astype(bool)
+                    _pred_filter_applied = True
+                else:
+                    logging.info(
+                        "Spurious PSM pre-filter: prediction coverage columns are all False — "
+                        "predictions likely unavailable. Skipping prediction-based criteria "
+                        "(applying min 3 fragments only)."
+                    )
 
             _spurious_mask = _min_frag_mask & _base_peak_mask & _top3_mask
             _n_spurious = (~_spurious_mask).sum()
             if _n_spurious > 0:
                 results_df = results_df[_spurious_mask].copy()
+                _filter_desc = "min 3 fragments + predicted peak coverage" if _pred_filter_applied else "min 3 fragments"
                 logging.info(
                     f"Spurious PSM pre-filter: removed {_n_spurious:,} of "
-                    f"{_n_before_filter:,} PSMs (min 3 fragments + predicted "
-                    f"peak coverage). {len(results_df):,} PSMs remain."
+                    f"{_n_before_filter:,} PSMs ({_filter_desc}). "
+                    f"{len(results_df):,} PSMs remain."
                 )
             else:
                 logging.info("Spurious PSM pre-filter: all PSMs passed quality checks.")
@@ -9748,20 +10339,30 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                 # --- Pre-populate in-memory caches from DataFrames still in memory ---
                 # This avoids slow pd.read_excel() on first plot view.
                 try:
+                    _precache_t0 = time.time()
                     _excel_sheet_cache[(output_file, 'PSM')] = results_df_for_display.copy()
                     _excel_sheet_cache[(output_file, 'Peptide Quantification')] = peptide_quant_data.copy()
                     _excel_sheet_cache[(output_file, 'Protein Quantification')] = protein_quantities.copy()
                     _excel_sheet_cache[(output_file, 'Combined')] = combined_results.copy()
                     if eic_records:
-                        eic_df_cache = pd.DataFrame(eic_records)
+                        # Reuse the DataFrame created for CSV export if available.
+                        # Avoid rebuilding a large DataFrame from eic_records again.
+                        if 'eic_df' in locals() and isinstance(eic_df, pd.DataFrame):
+                            eic_df_cache = eic_df
+                        else:
+                            eic_df_cache = pd.DataFrame(eic_records)
                         _excel_sheet_cache[(output_file, 'EICs')] = eic_df_cache
-                        # Also populate cached_eic_data dict for fast per-peptide lookups
-                        cached_eic_data = {}
-                        for key, group_df in eic_df_cache.groupby(
-                            [eic_df_cache['peptide'].astype(str) + '_' + eic_df_cache['file'].astype(str)]
-                        ):
-                            cached_eic_data[key] = [row for row in group_df.itertuples(index=False)]
-                        logging.debug(f"Pre-cached EIC data for {len(cached_eic_data)} peptide-file combinations")
+
+                        # Do not block run completion on heavy EIC indexing.
+                        # Keep immediate plotting fast via in-memory EIC DataFrame cache.
+                        # NOTE: Avoid background Python thread warmup here; third-party
+                        # SQLite-backed objects (e.g., from rescoring libs) can be
+                        # finalized on that thread and trigger cross-thread sqlite errors.
+                        cached_eic_data = None
+
+                    logging.info(
+                        f"Post-save cache warmup completed in {time.time() - _precache_t0:.2f}s"
+                    )
                 except Exception as e:
                     logging.debug(f"Could not pre-populate in-memory caches: {e}")
                 
@@ -10228,6 +10829,33 @@ class TextHandler(logging.Handler):
             except Exception:
                 self._flush_scheduled = False
 
+class _ThirdPartyWarningFilter(logging.Filter):
+    """Suppress WARNING-level messages that originate from third-party libraries
+    (e.g. cupy CUDA path, tensorflow deprecation notices) rather than from
+    ProteoPRM application code."""
+
+    _SUPPRESSED_PATTERNS = (
+        'userwarning',
+        'deprecationwarning',
+        'futurewarning',
+        'cuda path could not be detected',
+        'cupy',
+        'tensorflow',
+        'torch',
+        'numba',
+        'gpu support is not available',
+        'gpu will not be used',
+        'wsl2',
+        'directml',
+    )
+
+    def filter(self, record):
+        if record.levelno != logging.WARNING:
+            return True
+        msg = record.getMessage().lower()
+        return not any(pat in msg for pat in self._SUPPRESSED_PATTERNS)
+
+
 class LogBuffer(logging.Handler):
     def __init__(self):
         super().__init__()
@@ -10254,6 +10882,11 @@ def initialize_logging(log_widget):
     buffer_handler.setFormatter(formatter)
     widget_handler.setFormatter(formatter)
     
+    # Suppress third-party warnings from log output
+    _warn_filter = _ThirdPartyWarningFilter()
+    buffer_handler.addFilter(_warn_filter)
+    widget_handler.addFilter(_warn_filter)
+
     # Add handlers
     logger.addHandler(buffer_handler)
     if show_logs:
@@ -10395,7 +11028,7 @@ frame.grid_rowconfigure(6, weight=2)
 frame.grid_rowconfigure(7, weight=0)
 frame.grid_rowconfigure(8, weight=0)
 
-ttk.Label(frame, text="Select PRM Input File:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+ttk.Label(frame, text="PRM Input File:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
 prm_input_entry = ttk.Entry(frame, width=50, state='readonly')
 prm_input_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
 ToolTip(prm_input_entry,
@@ -10413,17 +11046,17 @@ ToolTip(prm_input_entry,
         "A header row is expected but column names are ignored.")
 ttk.Button(frame, text="Browse", command=lambda: browse_file(prm_input_entry, "prm")).grid(row=0, column=2, padx=5, pady=5, sticky='ew')
 
-ttk.Label(frame, text="Select Raw Files/mzML Folder:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+ttk.Label(frame, text="Raw Files/mzML Folder:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
 mzml_folder_entry = ttk.Entry(frame, width=50, state='readonly')
 mzml_folder_entry.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
 ttk.Button(frame, text="Browse", command=lambda: browse_folder(mzml_folder_entry)).grid(row=1, column=2, padx=5, pady=5, sticky='ew')
 
-ttk.Label(frame, text="Select Output Folder Location:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+ttk.Label(frame, text="Output Folder Location:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
 output_file_entry = ttk.Entry(frame, width=50, state='readonly')
 output_file_entry.grid(row=2, column=1, padx=5, pady=5, sticky='ew')
 ttk.Button(frame, text="Browse", command=lambda: browse_folder(output_file_entry)).grid(row=2, column=2, padx=5, pady=5, sticky='ew')
 
-ttk.Label(frame, text="Select Protein FASTA File:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+ttk.Label(frame, text="Protein FASTA File:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
 fasta_file_entry = ttk.Entry(frame, width=50, state='readonly')
 fasta_file_entry.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
 ttk.Button(frame, text="Browse", command=lambda: browse_file(fasta_file_entry, "fasta")).grid(row=3, column=2, padx=5, pady=5, sticky='ew')
@@ -10832,6 +11465,8 @@ ms2pip_engine_radio.pack(side='left', padx=5)
 ToolTip(ms2pip_engine_radio,
     "MS2PIP: XGBoost-based fragment intensity prediction.\n"
     "Supports HCD and CID fragmentation only.\n"
+    "Uses HCDch2 / CIDch2 models (b/y charge 1 & 2 predictions).\n"
+    "Trained on tryptic digest data — works well for most digestion types.\n"
     "Fast, no GPU required, good baseline accuracy.\n"
     "Does NOT require calibration data."
 )
@@ -10950,6 +11585,60 @@ apd_cal_nce_var = tk.StringVar(value='')
 # Widgets to toggle
 _apd_cal_widgets = [apd_model_combo]
 
+# --- MS2PIP-specific options (visible only when MS2PIP engine is selected) ---
+ms2pip_opts_frame = ttk.Frame(pred_engine_frame)
+ms2pip_opts_frame.grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=2)
+
+ttk.Label(ms2pip_opts_frame, text="MS2 Mass Analyzer:").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+ms2pip_analyzer_var = tk.StringVar(value="Orbitrap")
+ms2pip_analyzer_combo = ttk.Combobox(
+    ms2pip_opts_frame, textvariable=ms2pip_analyzer_var,
+    values=["Orbitrap", "Linear Ion Trap"], state='readonly', width=16
+)
+ms2pip_analyzer_combo.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+ToolTip(ms2pip_analyzer_combo,
+    "MS2 mass analyzer used in your experiment.\n\n"
+    "The MS2PIP prediction model was trained on data acquired with\n"
+    "a specific analyzer for each fragmentation type:\n"
+    "  • HCD → HCDch2 model (Orbitrap data, b/y charge 1 & 2)\n"
+    "  • CID → CIDch2 model (Linear Ion Trap data, b/y charge 1 & 2)\n\n"
+    "This selector auto-syncs with the Fragmentation Type setting.\n"
+    "If your instrument differs from the expected analyzer, a warning\n"
+    "will be shown — predictions may be less accurate but still usable.\n\n"
+    "Training data: tryptic digest peptides."
+)
+
+ttk.Label(ms2pip_opts_frame, text="Model:").grid(row=0, column=2, sticky='w', padx=(15, 5), pady=2)
+ms2pip_model_display_var = tk.StringVar(value="HCDch2")
+ms2pip_model_display = ttk.Entry(
+    ms2pip_opts_frame, textvariable=ms2pip_model_display_var,
+    state='readonly', width=12
+)
+ms2pip_model_display.grid(row=0, column=3, sticky='w', padx=5, pady=2)
+ToolTip(ms2pip_model_display,
+    "Active MS2PIP model (read-only, determined by Fragmentation Type).\n\n"
+    "HCDch2: HCD + Orbitrap, tryptic, predicts b/y charge 1 & 2\n"
+    "CIDch2: CID + Linear Ion Trap, tryptic, predicts b/y charge 1 & 2"
+)
+
+def _sync_ms2pip_analyzer(*_args):
+    """Auto-sync mass analyzer and model display with fragmentation type."""
+    frag = fragmentation_var.get()
+    expected_analyzer = _MS2PIP_FRAG_ANALYZER_MAP.get(frag, '')
+    model_name = _MS2PIP_MODEL_MAP.get(frag, '')
+    if expected_analyzer:
+        ms2pip_analyzer_var.set(expected_analyzer)
+    if model_name:
+        ms2pip_model_display_var.set(model_name)
+    elif 'HCD' in frag:
+        ms2pip_analyzer_var.set('Orbitrap')
+        ms2pip_model_display_var.set('HCDch2')
+    elif 'CID' in frag:
+        ms2pip_analyzer_var.set('Linear Ion Trap')
+        ms2pip_model_display_var.set('CIDch2')
+
+fragmentation_var.trace_add('write', _sync_ms2pip_analyzer)
+
 def _toggle_apd_calibration():
     """Enable/disable calibration-specific widgets."""
     cal_on = apd_calibrate_var.get()
@@ -10965,6 +11654,7 @@ def _toggle_pred_engine_frame(*args):
     else:
         pred_engine_frame.grid_remove()
     _toggle_apd_options()
+    _toggle_ms2pip_options()
 
 def _toggle_apd_options(*args):
     """Show/hide AlphaPeptDeep options based on engine selection."""
@@ -10977,9 +11667,18 @@ def _toggle_apd_options(*args):
     if is_apd:
         _toggle_apd_calibration()
 
+def _toggle_ms2pip_options(*args):
+    """Show/hide MS2PIP options based on engine selection."""
+    is_ms2pip = pred_engine_var.get() == "ms2pip"
+    if is_ms2pip and fragment_usage_var.get() == "probabilistic":
+        ms2pip_opts_frame.grid()
+    else:
+        ms2pip_opts_frame.grid_remove()
+
 # Bind variable traces
 fragment_usage_var.trace_add('write', _toggle_pred_engine_frame)
 pred_engine_var.trace_add('write', _toggle_apd_options)
+pred_engine_var.trace_add('write', _toggle_ms2pip_options)
 
 # Initial state: hide prediction engine frame (not probabilistic by default)
 _toggle_pred_engine_frame()
@@ -11006,6 +11705,9 @@ log_widget.pack(fill='both', expand=True)
 
 # Initialize logging
 buffer_handler, widget_handler = initialize_logging(log_widget)
+
+# Warm up heavy modules after GUI is visible, without blocking startup.
+root.after(900, _start_background_module_warmup)
 
 
 theoretical_ions_cache = {}
@@ -11134,7 +11836,8 @@ def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta
 
     # Block probabilistic mode for fragmentation types not supported by MS2PIP
     if fragment_usage_var.get() == "probabilistic":
-        if not HAS_MS2PIP:
+        _pred_eng = pred_engine_var.get()
+        if _pred_eng == "ms2pip" and not HAS_MS2PIP:
             messagebox.showwarning(
                 "Probabilistic Deconvolution Disabled",
                 "'Probabilistic (Deconv)' was selected, but MS2PIP is unavailable.\n\n"
@@ -11143,16 +11846,30 @@ def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta
                 "Install/upgrade MS2PIP and restart the app to enable probabilistic deconvolution:\n"
                 "pip install -U ms2pip"
             )
-        elif fragmentation_type not in _MS2PIP_SUPPORTED_FRAG_TYPES:
+        elif _pred_eng == "ms2pip" and fragmentation_type not in _MS2PIP_SUPPORTED_FRAG_TYPES:
             messagebox.showerror(
                 "Unsupported Fragmentation for Probabilistic Mode",
                 f"MS2PIP does not support '{fragmentation_type}' fragmentation.\n\n"
                 f"Supported types: {', '.join(sorted(_MS2PIP_SUPPORTED_FRAG_TYPES))}.\n\n"
-                "Please change the Fragment Usage setting to 'All Fragments', "
-                "'Unique Only (Quant)', or 'Unique + All (ID)', or select a supported "
-                "fragmentation type."
+                "Please choose a different Fragment Usage setting or a supported fragmentation type."
             )
             return
+
+        # Warn if MS2PIP mass analyzer selection mismatches the fragmentation type
+        if _pred_eng == "ms2pip" and fragmentation_type in _MS2PIP_SUPPORTED_FRAG_TYPES:
+            expected_analyzer = _MS2PIP_FRAG_ANALYZER_MAP.get(fragmentation_type, '')
+            selected_analyzer = ms2pip_analyzer_var.get()
+            if expected_analyzer and selected_analyzer != expected_analyzer:
+                _proceed = messagebox.askyesno(
+                    "MS2PIP Mass Analyzer Mismatch",
+                    f"The MS2PIP '{_MS2PIP_MODEL_MAP[fragmentation_type]}' model was trained on "
+                    f"{expected_analyzer} data,\n"
+                    f"but you selected '{selected_analyzer}' as the MS2 mass analyzer.\n\n"
+                    f"Predictions may be less accurate for your instrument configuration.\n\n"
+                    f"Continue anyway?"
+                )
+                if not _proceed:
+                    return
 
     # Auto-convert vendor data files (e.g., .raw, .wiff, .d) to mzML, skipping already converted
     # For .raw files: use fisher_py for direct reading when available (no conversion needed)
@@ -11945,9 +12662,13 @@ def plot_eic_for_peptide(peptide, mzml_file, mzml_folder, canvas_frame, theoreti
         if cached_eic_data is not None:
             cache_key_eic = f"{peptide_seq}_{mzml_file}"
             if cache_key_eic in cached_eic_data:
-                peptide_eic_data = cached_eic_data[cache_key_eic]
-                use_saved_eics = True
-                logging.debug(f"Using cached EIC data for {peptide_seq} in {mzml_file}")
+                # Keep rendering on the DataFrame path for correctness.
+                # _get_cached_excel_sheet uses in-memory cache after a run,
+                # so this remains fast without blocking viewer launch.
+                logging.debug(
+                    f"EIC lookup cache entry available for {peptide_seq} in {mzml_file}; "
+                    f"using DataFrame render path."
+                )
 
         # If no cached data available, check from output folder
         _out_folder = output_file_entry.get()
@@ -13256,6 +13977,7 @@ def save_settings():
         "flag_ambiguous": flag_ambiguous_var.get(),
         # Prediction engine options (for probabilistic deconvolution)
         "pred_engine": pred_engine_var.get(),
+        "ms2pip_mass_analyzer": ms2pip_analyzer_var.get(),
         "apd_instrument": apd_instrument_var.get(),
         "apd_nce": apd_nce_var.get(),
         "apd_calibrate": apd_calibrate_var.get(),
@@ -13409,6 +14131,8 @@ def load_settings():
         # Load prediction engine options
         if "pred_engine" in settings:
             pred_engine_var.set(settings["pred_engine"])
+        if "ms2pip_mass_analyzer" in settings:
+            ms2pip_analyzer_var.set(settings["ms2pip_mass_analyzer"])
         if "apd_instrument" in settings:
             apd_instrument_var.set(settings["apd_instrument"])
         if "apd_nce" in settings:
@@ -14163,9 +14887,7 @@ def open_apd_calibration_dialog():
         if psm:
             _log(f"PSM: {psm}")
 
-        # Paper: "5,000 PSMs are randomly sampled from at most 8 RAW files"
-        _MAX_CAL_PSMS = 5_000
-        _MAX_MGF_FILES = 8      # per paper recommendation
+        _MAX_MGF_FILES = 8
 
         def _do_calibrate():
             try:
@@ -14218,6 +14940,8 @@ def open_apd_calibration_dialog():
                         mf, nce_val, inst,
                         psm_file=psm if psm else None)
                     if not part.empty:
+                        part = part.copy()
+                        part['_mgf_source'] = os.path.normpath(os.path.abspath(mf))
                         all_psm_dfs.append(part)
                         cal_win.after(0, lambda n=len(part), mf=mf: _log(
                             f"  → {n:,} valid PSMs from {os.path.basename(mf)}"))
@@ -14230,9 +14954,11 @@ def open_apd_calibration_dialog():
                     return
 
                 psm_df = pd.concat(all_psm_dfs, ignore_index=True)
+                psm_df = _apd_cap_psms_per_mgf_pool(psm_df)
                 n_total = len(psm_df)
                 cal_win.after(0, lambda: _log(
-                    f"Total pooled PSMs: {n_total:,} from {len(all_psm_dfs)} file(s)"))
+                    f"Total pooled PSMs: {n_total:,} from {len(all_psm_dfs)} file(s) "
+                    f"(per-file cap applies when multiple MGFs)"))
 
                 if n_total < 10:
                     cal_win.after(0, lambda: _log(
@@ -14241,24 +14967,20 @@ def open_apd_calibration_dialog():
                     cal_win.after(0, lambda: _progress_var.set(0))
                     return
 
-                # ── Mod-aware subsampling BEFORE predict_all ──
-                # Paper: "5,000 PSMs randomly sampled, top-10 mods, ≤100/mod"
+                _MAX_CAL_PSMS = 5_000
                 if n_total > _MAX_CAL_PSMS:
-                    try:
-                        from peptdeep.pretrained_models import psm_sampling_with_important_mods
-                        cal_win.after(0, lambda: _log(
-                            f"Subsampling {n_total:,} → {_MAX_CAL_PSMS:,} PSMs "
-                            f"(mod-aware: top-10 mods, ≤100/mod)"))
-                        psm_df = psm_sampling_with_important_mods(
-                            psm_df, n_sample=_MAX_CAL_PSMS,
-                            top_n_mods=10, n_sample_each_mod=100,
-                        ).reset_index(drop=True)
-                    except ImportError:
-                        cal_win.after(0, lambda: _log(
-                            f"Subsampling {n_total:,} → {_MAX_CAL_PSMS:,} PSMs (random)"))
-                        psm_df = psm_df.sample(
-                            n=_MAX_CAL_PSMS, random_state=42
-                        ).reset_index(drop=True)
+                    _rts = psm_df['rt'].fillna(0).values.astype(float)
+                    _mods_l = psm_df['mods'].fillna('').astype(str).tolist()
+                    _seqs = psm_df['sequence'].astype(str).tolist()
+                    _z = psm_df['charge'].fillna(2).astype(int).tolist()
+                    _sel = _apd_select_training_indices(
+                        _rts, _mods_l, _seqs, charges=_z, max_n=_MAX_CAL_PSMS,
+                        rng=np.random.RandomState(42))
+                    psm_df = psm_df.iloc[_sel].reset_index(drop=True)
+                    cal_win.after(0, lambda: _log(
+                        f"Subsampling {n_total:,} → {len(psm_df):,} PSMs "
+                        f"(mods + RT + length + KD + charged-aa% + z, "
+                        f"cap={_MAX_CAL_PSMS:,})"))
                 else:
                     cal_win.after(0, lambda: _log(
                         f"Using all {n_total:,} PSMs (≤{_MAX_CAL_PSMS:,} cap)"))
@@ -14287,6 +15009,20 @@ def open_apd_calibration_dialog():
 
                 matched_intensity_df = _match_observed_to_predicted(
                     cal_df, frag_mz_df, psm_df, frag_tol_ppm=20.0)
+
+                _qf = _apd_ms2_apply_matched_quality_filter(
+                    cal_df, psm_df, frag_mz_df, matched_intensity_df)
+                if _qf is None or len(_qf[0]) < 10:
+                    cal_win.after(0, lambda: _log(
+                        "ERROR: Matched-peak quality filter left fewer than 10 PSMs. "
+                        "Check MGF/PSM alignment and spectrum quality, or relax "
+                        f"thresholds in code (_APD_MS2_CAL_MIN_MATCHED_FRAGMENTS="
+                        f"{_APD_MS2_CAL_MIN_MATCHED_FRAGMENTS}, "
+                        f"_APD_MS2_CAL_MIN_MATCHED_FRAC_OF_PRED="
+                        f"{_APD_MS2_CAL_MIN_MATCHED_FRAC_OF_PRED})."))
+                    cal_win.after(0, lambda: _progress_var.set(0))
+                    return
+                cal_df, psm_df, frag_mz_df, matched_intensity_df = _qf
 
                 cal_win.after(0, lambda: _progress_var.set(75))
                 cal_win.after(0, lambda: _log("Transfer-learning MS2 model..."))
@@ -14329,7 +15065,7 @@ def open_apd_calibration_dialog():
                 mgr.warmup_epoch_to_train_ms2 = 5
                 mgr.lr_to_train_ms2 = 1e-5
                 mgr.batch_size_to_train_ms2 = 256
-                mgr.psm_num_to_train_ms2 = _MAX_CAL_PSMS
+                mgr.psm_num_to_train_ms2 = min(len(cal_df), _MAX_CAL_PSMS)
                 mgr.top_n_mods_to_train = 10
                 mgr.psm_num_per_mod_to_train_ms2 = 100
                 try:
@@ -14843,11 +15579,11 @@ def open_spectral_prediction_qc():
     tree_outer.columnconfigure(0, weight=1)
     tree_outer.rowconfigure(0, weight=1)
 
-    tree_cols = ('peptide', 'charge', 'file', 'scan', 'spectral_angle',
+    tree_cols = ('peptide', 'modification', 'charge', 'file', 'scan', 'spectral_angle',
                  'matched_fragments', 'mass_accuracy')
     tree = ttk.Treeview(tree_outer, columns=tree_cols, show='headings', selectmode='browse')
     _col_labels = {
-        'peptide': 'Peptide', 'charge': 'Charge', 'file': 'File',
+        'peptide': 'Peptide', 'modification': 'Modification', 'charge': 'Charge', 'file': 'File',
         'scan': 'Scan', 'spectral_angle': 'SA Score',
         'matched_fragments': 'Matched Ions', 'mass_accuracy': 'Mass Acc (ppm)',
     }
@@ -14865,7 +15601,7 @@ def open_spectral_prediction_qc():
     for c in tree_cols:
         tree.heading(c, text=_col_labels.get(c, c),
                      command=lambda _col=c: _sort_qc_tree(_col, False))
-        w = 90 if c not in ('peptide', 'file') else 200
+        w = 90 if c not in ('peptide', 'modification', 'file') else 200
         tree.column(c, width=w, minwidth=60)
     tree_scroll = ttk.Scrollbar(tree_outer, orient='vertical', command=tree.yview)
     tree.configure(yscrollcommand=tree_scroll.set)
@@ -14957,11 +15693,16 @@ def open_spectral_prediction_qc():
                 tree.delete(item)
 
             pep_col = next((c for c in df.columns if c.lower() in ('peptide', 'sequence')), None)
+            mod_col = next((c for c in df.columns if c.lower() in ('modification', 'modifications', 'mods')), None)
             chg_col = next((c for c in df.columns if c.lower() in ('charge', 'precursor_charge')), None)
             file_col = next((c for c in df.columns if c.lower() in ('file', 'raw_file', 'filename')), None)
             scan_col = next((c for c in df.columns if c.lower() in ('scan', 'scan_number', 'scannumber')), None)
             mf_col = next((c for c in df.columns if c.lower() in ('matched_fragments', 'fragment_count')), None)
             ma_col = next((c for c in df.columns if c.lower() in ('mass_accuracy',)), None)
+            
+            # Diagnostic: log which columns were found
+            logging.debug(f"QC Viewer column detection: pep_col={pep_col}, mod_col={mod_col}, chg_col={chg_col}, file_col={file_col}, scan_col={scan_col}, mf_col={mf_col}, ma_col={ma_col}")
+            logging.debug(f"QC Viewer available columns: {list(df.columns)}")
 
             n_with_sa = 0
             # Pre-filter: exclude decoys and zero/NaN SA rows vectorially
@@ -14970,18 +15711,19 @@ def open_spectral_prediction_qc():
             _tree_mask = ~_pep_vals.str.startswith('DECOY_') & (_sa_vals_raw > 0)
             _tree_df = df[_tree_mask]
             n_with_sa = len(_tree_df)
+            _mod_vals = _tree_df[mod_col].fillna('').astype(str).values if mod_col else [''] * n_with_sa
             _chg_vals = _tree_df[chg_col].astype(str).values if chg_col else [''] * n_with_sa
             _file_vals = _tree_df[file_col].apply(lambda x: os.path.basename(str(x))).values if file_col else [''] * n_with_sa
             _scan_vals = _tree_df[scan_col].astype(str).values if scan_col else [''] * n_with_sa
             _sa_fmt = [f"{float(v):.4f}" for v in _sa_vals_raw[_tree_mask].values]
             _mf_vals = _tree_df[mf_col].astype(str).values if mf_col else [''] * n_with_sa
             _ma_vals = [f"{float(v):.2f}" for v in _tree_df[ma_col].fillna(0).values] if ma_col else [''] * n_with_sa
-            for pep_v, chg_v, file_v, scan_v, sa_v, mf_v, ma_v in zip(
-                _pep_vals[_tree_mask].values, _chg_vals, _file_vals,
+            for pep_v, mod_v, chg_v, file_v, scan_v, sa_v, mf_v, ma_v in zip(
+                _pep_vals[_tree_mask].values, _mod_vals, _chg_vals, _file_vals,
                 _scan_vals, _sa_fmt, _mf_vals, _ma_vals
             ):
                 tree.insert('', 'end', values=(
-                    str(pep_v), str(chg_v), str(file_v), str(scan_v),
+                    str(pep_v), str(mod_v), str(chg_v), str(file_v), str(scan_v),
                     sa_v, str(mf_v), ma_v,
                 ))
 
@@ -15048,10 +15790,15 @@ def open_spectral_prediction_qc():
             return
         vals = tree.item(sel[0], 'values')
         peptide = vals[0]
-        charge = vals[1]
-        file_name = vals[2]
-        scan_str = vals[3]
-        sa_score = vals[4]
+        charge = vals[2]
+        file_name = vals[3]
+        scan_str = vals[4]
+        sa_score = vals[5]
+        matched_table_count = None
+        try:
+            matched_table_count = int(float(vals[6]))
+        except Exception:
+            matched_table_count = None
 
         df = _qc_data['df']
         if df is None:
@@ -15082,7 +15829,7 @@ def open_spectral_prediction_qc():
             return m.group(1) if m else t
 
         # ── 1. Load matched ions + predicted intensities from EICs ───
-        matched_ions = []   # (mz, intensity, ion_label, base_type)
+        matched_ions = []   # (mz, intensity, ion_label, base_type, has_prediction, is_neutral_loss)
         pred_ions = []      # (mz, predicted_intensity, ion_label, base_type)
 
         eic_df = _qc_data.get('eic_df')
@@ -15100,23 +15847,29 @@ def open_spectral_prediction_qc():
                     scan_keys = pep_eic['scan_number'].apply(_sk)
                     scan_rows = pep_eic[scan_keys == req_key]
                     if not scan_rows.empty:
-                        main = scan_rows[
-                            scan_rows['neutral_loss'].isnull() |
-                            (scan_rows['neutral_loss'] == '')
-                        ]
-                        for row_dict in main.to_dict('records'):
+                        for row_dict in scan_rows.to_dict('records'):
                             it = str(row_dict.get('ion_type', '')) if pd.notna(row_dict.get('ion_type')) else ''
                             mz = float(row_dict.get('fragment_theoretical_mz', 0))
                             inten = float(row_dict.get('intensity', 0))
                             base_type = ''.join(c for c in it if c.isalpha()).lower()
-                            matched_ions.append((mz, inten, it, base_type))
+                            _nl_val = row_dict.get('neutral_loss', '')
+                            _nl_txt = '' if pd.isna(_nl_val) else str(_nl_val).strip()
+                            is_neutral_loss = bool(_nl_txt)
                             # Actual APD / MS2PIP predicted intensity
                             pred_int = row_dict.get('predicted_intensity', np.nan)
                             try:
                                 pred_int = float(pred_int)
                             except Exception:
                                 pred_int = np.nan
-                            if pd.notna(pred_int) and pred_int > 0:
+                            has_prediction = bool(pd.notna(pred_int) and pred_int > 0)
+                            # Keep only actually matched observed ions.
+                            # Unmatched predicted ions are stored with intensity=0.
+                            if inten > 0:
+                                matched_ions.append((
+                                    mz, inten, it, base_type,
+                                    has_prediction, is_neutral_loss
+                                ))
+                            if has_prediction:
                                 pred_ions.append((mz, pred_int, it, base_type))
             except Exception:
                 pass
@@ -15136,7 +15889,7 @@ def open_spectral_prediction_qc():
                     if ':' in entry:
                         parts = entry.split(':')
                         try:
-                            matched_ions.append((float(parts[0]), 1.0, '', ''))
+                            matched_ions.append((float(parts[0]), 1.0, '', '', False, False))
                         except ValueError:
                             pass
 
@@ -15207,9 +15960,20 @@ def open_spectral_prediction_qc():
                     _mirror_spectrum_cache[_cache_key] = all_scan_peaks
 
         # ── 3. Draw Observed spectrum (upward) ───────────────────────
-        actual_matched = 0
+        actual_matched = matched_table_count if matched_table_count is not None else len(matched_ions)
         has_raw = all_scan_peaks is not None
-        tol_da = 0.02  # m/z tolerance for mapping matched → raw peaks
+        try:
+            _map_tol_val = float(fragment_tolerance_entry.get())
+            _map_tol_unit = str(fragment_unit_var.get()).strip().lower()
+        except Exception:
+            _map_tol_val = 20.0
+            _map_tol_unit = 'ppm'
+
+        def _map_tol_da(theoretical_mz):
+            if _map_tol_unit == 'ppm':
+                return max(float(theoretical_mz) * _map_tol_val / 1e6, 1e-6)
+            return max(_map_tol_val, 1e-6)
+
         _LABEL_THRESH = 3.0  # only label ions ≥ 3% relative intensity
 
         if has_raw:
@@ -15221,11 +15985,28 @@ def open_spectral_prediction_qc():
 
             # Build match map: raw-peak index → (ion_label, base_type)
             matched_raw_idx = {}
-            for mmz, _, lbl, bt in matched_ions:
+            for mmz, _, lbl, bt, has_pred, is_nl in matched_ions:
                 diffs = np.abs(mz_all - mmz)
                 best_idx = int(np.argmin(diffs))
-                if diffs[best_idx] < tol_da:
-                    matched_raw_idx[best_idx] = (lbl, bt)
+                if diffs[best_idx] <= _map_tol_da(mmz):
+                    _new_delta = float(diffs[best_idx])
+                    _prev = matched_raw_idx.get(best_idx)
+                    if _prev is None:
+                        matched_raw_idx[best_idx] = (lbl, bt, has_pred, is_nl, _new_delta)
+                    else:
+                        _prev_lbl, _prev_bt, _prev_has_pred, _prev_is_nl, _prev_delta = _prev
+                        # Prefer ions that have a corresponding predicted peak.
+                        # If both have no prediction, prefer real ions over neutral-loss ions.
+                        # If still tied, keep the one closer in m/z to the raw peak.
+                        if (has_pred and not _prev_has_pred) or (
+                            has_pred == _prev_has_pred and not has_pred
+                            and (_prev_is_nl and not is_nl)
+                        ) or (
+                            has_pred == _prev_has_pred and (
+                                has_pred or (is_nl == _prev_is_nl)
+                            ) and _new_delta < _prev_delta
+                        ):
+                            matched_raw_idx[best_idx] = (lbl, bt, has_pred, is_nl, _new_delta)
 
             # Unmatched peaks in grey (vectorised)
             unmatched_mask = np.ones(len(mz_all), dtype=bool)
@@ -15237,7 +16018,7 @@ def open_spectral_prediction_qc():
 
             # Batch matched peaks by colour for fewer draw calls
             _batched_obs = {}  # base_type -> (mz_list, int_list, lbl_list)
-            for idx, (lbl, bt) in matched_raw_idx.items():
+            for idx, (lbl, bt, _has_pred, _is_nl, _delta) in matched_raw_idx.items():
                 _batched_obs.setdefault(bt, ([], [], []))
                 _batched_obs[bt][0].append(mz_all[idx])
                 _batched_obs[bt][1].append(int_norm[idx])
@@ -15249,7 +16030,6 @@ def open_spectral_prediction_qc():
                     if _l and _i >= _LABEL_THRESH:
                         ax_mirror.text(_m, _i + 2, _l, fontsize=7,
                                        ha='center', va='bottom', rotation=90, color=color)
-            actual_matched = len(matched_raw_idx)
         else:
             # No raw data — show only matched ions from EICs
             if matched_ions:
@@ -15257,7 +16037,7 @@ def open_spectral_prediction_qc():
                 if max_obs <= 0:
                     max_obs = 1.0
                 _batched_obs2 = {}
-                for mz, inten, lbl, bt in matched_ions:
+                for mz, inten, lbl, bt, _has_pred, _is_nl in matched_ions:
                     norm_int = inten / max_obs * 100.0
                     _batched_obs2.setdefault(bt, ([], [], []))
                     _batched_obs2[bt][0].append(mz)
@@ -15270,7 +16050,6 @@ def open_spectral_prediction_qc():
                         if _l and _i >= _LABEL_THRESH:
                             ax_mirror.text(_m, _i + 2, _l, fontsize=7, ha='center',
                                            va='bottom', rotation=90, color=color)
-            actual_matched = len(matched_ions)
 
         # ── 4. Draw Predicted spectrum (downward) — actual APD/MS2PIP ─
         pred_norm = []
@@ -15301,7 +16080,7 @@ def open_spectral_prediction_qc():
         ax_mirror.set_xlabel('m/z')
 
         mirror_info_var.set(f"{peptide}  z={charge}   SA={sa_score}   matched={actual_matched}")
-        ax_mirror.set_title(f'Mirror Plot \u2014 {peptide} {charge}+   SA = {sa_score}')
+        ax_mirror.set_title(f'{peptide} {charge}+   SA = {sa_score}')
 
         current_ylim = ax_mirror.get_ylim()
         max_abs = max(abs(current_ylim[0]), abs(current_ylim[1]), 100)
@@ -17732,23 +18511,59 @@ def open_rt_predictor():
     Prediction data: CSV or XLSX with at least a 'Sequence' column (plus
                      optional 'Modifications' and 'Charge').
     """
-    from sklearn.ensemble import (
-        HistGradientBoostingRegressor,
-        GradientBoostingRegressor,
-    )
-    from sklearn.model_selection import cross_val_score, cross_val_predict
-    from sklearn.metrics import mean_absolute_error, r2_score, median_absolute_error
-    from sklearn.preprocessing import StandardScaler
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-    # ── DeepLC availability check ─────────────────────────────────────────
+    # Defer heavy imports so the RT tool window appears immediately.
     _DEEPLC_AVAILABLE = False
-    try:
-        from deeplc import DeepLC as _DeepLC_Class
-        _DEEPLC_AVAILABLE = True
-    except ImportError:
-        _DeepLC_Class = None
+    _DeepLC_Class = None
+    _rt_runtime_ready = [False]
+
+    def _ensure_rt_runtime():
+        """Load heavy optional dependencies once, on-demand."""
+        nonlocal _DEEPLC_AVAILABLE, _DeepLC_Class
+        if _rt_runtime_ready[0]:
+            return True, ""
+
+        try:
+            from sklearn.ensemble import (
+                HistGradientBoostingRegressor as _HistGradientBoostingRegressor,
+                GradientBoostingRegressor as _GradientBoostingRegressor,
+            )
+            from sklearn.model_selection import (
+                cross_val_score as _cross_val_score,
+                cross_val_predict as _cross_val_predict,
+            )
+            from sklearn.metrics import (
+                mean_absolute_error as _mean_absolute_error,
+                r2_score as _r2_score,
+                median_absolute_error as _median_absolute_error,
+            )
+            from sklearn.preprocessing import StandardScaler as _StandardScaler
+            from matplotlib.figure import Figure as _Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg as _FigureCanvasTkAgg
+        except Exception as exc:
+            return False, f"Failed to load RT predictor dependencies: {exc}"
+
+        g = globals()
+        g['HistGradientBoostingRegressor'] = _HistGradientBoostingRegressor
+        g['GradientBoostingRegressor'] = _GradientBoostingRegressor
+        g['cross_val_score'] = _cross_val_score
+        g['cross_val_predict'] = _cross_val_predict
+        g['mean_absolute_error'] = _mean_absolute_error
+        g['r2_score'] = _r2_score
+        g['median_absolute_error'] = _median_absolute_error
+        g['StandardScaler'] = _StandardScaler
+        g['Figure'] = _Figure
+        g['FigureCanvasTkAgg'] = _FigureCanvasTkAgg
+
+        try:
+            from deeplc import DeepLC as _DeepLC
+            _DeepLC_Class = _DeepLC
+            _DEEPLC_AVAILABLE = True
+        except ImportError:
+            _DeepLC_Class = None
+            _DEEPLC_AVAILABLE = False
+
+        _rt_runtime_ready[0] = True
+        return True, ""
 
     # ── amino-acid physicochemical tables ─────────────────────────────────
     AMINO_ACIDS = list('ACDEFGHIKLMNPQRSTVWY')
@@ -18023,14 +18838,17 @@ def open_rt_predictor():
 
     # closure-level state
     _train_resolved = {}
-    _cached_train_df  = [None]
-    _cached_train_sig = [None]
+    _cached_train_df      = [None]
+    _cached_train_sig     = [None]
+    _cached_train_excel   = [None]    # Cache ExcelFile object to avoid re-parsing
+    _cached_train_excel_path = [None]
     _trained_model       = [None]
     _trained_feat_names  = [[]]
     _trained_scaler      = [None]
     _trained_algorithm   = [None]
     _model_metrics       = [{}]
-    _rt_norm_bounds      = [None]   # (rt_min, rt_max) for AlphaPeptDeep denormalization
+    _rt_norm_bounds      = [None]   # (rt_min, rt_max) — legacy, unused with calibration
+    _apd_calibration     = [None]   # IsotonicRegression for APD RT calibration
 
     def _pd_mods_to_deeplc(seq, mod_str):
         """
@@ -18075,9 +18893,15 @@ def open_rt_predictor():
         if not fp or not os.path.isfile(fp):
             return
         try:
-            xl = pd.ExcelFile(fp)
+            # Cache ExcelFile to reuse if same file
+            if _cached_train_excel_path[0] != fp:
+                _cached_train_excel[0] = pd.ExcelFile(fp, engine='openpyxl')
+                _cached_train_excel_path[0] = fp
+            xl = _cached_train_excel[0]
             names = list(xl.sheet_names)
         except Exception:
+            _cached_train_excel[0] = None
+            _cached_train_excel_path[0] = None
             return
         train_sheet_combo['values'] = names
         cur = train_sheet_var.get().strip()
@@ -18111,9 +18935,14 @@ def open_rt_predictor():
 
         _refresh_train_sheets(fp)
         try:
-            df = pd.read_excel(fp, sheet_name=sheet)
+            # Use cached ExcelFile to read sheet (faster than re-parsing file)
+            if _cached_train_excel[0] is not None:
+                df = _cached_train_excel[0].parse(sheet_name=sheet)
+            else:
+                df = pd.read_excel(fp, sheet_name=sheet, engine='openpyxl')
         except Exception as exc:
             train_status_var.set("Could not read workbook/sheet.")
+            status_var.set("")  # Clear main status on error
             if show_popup:
                 messagebox.showerror("File Error",
                     f"Could not read the selected sheet:\n{exc}", parent=win)
@@ -18128,6 +18957,7 @@ def open_rt_predictor():
             if not has_rt:
                 hints.append("  - An RT column (Top Apex RT [min], RT [min], etc.)")
             train_status_var.set("Missing required columns.")
+            status_var.set("")  # Clear main status on error
             if show_popup:
                 messagebox.showerror("Column Error",
                     "The selected sheet is missing required columns:\n\n"
@@ -18138,8 +18968,14 @@ def open_rt_predictor():
         _cached_train_df[0]  = df
         _cached_train_sig[0] = sig
 
-        rt_col = cm.get('top_apex_rt') or cm.get('rt_search')
-        n_valid = int(df[rt_col].notna().sum())
+        _rt_count_series = pd.Series(np.nan, index=df.index)
+        if 'top_apex_rt' in cm:
+            _rt_count_series = pd.to_numeric(df[cm['top_apex_rt']], errors='coerce')
+        if 'rt_search' in cm:
+            _fill = _rt_count_series.isna()
+            _rt_count_series.loc[_fill] = pd.to_numeric(
+                df.loc[_fill, cm['rt_search']], errors='coerce')
+        n_valid = int(_rt_count_series.notna().sum())
         extra = []
         if 'charge' in cm:
             extra.append('Charge')
@@ -18150,21 +18986,41 @@ def open_rt_predictor():
         extra_txt = f"  [+{', '.join(extra)}]" if extra else ''
         train_status_var.set(
             f"Validated: {sheet} — {len(df)} rows, {n_valid} with RT values{extra_txt}")
+        status_var.set("") 
         return df
+
+    def _run_rt_io_task(task_fn, status_msg):
+        status_var.set(status_msg)
+        threading.Thread(target=lambda: _run_threaded(task_fn), daemon=True).start()
 
     def _browse_train():
         fp = filedialog.askopenfilename(
             title="Select PD PeptideGroups File for Training",
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")],
+            parent=win,
         )
         if fp:
             train_file_var.set(fp)
-            _refresh_train_sheets(fp)
-            _validate_train(show_popup=True)
+            _run_rt_io_task(
+                lambda: (_refresh_train_sheets(fp), _validate_train(show_popup=True)),
+                "Loading training workbook…",
+            )
 
     ttk.Button(train_lf, text="Browse", command=_browse_train).grid(row=0, column=2, padx=5, pady=4)
-    train_entry.bind('<FocusOut>', lambda _e: _refresh_train_sheets(train_file_var.get()))
-    train_sheet_combo.bind('<<ComboboxSelected>>', lambda _e: _validate_train(show_popup=True))
+    train_entry.bind(
+        '<FocusOut>',
+        lambda _e: _run_rt_io_task(
+            lambda: _refresh_train_sheets(train_file_var.get()),
+            "Loading training workbook…",
+        ),
+    )
+    train_sheet_combo.bind(
+        '<<ComboboxSelected>>',
+        lambda _e: _run_rt_io_task(
+            lambda: _validate_train(show_popup=True),
+            "Validating training sheet…",
+        ),
+    )
 
     ToolTip(train_sheet_combo,
             "Select the worksheet that contains training peptides.\n"
@@ -18270,11 +19126,15 @@ def open_rt_predictor():
         fp = filedialog.askopenfilename(
             title="Select Peptide File for Prediction",
             filetypes=[("Excel / CSV", "*.xlsx *.xls *.csv *.tsv"),
-                       ("All files", "*.*")]
+                       ("All files", "*.*")],
+            parent=win,
         )
         if fp:
             pred_file_var.set(fp)
-            _validate_pred(show_popup=True)
+            _run_rt_io_task(
+                lambda: _validate_pred(show_popup=True),
+                "Loading prediction peptides…",
+            )
 
     ttk.Button(pred_lf, text="Browse", command=_browse_pred).grid(row=0, column=2, padx=5, pady=4)
 
@@ -18288,13 +19148,16 @@ def open_rt_predictor():
     r = 0
     ttk.Label(opts_lf, text="Algorithm:").grid(row=r, column=0, sticky='w', padx=5, pady=2)
     _algo_choices = [
+        "AlphaPeptDeep (transfer learning)",
+        "DeepLC (transfer learning)",
         "HistGradientBoosting",
         "GradientBoosting",
-        "DeepLC (transfer learning)",
-        "AlphaPeptDeep (transfer learning)",
     ]
 
-    algo_var = tk.StringVar(value="HistGradientBoosting")
+    _default_rt_algo = (
+        "AlphaPeptDeep (transfer learning)" if _ALPHAPEPTDEEP_AVAILABLE
+        else "HistGradientBoosting")
+    algo_var = tk.StringVar(value=_default_rt_algo)
     algo_combo = ttk.Combobox(opts_lf, textvariable=algo_var,
                               values=_algo_choices,
                               state='readonly', width=28)
@@ -18340,12 +19203,14 @@ def open_rt_predictor():
             "t start / t stop columns for instrument scheduling.")
 
     cv_var = tk.BooleanVar(value=True)
-    ttk.Checkbutton(opts_lf, text="5-fold cross-validation",
-                    variable=cv_var).grid(row=r, column=2, columnspan=2,
-                                          sticky='w', padx=15, pady=2)
-    ToolTip(rw_entry,
-            "When enabled, reports R², MAE, and Median AE on held-out folds\n"
-            "so you can judge model quality before using predictions.")
+    _cv_cb = ttk.Checkbutton(opts_lf, text="5-fold cross-validation",
+                            variable=cv_var)
+    _cv_cb.grid(row=r, column=2, columnspan=2,
+                sticky='w', padx=15, pady=2)
+    ToolTip(_cv_cb,
+            "Enable k-fold cross-validation to estimate model performance\n"
+            "on unseen peptides. The data is split into k folds, each used\n"
+            "once for validation while the remaining k-1 folds are used for training.")
 
     dedup_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(opts_lf, text="Deduplicate training sequences",
@@ -18500,10 +19365,12 @@ def open_rt_predictor():
             status_var.set("Insufficient training data.")
             return
 
-        # deduplicate by sequence (keep first = arbitrary best)
+        # deduplicate by sequence + modifications (keep first = arbitrary best)
         seq_col = tc['sequence']
         if dedup_var.get():
-            tr = tr.drop_duplicates(subset=[seq_col], keep='first')
+            mod_col = tc.get('modifications')
+            dedup_cols = [seq_col, mod_col] if mod_col else [seq_col]
+            tr = tr.drop_duplicates(subset=dedup_cols, keep='first')
 
         algo = algo_var.get()
         is_deeplc = algo.startswith("DeepLC")
@@ -18612,25 +19479,70 @@ def open_rt_predictor():
                 status_var.set("Insufficient valid calibration peptides.")
                 return
 
+            _n_before_sub = len(cal_rows)
+            if _n_before_sub > 7000:
+                # RT stratification uses PD training-sheet RT (minutes), not MGF.
+                # (MGF RTINSECONDS applies only to MS2 calibration DataFrames.)
+                _rts = np.array(
+                    [float(row['rt_norm']) for row in cal_rows], dtype=float)
+                _mods_l = [row.get('mods') or '' for row in cal_rows]
+                _seqs = [row.get('sequence') or '' for row in cal_rows]
+                _z = [row.get('charge', 2) for row in cal_rows]
+                _sel = _apd_select_training_indices(
+                    _rts, _mods_l, _seqs, charges=_z, max_n=5000,
+                    rng=np.random.RandomState(42))
+                cal_rows = [cal_rows[i] for i in _sel]
+                logging.info(
+                    f"AlphaPeptDeep RT: subsampled {_n_before_sub} → {len(cal_rows)} "
+                    f"peptides (mods + RT + length + KD + charged-aa% + z stratification, "
+                    f"cap=5000, trigger>7000); RT range in sample "
+                    f"[{_rts[_sel].min():.2f}, {_rts[_sel].max():.2f}] min "
+                    f"(full data [{_rts.min():.2f}, {_rts.max():.2f}] min)")
+
             cal_df = pd.DataFrame(cal_rows)
             y_train_raw = cal_df['rt_norm'].values.copy()  # actual RT in minutes
 
-            # Normalize RT to 0-1 range for AlphaPeptDeep transfer learning
-            _rt_min = float(y_train_raw.min())
-            _rt_max = float(y_train_raw.max())
-            if _rt_max - _rt_min < 1e-6:
-                _rt_max = _rt_min + 1.0  # avoid division by zero
-            cal_df['rt_norm'] = (cal_df['rt_norm'] - _rt_min) / (_rt_max - _rt_min)
-            _rt_norm_bounds[0] = (_rt_min, _rt_max)
+            # ── Log modification summary ─────────────────────────────────
+            mod_types = set()
+            for row in cal_rows:
+                if row['mods']:
+                    for m in row['mods'].split(';'):
+                        mn = m.split('@')[0].strip()
+                        if mn:
+                            mod_types.add(mn)
+            logging.info(
+                f"AlphaPeptDeep: fine-tuning on {len(cal_rows)} peptides "
+                f"({len(mod_types)} modification types)")
+
+            # Log a few example modification conversions for diagnostics
+            _logged = 0
+            for row in cal_rows:
+                if row['mods'] and _logged < 5:
+                    logging.info(
+                        f"  mod example: seq={row['sequence'][:12]}… "
+                        f"mods='{row['mods']}' sites='{row['mod_sites']}'")
+                    _logged += 1
+
+            # ── Normalise RT by gradient length (paper approach) ────────
+            # The pretrained model was trained with rt_norm = RT / gradient_length.
+            # Using min-max normalisation would shift the baseline and confuse
+            # the pretrained representations, leading to poor generalisation.
+            gradient_length = float(y_train_raw.max())
+            if gradient_length < 1e-6:
+                gradient_length = 1.0
+            cal_df['rt_norm'] = y_train_raw / gradient_length
+            _rt_norm_bounds[0] = (0.0, gradient_length)
             y_train = y_train_raw  # keep raw minutes for diagnostics
 
-            # Calibrate (transfer learn) RT model
-            status_var.set(f"Calibrating AlphaPeptDeep RT on {len(cal_df)} peptides…")
+            logging.info(
+                f"AlphaPeptDeep RT normalisation: gradient_length={gradient_length:.2f} min, "
+                f"rt_norm range=[{cal_df['rt_norm'].min():.4f}, {cal_df['rt_norm'].max():.4f}]")
+
+            # ── Fine-tune RT model (paper params) ───────────────────────
+            status_var.set(f"Fine-tuning AlphaPeptDeep RT on {len(cal_df)} peptides…")
             win.update_idletasks()
 
             try:
-                # Paper-recommended RT TL params: epoch=30, warmup=10,
-                # lr=1e-4, dropout=0.1, batch_size=256.
                 try:
                     mgr.rt_model.model.dropout.p = 0.1
                 except Exception:
@@ -18642,35 +19554,51 @@ def open_rt_predictor():
                     warmup_epoch=10,
                     lr=1e-4,
                 )
-                logging.info(f"AlphaPeptDeep RT model calibrated on {len(cal_df)} peptides")
+                logging.info(
+                    f"AlphaPeptDeep RT model fine-tuned on {len(cal_df)} peptides "
+                    f"(gradient_length={gradient_length:.1f} min)")
             except Exception as exc:
-                logging.warning(f"AlphaPeptDeep RT calibration failed ({exc}). "
+                logging.warning(f"AlphaPeptDeep RT fine-tuning failed ({exc}). "
                                 f"Using uncalibrated pretrained model.")
 
             _trained_model[0] = mgr
+            _apd_calibration[0] = None
             _trained_feat_names[0] = []
             _trained_algorithm[0] = "AlphaPeptDeep (transfer learning)"
             _set_model_ready(True)
 
-            # Cross-validation via calibration residuals
+            # ── Calibration residuals ───────────────────────────────────
+            # IMPORTANT: predict on a FRESH DataFrame copy — peptdeep's
+            # train() may leave cached rt_pred values in cal_df that
+            # would make diagnostics look artificially perfect.
             cv_text = ""
             y_cv_pred = None
             if cv_var.get():
                 status_var.set("Computing AlphaPeptDeep calibration residuals…")
                 win.update_idletasks()
                 try:
-                    pred_result = mgr.predict_rt(cal_df)
+                    _input_cols = ['sequence', 'mods', 'mod_sites',
+                                   'charge', 'nce', 'instrument']
+                    diag_df = cal_df[_input_cols].copy()
+                    diag_df['nAA'] = diag_df['sequence'].str.len()
+                    pred_result = mgr.predict_rt(diag_df)
                     if isinstance(pred_result, pd.DataFrame) and 'rt_pred' in pred_result.columns:
-                        y_cv_pred = pred_result['rt_pred'].values
+                        y_cv_pred = pred_result['rt_pred'].values.copy()
                     elif isinstance(pred_result, np.ndarray):
-                        y_cv_pred = pred_result.flatten()
+                        y_cv_pred = pred_result.flatten().copy()
                     else:
-                        y_cv_pred = np.array(pred_result).flatten()
+                        y_cv_pred = np.array(pred_result).flatten().copy()
 
-                    # Denormalize predictions back to minutes
-                    if _rt_norm_bounds[0] is not None:
-                        _bmin, _bmax = _rt_norm_bounds[0]
-                        y_cv_pred = y_cv_pred * (_bmax - _bmin) + _bmin
+                    # Log raw predictions for first 5 peptides
+                    for _di in range(min(5, len(y_cv_pred))):
+                        logging.info(
+                            f"  diag[{_di}] seq={diag_df['sequence'].iloc[_di][:15]}… "
+                            f"raw_rt_pred={y_cv_pred[_di]:.4f}  "
+                            f"actual_rt={y_train[_di]:.2f} min")
+
+                    # Denormalise back to minutes
+                    _bmin, _bmax = _rt_norm_bounds[0]
+                    y_cv_pred = y_cv_pred * (_bmax - _bmin) + _bmin
 
                     cv_r2    = r2_score(y_train, y_cv_pred)
                     cv_mae   = mean_absolute_error(y_train, y_cv_pred)
@@ -18682,7 +19610,7 @@ def open_rt_predictor():
                         'n_train': len(y_train), 'algorithm': 'AlphaPeptDeep',
                     }
                     cv_text = (
-                        f"AlphaPeptDeep (calibrated)  ▸  R² = {cv_r2:.4f}   "
+                        f"AlphaPeptDeep (transfer learning)  ▸  R² = {cv_r2:.4f}   "
                         f"MAE = {cv_mae:.2f} min   "
                         f"Median AE = {cv_medae:.2f} min   "
                         f"P95 = ±{cv_p95:.2f} min   "
@@ -18773,22 +19701,34 @@ def open_rt_predictor():
                 return
 
             pred_apd_df = pd.DataFrame(pred_apd_rows)
+            pred_apd_df['nAA'] = pred_apd_df['sequence'].str.len()
 
             status_var.set(f"AlphaPeptDeep predicting RT for {len(pred_apd_df)} peptides…")
             win.update_idletasks()
             try:
                 pred_result = mgr.predict_rt(pred_apd_df)
                 if isinstance(pred_result, pd.DataFrame) and 'rt_pred' in pred_result.columns:
-                    y_pred = pred_result['rt_pred'].values
+                    raw_pred_new = pred_result['rt_pred'].values
                 elif isinstance(pred_result, np.ndarray):
-                    y_pred = pred_result.flatten()
+                    raw_pred_new = pred_result.flatten()
                 else:
-                    y_pred = np.array(pred_result).flatten()
+                    raw_pred_new = np.array(pred_result).flatten()
 
-                # Denormalize predictions back to minutes
-                if _rt_norm_bounds[0] is not None:
+                # Log raw predictions for first 5 peptides
+                for _pi in range(min(5, len(raw_pred_new))):
+                    logging.info(
+                        f"  pred[{_pi}] seq={pred_apd_df['sequence'].iloc[_pi][:15]}… "
+                        f"mods='{pred_apd_df['mods'].iloc[_pi]}' "
+                        f"raw_rt_pred={raw_pred_new[_pi]:.4f}")
+
+                # Denormalise: multiply by gradient length to get RT in minutes
+                if _apd_calibration[0] is not None:
+                    y_pred = _apd_calibration[0].predict(raw_pred_new)
+                elif _rt_norm_bounds[0] is not None:
                     _bmin, _bmax = _rt_norm_bounds[0]
-                    y_pred = y_pred * (_bmax - _bmin) + _bmin
+                    y_pred = raw_pred_new * (_bmax - _bmin) + _bmin
+                else:
+                    y_pred = raw_pred_new
             except Exception as exc:
                 messagebox.showerror("AlphaPeptDeep Error",
                     f"AlphaPeptDeep RT prediction failed:\n{exc}", parent=win)
@@ -18842,8 +19782,8 @@ def open_rt_predictor():
                 status_var.set("DeepLC not installed.")
                 return
 
-            # ── build calibration DataFrame for DeepLC ──
-            status_var.set(f"Building DeepLC calibration set from {len(tr)} peptides…")
+            # ── build training DataFrame for DeepLC ──
+            status_var.set(f"Building DeepLC training set from {len(tr)} peptides…")
             win.update_idletasks()
 
             mod_col = tc.get('modifications')
@@ -18865,7 +19805,7 @@ def open_rt_predictor():
 
             if len(cal_rows) < 10:
                 messagebox.showwarning("Insufficient Data",
-                    f"Only {len(cal_rows)} valid peptides for DeepLC calibration.\n"
+                    f"Only {len(cal_rows)} valid peptides for DeepLC transfer learning.\n"
                     "Need at least 10.", parent=win)
                 status_var.set("Insufficient valid calibration peptides.")
                 return
@@ -18873,22 +19813,24 @@ def open_rt_predictor():
             cal_df = pd.DataFrame(cal_rows)
             y_train = cal_df['tr'].values
 
-            # ── instantiate & calibrate DeepLC ──
-            status_var.set(f"Calibrating DeepLC on {len(cal_df)} peptides (transfer learning)…")
+            # ── instantiate & transfer-learn DeepLC ──
+            status_var.set(f"Transfer-learning DeepLC on {len(cal_df)} peptides…")
             win.update_idletasks()
 
             try:
                 dlc = _DeepLC_Class(
-                    split_cal=10,     # 10-part calibration
+                    split_cal=10,
                     n_jobs=1,
                     verbose=False,
+                    deeplc_retrain=True,
+                    n_epochs=20,
                 )
                 dlc.calibrate_preds(seq_df=cal_df)
             except Exception as exc:
                 messagebox.showerror("DeepLC Error",
-                    f"DeepLC calibration failed:\n{exc}",
+                    f"DeepLC transfer learning failed:\n{exc}",
                     parent=win)
-                status_var.set(f"DeepLC calibration failed: {exc}")
+                status_var.set(f"DeepLC transfer learning failed: {exc}")
                 return
 
             _trained_model[0] = dlc
@@ -18900,7 +19842,7 @@ def open_rt_predictor():
             cv_text = ""
             y_cv_pred = None
             if cv_var.get():
-                status_var.set("Computing DeepLC calibration residuals…")
+                status_var.set("Computing DeepLC training residuals…")
                 win.update_idletasks()
                 try:
                     y_cv_pred = np.array(dlc.make_preds(seq_df=cal_df))
@@ -18914,14 +19856,14 @@ def open_rt_predictor():
                         'n_train': len(y_train), 'algorithm': 'DeepLC',
                     }
                     cv_text = (
-                        f"DeepLC (calibrated)  ▸  R² = {cv_r2:.4f}   "
+                        f"DeepLC (transfer learning)  ▸  R² = {cv_r2:.4f}   "
                         f"MAE = {cv_mae:.2f} min   "
                         f"Median AE = {cv_medae:.2f} min   "
                         f"P95 = ±{cv_p95:.2f} min   "
                         f"(n = {len(y_train)})"
                     )
                 except Exception as exc:
-                    cv_text = f"DeepLC residual check failed: {exc}"
+                    cv_text = f"DeepLC transfer-learning residual check failed: {exc}"
             else:
                 cv_text = "Cross-validation disabled."
 
@@ -18938,7 +19880,7 @@ def open_rt_predictor():
                 ax1.plot([lo, hi], [lo, hi], 'r--', lw=1)
                 ax1.set_xlabel('Observed RT (min)')
                 ax1.set_ylabel('DeepLC Predicted RT (min)')
-                ax1.set_title('Actual vs Predicted (calibration)')
+                ax1.set_title('Actual vs Predicted (transfer learning)')
                 ax2 = fig.add_subplot(1, 2, 2)
                 residuals = y_cv_pred - y_train
                 ax2.hist(residuals, bins=50, edgecolor='black', alpha=0.7)
@@ -18963,7 +19905,7 @@ def open_rt_predictor():
             win.update_idletasks()
             pred_df = _validate_pred(show_popup=True)
             if pred_df is None:
-                status_var.set(f"DeepLC calibrated ({cv_text}).  Load a prediction file to continue.")
+                status_var.set(f"DeepLC trained ({cv_text}).  Load a prediction file to continue.")
                 return
             pc = _pred_col_map[0]
 
@@ -19395,18 +20337,31 @@ def open_rt_predictor():
                 return
 
             try:
-                pred_result = trained.predict_rt(pd.DataFrame(pred_apd_rows))
+                _pred_fresh_df = pd.DataFrame(pred_apd_rows)
+                _pred_fresh_df['nAA'] = _pred_fresh_df['sequence'].str.len()
+                pred_result = trained.predict_rt(_pred_fresh_df)
                 if isinstance(pred_result, pd.DataFrame) and 'rt_pred' in pred_result.columns:
-                    y_pred = pred_result['rt_pred'].values
+                    raw_pred_vals = pred_result['rt_pred'].values
                 elif isinstance(pred_result, np.ndarray):
-                    y_pred = pred_result.flatten()
+                    raw_pred_vals = pred_result.flatten()
                 else:
-                    y_pred = np.array(pred_result).flatten()
+                    raw_pred_vals = np.array(pred_result).flatten()
 
-                # Denormalize predictions back to minutes
-                if _rt_norm_bounds[0] is not None:
+                # Log raw predictions for first 5 peptides
+                for _pi in range(min(5, len(raw_pred_vals))):
+                    logging.info(
+                        f"  pred[{_pi}] seq={_pred_fresh_df['sequence'].iloc[_pi][:15]}… "
+                        f"mods='{_pred_fresh_df['mods'].iloc[_pi]}' "
+                        f"raw_rt_pred={raw_pred_vals[_pi]:.4f}")
+
+                # Denormalise: multiply by gradient length to get RT in minutes
+                if _apd_calibration[0] is not None:
+                    y_pred = _apd_calibration[0].predict(raw_pred_vals)
+                elif _rt_norm_bounds[0] is not None:
                     _bmin, _bmax = _rt_norm_bounds[0]
-                    y_pred = y_pred * (_bmax - _bmin) + _bmin
+                    y_pred = raw_pred_vals * (_bmax - _bmin) + _bmin
+                else:
+                    y_pred = raw_pred_vals
             except Exception as exc:
                 messagebox.showerror("AlphaPeptDeep Error",
                     f"AlphaPeptDeep RT prediction failed:\n{exc}", parent=win)
@@ -19527,6 +20482,8 @@ def open_rt_predictor():
             'trained_model': trained,
             'feature_names': list(_trained_feat_names[0]) if _trained_feat_names[0] is not None else [],
             'metrics': dict(_model_metrics[0]) if _model_metrics[0] else {},
+            'apd_calibration': _apd_calibration[0],
+            'rt_norm_bounds': _rt_norm_bounds[0],
             'saved_at': datetime.datetime.now().isoformat(),
         }
 
@@ -19571,6 +20528,8 @@ def open_rt_predictor():
         _trained_algorithm[0] = loaded_algo
         _trained_feat_names[0] = list(loaded_feats) if loaded_feats is not None else []
         _model_metrics[0] = dict(loaded_metrics) if isinstance(loaded_metrics, dict) else {}
+        _apd_calibration[0] = payload.get('apd_calibration')
+        _rt_norm_bounds[0] = payload.get('rt_norm_bounds')
 
         if loaded_algo in _algo_choices:
             algo_var.set(loaded_algo)
@@ -19594,6 +20553,19 @@ def open_rt_predictor():
 
     def _run_threaded(target_func):
         """Run work on a background thread and surface failures."""
+        ok_runtime, runtime_msg = _ensure_rt_runtime()
+        if not ok_runtime:
+            win.after(0, lambda: status_var.set(runtime_msg))
+            win.after(
+                0,
+                lambda: messagebox.showerror(
+                    "RT Predictor Error",
+                    f"{runtime_msg}\n\nSee log for details:\n{temp_log_file}",
+                    parent=win,
+                ),
+            )
+            return
+
         def _ui_call(func, *args, **kwargs):
             if threading.current_thread() is threading.main_thread():
                 return func(*args, **kwargs)

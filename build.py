@@ -72,12 +72,120 @@ def _pyinstaller():
     return [_find_python(), '-m', 'PyInstaller']
 
 
+def _major_version(version_text):
+    """Best-effort parse of a major version integer."""
+    try:
+        return int(str(version_text).split('.')[0])
+    except Exception:
+        return 999
+
+
+def _prune_broken_dist_info():
+    """
+    Remove stale *.dist-info folders missing METADATA.
+
+    PyInstaller checks package versions via importlib.metadata; broken dist-info
+    folders can make version() return None and crash hooks.
+    """
+    import sysconfig
+
+    site_packages = Path(sysconfig.get_paths()['purelib'])
+    removed = 0
+
+    for dist_info in site_packages.glob('*.dist-info'):
+        if not (dist_info / 'METADATA').is_file():
+            shutil.rmtree(dist_info, ignore_errors=True)
+            if not dist_info.exists():
+                removed += 1
+
+    if removed:
+        print(f'  [FIX] Removed {removed} broken *.dist-info folders')
+
+
+def _ensure_setuptools_pkg_resources_compat():
+    """
+    Ensure pkg_resources still provides APIs expected by PyInstaller runtime hooks.
+
+    PyInstaller's pyi_rth_pkgres hook currently assumes legacy pkg_resources
+    symbols (e.g. NullProvider) that are absent in setuptools>=81.
+    """
+    import warnings
+    from importlib import metadata as importlib_metadata
+
+    try:
+        setuptools_version = importlib_metadata.version('setuptools')
+    except Exception:
+        setuptools_version = None
+
+    needs_pin = setuptools_version is None or _major_version(setuptools_version) >= 81
+    if needs_pin:
+        print('  [FIX] Pinning setuptools to <81 for PyInstaller compatibility ...')
+        _run(
+            [_find_python(), '-m', 'pip', 'install', '--force-reinstall', 'setuptools<81'],
+            'Pin setuptools<81'
+        )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            category=UserWarning,
+            message='pkg_resources is deprecated'
+        )
+        import pkg_resources
+
+    required_symbols = (
+        'NullProvider',
+        'register_loader_type',
+        'register_finder',
+        'find_on_path',
+    )
+    missing = [name for name in required_symbols if not hasattr(pkg_resources, name)]
+    if missing:
+        raise RuntimeError(
+            'pkg_resources compatibility check failed. Missing symbols: '
+            + ', '.join(missing)
+            + '. Reinstall setuptools<81 and rebuild.'
+        )
+
+    final_setuptools = importlib_metadata.version('setuptools')
+    print(f'  [OK]  setuptools/pkg_resources compatibility ({final_setuptools})')
+
+
+def _ensure_pyinstaller_metadata_health():
+    """
+    Validate metadata needed by PyInstaller hook version checks.
+    """
+    from importlib import metadata as importlib_metadata
+
+    # Dist names checked by PyInstaller hooks via check_requirement(...)
+    critical = ['setuptools', 'matplotlib', 'scipy', 'scikit-learn']
+    bad = []
+    for dist_name in critical:
+        try:
+            version = importlib_metadata.version(dist_name)
+            if not isinstance(version, str) or not version.strip():
+                bad.append(dist_name)
+        except Exception:
+            bad.append(dist_name)
+
+    if bad:
+        raise RuntimeError(
+            'Broken package metadata detected for: '
+            + ', '.join(sorted(set(bad)))
+            + '. Reinstall these packages before building.'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Dependency check
 # ---------------------------------------------------------------------------
 def check_dependencies():
     _hr()
     print('Checking build dependencies ...')
+    _prune_broken_dist_info()
+    _ensure_setuptools_pkg_resources_compat()
+    _ensure_pyinstaller_metadata_health()
+
     required = {
         'PyInstaller': 'PyInstaller',
         'numpy':       'numpy',

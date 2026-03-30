@@ -50,6 +50,24 @@ except ImportError:
     _HAS_FISHER = False
 
 
+def _eic_rows_matched_only(df):
+    """
+    Return only EIC rows that represent fragments matched to observed signal.
+
+    ProteoPRM also writes rows with intensity 0 for *unmatched* predicted
+    fragments (so the full predicted spectrum can be drawn elsewhere). Those
+    rows must not be overlaid on MS2 or Spectral-QC mirror plots — otherwise
+    each theoretical m/z is snapped to the nearest raw peak and appears as a
+    false \"matched\" stem.
+    """
+    if df is None or getattr(df, 'empty', True):
+        return df
+    if 'intensity' not in df.columns:
+        return df
+    _v = pd.to_numeric(df['intensity'], errors='coerce').fillna(0.0)
+    return df.loc[_v > 0].copy()
+
+
 # ---------------------------------------------------------------------------
 # Result CSV cache
 # ---------------------------------------------------------------------------
@@ -469,6 +487,7 @@ class ResultsViewer:
         self.mzml_folder = None
         self._eic_displayed = False
         self._last_rt_width_val = ""
+        self._qc_tab_populated = False  # Track if Spectral QC tab has been loaded
 
         self._build_ui()
 
@@ -675,7 +694,7 @@ class ResultsViewer:
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-        self._qc_data = {'df': None, 'eic_df': None, 'sa_col': 'spectral_angle'}
+        self._qc_data = {'df': None, 'eic_df': None, 'sa_col': 'spectral_angle', 'filepath': None}
 
         self.spectral_qc_frame.columnconfigure(0, weight=1)
         self.spectral_qc_frame.rowconfigure(1, weight=1)
@@ -705,12 +724,12 @@ class ResultsViewer:
         tree_outer.columnconfigure(0, weight=1)
         tree_outer.rowconfigure(0, weight=1)
 
-        tree_cols = ('peptide', 'charge', 'file', 'scan', 'spectral_angle',
+        tree_cols = ('peptide', 'modification', 'charge', 'file', 'scan', 'spectral_angle',
                      'matched_fragments', 'mass_accuracy')
         self._qc_tree = ttk.Treeview(tree_outer, columns=tree_cols,
                                      show='headings', selectmode='browse')
         _col_labels = {
-            'peptide': 'Peptide', 'charge': 'Charge', 'file': 'File',
+            'peptide': 'Peptide', 'modification': 'Modification', 'charge': 'Charge', 'file': 'File',
             'scan': 'Scan', 'spectral_angle': 'SA Score',
             'matched_fragments': 'Matched Ions', 'mass_accuracy': 'Mass Acc (ppm)',
         }
@@ -718,7 +737,7 @@ class ResultsViewer:
             self._qc_tree.heading(
                 c, text=_col_labels.get(c, c),
                 command=lambda _col=c: self._sort_qc_tree(_col, False))
-            w = 90 if c not in ('peptide', 'file') else 200
+            w = 90 if c not in ('peptide', 'modification', 'file') else 200
             self._qc_tree.column(c, width=w, minwidth=60)
         tree_scroll = ttk.Scrollbar(tree_outer, orient='vertical',
                                     command=self._qc_tree.yview)
@@ -749,6 +768,9 @@ class ResultsViewer:
         # ── Tab 2: SA histogram ──
         tab_hist = ttk.Frame(self._qc_nb)
         self._qc_nb.add(tab_hist, text="SA Distribution")
+        
+        # Bind tab selection to lazy-load Spectral QC when user clicks that tab
+        self._qc_nb.bind('<<NotebookTabChanged>>', self._on_qc_tab_selected)
         self._qc_fig_hist = Figure(figsize=(7, 4), dpi=100)
         self._qc_ax_hist = self._qc_fig_hist.add_subplot(111)
         self._qc_canvas_hist = FigureCanvasTkAgg(self._qc_fig_hist, master=tab_hist)
@@ -827,8 +849,9 @@ class ResultsViewer:
                 self.eic_file_var.set(files[0])
 
             self.root.title(f"ProteoPRM - Results Viewer  [{os.path.basename(path)}]")
-            # Also populate Spectral Prediction QC tab
-            self._populate_spectral_qc(path)
+            # Defer Spectral QC tab population (will load lazily when user clicks that tab)
+            self._qc_tab_populated = False
+            self._qc_data['filepath'] = path  # Store path for lazy loading
             messagebox.showinfo("Loaded", f"Results loaded successfully.\n"
                                 f"{len(combos)} peptides, {len(files)} files.")
         except Exception as e:
@@ -860,6 +883,15 @@ class ResultsViewer:
     # --------------------------------------------------------------------- #
     # Spectral Prediction QC
     # --------------------------------------------------------------------- #
+    def _on_qc_tab_selected(self, event=None):
+        """Lazy-load Spectral QC data when user clicks on that tab for the first time."""
+        if self._qc_tab_populated or not self._qc_data.get('filepath'):
+            return
+        self._qc_tab_populated = True
+        filepath = self._qc_data['filepath']
+        # Schedule population on next mainloop iteration to avoid blocking UI
+        self.root.after(100, lambda: self._populate_spectral_qc(filepath))
+
     def _populate_spectral_qc(self, filepath):
         """Load spectral-angle data from the results file/folder and populate the QC tab."""
         try:
@@ -895,6 +927,8 @@ class ResultsViewer:
 
             pep_col = next((c for c in df.columns
                             if c.lower() in ('peptide', 'sequence')), None)
+            mod_col = next((c for c in df.columns
+                            if c.lower() in ('modification', 'modifications', 'mods')), None)
             chg_col = next((c for c in df.columns
                             if c.lower() in ('charge', 'precursor_charge')), None)
             file_col = next((c for c in df.columns
@@ -917,6 +951,7 @@ class ResultsViewer:
                 n_with_sa += 1
                 self._qc_tree.insert('', 'end', values=(
                     pep_val,
+                    '' if (not mod_col or pd.isna(row.get(mod_col))) else str(row.get(mod_col, '')).strip(),
                     str(row.get(chg_col, '')) if chg_col else '',
                     os.path.basename(str(row.get(file_col, ''))) if file_col else '',
                     str(row.get(scan_col, '')) if scan_col else '',
@@ -973,49 +1008,34 @@ class ResultsViewer:
             col, command=lambda _col=col: self._sort_qc_tree(_col, not reverse))
 
     def _on_qc_tree_select_debounced(self, event=None):
-        """Debounce rapid tree-view clicks so the row highlight updates
-        instantly while the mirror-plot work is deferred. Uses a shorter
-        debounce for cached plots (near-instant) vs. fresh renders."""
+        """Update mirror plot immediately when a row is selected."""
         if self._mirror_debounce_id is not None:
             try:
                 self.root.after_cancel(self._mirror_debounce_id)
             except Exception:
                 pass
-        # Use very short debounce — the cache check inside is O(1)
-        self._mirror_debounce_id = self.root.after(15, self._on_qc_tree_select)
+        self._mirror_debounce_id = self.root.after(1, self._on_qc_tree_select)
 
     def _on_qc_tree_select(self, event=None):
         """Draw mirror plot for the selected PSM row.
 
         - Observed (upper):  all raw scan peaks when mzML folder is set;
-          matched ions in colour, unmatched in grey.
-        - Predicted (lower):  actual APD / MS2PIP intensities from EIC data.
+          matched ions in colour, unmatched peaks in light grey.
+        - Predicted (lower):  all MS2PIP / AlphaPeptDeep predicted intensities
+          from EIC data (both matched and unmatched predicted ions).
         """
         sel = self._qc_tree.selection()
         if not sel:
             return
         vals = self._qc_tree.item(sel[0], 'values')
         peptide = vals[0]
-        charge_str = vals[1]
-        file_name = vals[2]
-        scan_str = vals[3]
-        sa_score = vals[4]
+        # modification = vals[1]  (not used in mirror plot rendering)
+        charge_str = vals[2]
+        file_name = vals[3]
+        scan_str = vals[4]
+        sa_score = vals[5]
 
         if not self.results_file or not os.path.isdir(self.results_file):
-            return
-
-        # ── Fast path: restore cached bitmap ──────────────────────────
-        _cache_key = (peptide, charge_str, file_name, scan_str)
-        if _cache_key in _mirror_plot_cache:
-            _mirror_plot_cache.move_to_end(_cache_key)
-            buf_arr, info_str = _mirror_plot_cache[_cache_key]
-            ax = self._qc_ax_mirror
-            ax.clear()
-            ax.imshow(buf_arr, aspect='auto')
-            ax.axis('off')
-            self._qc_fig_mirror.subplots_adjust(left=0, right=1, top=1, bottom=0)
-            self._qc_mirror_info_var.set(info_str)
-            self._qc_canvas_mirror.draw_idle()
             return
 
         ax = self._qc_ax_mirror
@@ -1030,22 +1050,12 @@ class ResultsViewer:
         _default_color = '#757575'
         _unmatched_color = '#bdbdbd'
 
-        # Scan-key helper
-        def _sk(v):
-            import re as _re
-            t = str(v).strip()
-            m = _re.search(r'(\d+)(?:\.0+)?$', t)
-            return m.group(1) if m else t
-
         # ── 1. Load matched ions + predicted intensities from EICs ───
         matched_ions = []   # (mz, intensity, ion_label, base_type)
         pred_ions = []      # (mz, predicted_intensity, ion_label, base_type)
 
         eic_df = self._qc_data.get('eic_df')
-        if eic_df is None or (hasattr(eic_df, 'empty') and eic_df.empty):
-            eic_df = pd.DataFrame()
-
-        if not eic_df.empty:
+        if eic_df is not None and not eic_df.empty:
             try:
                 pep_eic = eic_df[
                     (eic_df['peptide'] == peptide) &
@@ -1055,20 +1065,28 @@ class ResultsViewer:
                     try:
                         scan_rows, _ = _find_scan_rows(pep_eic, scan_str)
                     except Exception:
-                        req_key = _sk(scan_str)
-                        scan_keys = pep_eic['scan_number'].apply(_sk)
+                        req_key = _scan_key(scan_str)
+                        scan_keys = pep_eic['scan_number'].apply(_scan_key)
                         scan_rows = pep_eic[scan_keys == req_key]
+
                     if not scan_rows.empty:
-                        main = scan_rows[
-                            scan_rows['neutral_loss'].isnull() |
-                            (scan_rows['neutral_loss'] == '')
-                        ]
+                        # Filter out neutral-loss rows safely
+                        if 'neutral_loss' in scan_rows.columns:
+                            nl_col = scan_rows['neutral_loss']
+                            main = scan_rows[nl_col.isnull() | (nl_col.astype(str).str.strip() == '') | (nl_col.astype(str) == 'nan')]
+                        else:
+                            main = scan_rows
+
                         for _, row in main.iterrows():
                             it = str(row.get('ion_type', '')) if pd.notna(row.get('ion_type')) else ''
-                            mz = float(row.get('fragment_theoretical_mz', 0))
+                            mz_col = 'fragment_theoretical_mz' if 'fragment_theoretical_mz' in main.columns else 'theoretical_mz'
+                            mz = float(row.get(mz_col, 0))
                             inten = float(row.get('intensity', 0))
                             base_type = ''.join(c for c in it if c.isalpha()).lower()
-                            matched_ions.append((mz, inten, it, base_type))
+
+                            if inten > 0:
+                                matched_ions.append((mz, inten, it, base_type))
+
                             pred_int = row.get('predicted_intensity', np.nan)
                             try:
                                 pred_int = float(pred_int)
@@ -1076,8 +1094,8 @@ class ResultsViewer:
                                 pred_int = np.nan
                             if pd.notna(pred_int) and pred_int > 0:
                                 pred_ions.append((mz, pred_int, it, base_type))
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.debug(f"Mirror plot EIC load error: {exc}")
 
         # Fallback: parse fragment_mzs from PSM sheet
         if not matched_ions:
@@ -1135,7 +1153,7 @@ class ResultsViewer:
         actual_matched = 0
         has_raw = all_scan_peaks is not None
         tol_da = 0.02
-        _LABEL_THRESH = 3.0  # only label ions ≥ 3% relative intensity
+        _LABEL_THRESH = 3.0
 
         if has_raw:
             mz_all, int_all = all_scan_peaks
@@ -1151,6 +1169,7 @@ class ResultsViewer:
                 if diffs[best_idx] < tol_da:
                     matched_raw_idx[best_idx] = (lbl, bt)
 
+            # Draw unmatched raw peaks in light grey
             unmatched_mask = np.ones(len(mz_all), dtype=bool)
             for idx in matched_raw_idx:
                 unmatched_mask[idx] = False
@@ -1158,8 +1177,7 @@ class ResultsViewer:
                 ax.vlines(mz_all[unmatched_mask], 0, int_norm[unmatched_mask],
                           colors=_unmatched_color, linewidth=0.7, alpha=0.45)
 
-            # Batch matched peaks by colour for fewer draw calls
-            _batched_obs = {}  # base_type -> (mz_list, int_list, lbl_list)
+            _batched_obs = {}
             for idx, (lbl, bt) in matched_raw_idx.items():
                 _batched_obs.setdefault(bt, ([], [], []))
                 _batched_obs[bt][0].append(mz_all[idx])
@@ -1194,7 +1212,7 @@ class ResultsViewer:
                                     va='bottom', rotation=90, color=color)
             actual_matched = len(matched_ions)
 
-        # ── 4. Draw Predicted spectrum (downward) — actual APD/MS2PIP ─
+        # ── 4. Draw Predicted spectrum (downward) — all predicted ions ─
         pred_norm = []
         if pred_ions:
             max_pred = max(i[1] for i in pred_ions)
@@ -1203,7 +1221,6 @@ class ResultsViewer:
             pred_norm = [(mz, inten / max_pred * 100.0, lbl, bt)
                          for mz, inten, lbl, bt in pred_ions]
 
-        # Batch predicted peaks by colour
         _batched_pred = {}
         for pmz, inten, plabel, pbt in pred_norm:
             _batched_pred.setdefault(pbt, ([], [], []))
@@ -1222,16 +1239,17 @@ class ResultsViewer:
         ax.axhline(0, color='black', linewidth=0.8)
         ax.set_xlabel('m/z')
 
-        self._qc_mirror_info_var.set(
-            f"{peptide}  z={charge_str}   SA={sa_score}   matched={actual_matched}")
+        info_str = f"{peptide}  z={charge_str}   SA={sa_score}   matched={actual_matched}"
+        self._qc_mirror_info_var.set(info_str)
         ax.set_title(f'Mirror Plot \u2014 {peptide} {charge_str}+   SA = {sa_score}')
 
         current_ylim = ax.get_ylim()
         max_abs = max(abs(current_ylim[0]), abs(current_ylim[1]), 100)
         ax.set_ylim(-max_abs * 1.15, max_abs * 1.15)
-        yticks = ax.get_yticks()
-        ax.set_yticklabels([f'{abs(v):.0f}' for v in yticks])
         ax.set_ylabel('Relative Intensity (%)')
+        yticks = ax.get_yticks()
+        ax.set_yticks(yticks)
+        ax.set_yticklabels([f'{abs(v):.0f}' for v in yticks])
 
         ax.text(0.01, 0.95, 'Observed \u2191', transform=ax.transAxes,
                 fontsize=9, va='top', ha='left', fontstyle='italic', color='#555')
@@ -1239,7 +1257,7 @@ class ResultsViewer:
             ax.text(0.01, 0.05, 'Predicted \u2193', transform=ax.transAxes,
                     fontsize=9, va='bottom', ha='left', fontstyle='italic', color='#555')
         else:
-            ax.text(0.01, 0.05, 'Predicted \u2193  (no predictions in this file)',
+            ax.text(0.01, 0.05, 'Predicted \u2193  (no predictions available)',
                     transform=ax.transAxes, fontsize=8, va='bottom', ha='left',
                     fontstyle='italic', color='#888')
 
@@ -1261,19 +1279,7 @@ class ResultsViewer:
             ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
 
         self._qc_fig_mirror.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.10)
-        self._qc_canvas_mirror.draw()
-
-        # ── Cache the rendered bitmap for instant future access ────────
-        try:
-            buf = self._qc_fig_mirror.canvas.buffer_rgba()
-            w, h = self._qc_fig_mirror.canvas.get_width_height()
-            buf_arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4)).copy()
-            info_str = self._qc_mirror_info_var.get()
-            if len(_mirror_plot_cache) >= _MIRROR_CACHE_MAX:
-                _mirror_plot_cache.popitem(last=False)
-            _mirror_plot_cache[_cache_key] = (buf_arr, info_str)
-        except Exception:
-            pass
+        self._qc_canvas_mirror.draw_idle()
 
     def _export_sa_csv(self):
         """Export spectral-angle scores to CSV."""
@@ -1555,6 +1561,7 @@ class ResultsViewer:
 
             # Match scan rows robustly (exact normalized key, then nearest numeric scan)
             scan_eic, matched_scan_key = _find_scan_rows(peptide_eic, scan_number)
+            scan_eic = _eic_rows_matched_only(scan_eic)
 
             # Read spectrum from mzML
             mzml_path = os.path.join(self.mzml_folder, mzml_file)
