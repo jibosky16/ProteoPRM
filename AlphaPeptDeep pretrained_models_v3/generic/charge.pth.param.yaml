@@ -1,0 +1,6 @@
+fixed_sequence_len: 0
+min_pred_value: 0.0
+hidden_dim: 128
+output_dim: 10
+nlayers: 4
+dropout: 0.1

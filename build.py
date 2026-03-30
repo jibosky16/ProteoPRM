@@ -203,6 +203,7 @@ def check_dependencies():
         'ms2pip':      'ms2pip',
         'peptdeep':    'peptdeep',
         'psm_utils':   'psm_utils',
+        'sqlalchemy':  'sqlalchemy',
         'deeplc':      'deeplc',
         'tensorflow':  'tensorflow',
         'numba':       'numba',

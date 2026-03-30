@@ -13,6 +13,7 @@
 # =============================================================================
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 SPEC_DIR = Path(SPECPATH)
 
@@ -55,11 +56,18 @@ hidden = [
     'concurrent.futures', 'threading',
 ]
 
+my_binaries = []
+for pkg in ['fisher_py']:
+    d, b, h = collect_all(pkg)
+    datas.extend(d)
+    my_binaries.extend(b)
+    hidden.extend(h)
+
 
 a = Analysis(
     [str(SPEC_DIR / 'ProteoPRM_Results_Viewer.py')],
     pathex=[str(SPEC_DIR)],
-    binaries=[],
+    binaries=my_binaries,
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],

@@ -73,6 +73,14 @@ if _fisher_spec and _fisher_spec.submodule_search_locations:
     if (_fisher_pkg / 'dll').is_dir():
         datas.append((str(_fisher_pkg / 'dll'), 'fisher_py/dll'))
 
+# alphabase package data (required by peptdeep/alphabase runtime)
+_alphabase_spec = _ilu.find_spec('alphabase')
+if _alphabase_spec and _alphabase_spec.submodule_search_locations:
+    _alphabase_pkg = Path(_alphabase_spec.submodule_search_locations[0])
+    _ab_const = _alphabase_pkg / 'constants' / 'const_files'
+    if _ab_const.is_dir():
+        datas.append((str(_ab_const), 'alphabase/constants/const_files'))
+
 # calibrated_apd_models: ship only the manifest.json seed so the folder
 # exists next to the EXE and the code doesn't error on first launch.
 _cal_manifest = SPEC_DIR / 'calibrated_apd_models' / 'manifest.json'
@@ -183,7 +191,7 @@ a = Analysis(
         'matplotlib.backends.backend_ps',
         # Large unused packages
         'PySide2', 'PyQt5', 'wx',
-        'sqlalchemy', 'psycopg2',
+        'psycopg2',
         'statsmodels',
     ],
     noarchive=False,

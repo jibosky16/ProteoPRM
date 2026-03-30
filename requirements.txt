@@ -3,7 +3,7 @@
 # Regenerate with: .venv311\Scripts\pip freeze
 
 # ── Core Scientific Computing ───────────────────────────────────────────────
-numpy==2.4.2
+numpy==1.26.4
 scipy==1.17.0
 pandas==2.3.3
 scikit-learn==1.8.0
@@ -97,13 +97,14 @@ sympy==1.14.0
 threadpoolctl==3.6.0
 tokenizers==0.22.2
 transformers==5.2.0
-triqler==0.9.1
+triqler==0.7.3
 typing_extensions==4.15.0
 urllib3==2.6.3
 wrapt==2.1.2
 xgboost==2.1.4
 zipp==3.23.0
-
+xlrd==2.0.1
+xlsxwriter==3.1.4
 # ============================================================================
 # OPTIONAL: GPU ACCELERATION
 # ============================================================================

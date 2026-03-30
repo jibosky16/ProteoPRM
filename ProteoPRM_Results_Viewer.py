@@ -46,7 +46,7 @@ except ImportError:
 try:
     from fisher_py import RawFile
     _HAS_FISHER = True
-except ImportError:
+except Exception:
     _HAS_FISHER = False
 
 

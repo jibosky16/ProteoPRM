@@ -18903,14 +18903,30 @@ def open_rt_predictor():
             _cached_train_excel[0] = None
             _cached_train_excel_path[0] = None
             return
-        train_sheet_combo['values'] = names
-        cur = train_sheet_var.get().strip()
-        if cur in names:
-            pass
-        elif 'PeptideGroups' in names:
-            train_sheet_var.set('PeptideGroups')
-        elif names:
-            train_sheet_var.set(names[0])
+
+        def _apply_sheet_choices():
+            try:
+                if not win.winfo_exists():
+                    return
+                train_sheet_combo['values'] = names
+                cur = train_sheet_var.get().strip()
+                if cur in names:
+                    return
+                if 'PeptideGroups' in names:
+                    train_sheet_var.set('PeptideGroups')
+                elif names:
+                    train_sheet_var.set(names[0])
+            except tk.TclError:
+                # Window/widget may have been destroyed while a background task was running.
+                return
+
+        if threading.current_thread() is threading.main_thread():
+            _apply_sheet_choices()
+        else:
+            try:
+                win.after(0, _apply_sheet_choices)
+            except tk.TclError:
+                return
 
     def _validate_train(show_popup=False):
         nonlocal _train_resolved
@@ -20553,11 +20569,17 @@ def open_rt_predictor():
 
     def _run_threaded(target_func):
         """Run work on a background thread and surface failures."""
+        def _safe_after_zero(callback):
+            try:
+                if win.winfo_exists():
+                    win.after(0, callback)
+            except tk.TclError:
+                return
+
         ok_runtime, runtime_msg = _ensure_rt_runtime()
         if not ok_runtime:
-            win.after(0, lambda: status_var.set(runtime_msg))
-            win.after(
-                0,
+            _safe_after_zero(lambda: status_var.set(runtime_msg))
+            _safe_after_zero(
                 lambda: messagebox.showerror(
                     "RT Predictor Error",
                     f"{runtime_msg}\n\nSee log for details:\n{temp_log_file}",
@@ -20621,15 +20643,19 @@ def open_rt_predictor():
             target_func()
         except Exception as exc:
             logging.exception("RT predictor background task failed")
-            win.after(0, lambda: status_var.set(f"Error: {exc}"))
-            win.after(
-                0,
-                lambda: messagebox.showerror(
+            exc_text = str(exc).strip() or repr(exc)
+            status_text = f"Error: {exc_text}"
+            dialog_text = (
+                f"An error occurred while running the RT task:\n{exc_text}\n\n"
+                f"See log for details:\n{temp_log_file}"
+            )
+            _safe_after_zero(lambda text=status_text: status_var.set(text))
+            _safe_after_zero(
+                lambda msg=dialog_text: messagebox.showerror(
                     "RT Predictor Error",
-                    f"An error occurred while running the RT task:\n{exc}\n\n"
-                    f"See log for details:\n{temp_log_file}",
+                    msg,
                     parent=win,
-                ),
+                )
             )
         finally:
             status_var.set = orig_status_set
