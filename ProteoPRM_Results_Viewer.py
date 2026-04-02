@@ -277,6 +277,8 @@ def _find_scan_rows(peptide_eic, requested_scan):
     return pd.DataFrame(), req_key
 
 
+_fisher_reader_cache = {}
+
 def _get_mzml_reader(mzml_path):
     """Return a persistent PreIndexedMzML reader for *mzml_path* (cached).
 
@@ -288,6 +290,11 @@ def _get_mzml_reader(mzml_path):
     if _HAS_PYTEOMICS and os.path.splitext(mzml_path)[1].lower() == '.mzml':
         try:
             reader = PreIndexedMzML(mzml_path)
+            # Pre-compute a lightning-fast hash map of cleaned scan keys to exact string IDs (Takes ~10ms once per file)
+            reader._fast_id_map = {}
+            if hasattr(reader, 'index') and 'spectrum' in reader.index:
+                for spec_id in reader.index['spectrum'].keys():
+                    reader._fast_id_map[_scan_key(str(spec_id))] = spec_id
             _mzml_reader_cache[mzml_path] = reader
             return reader
         except Exception:
@@ -308,16 +315,9 @@ def _get_spectrum_for_scan(mzml_path, requested_scan):
     # Fast random access via persistent PreIndexedMzML reader
     reader = _get_mzml_reader(mzml_path)
     if reader is not None:
-        # Check against mapped dictionary of index keys to find exact scan ID instantly
-        # (This completely avoids full sequential XML deserialization fallback)
+        # Instant direct O(1) hash map lookup from the pre-computed dictionary (~0.01ms vs iterating 50k keys)
         try:
-            target_id = None
-            if hasattr(reader, 'index') and 'spectrum' in reader.index:
-                all_ids = list(reader.index['spectrum'].keys())
-                for spec_id in all_ids:
-                    if _scan_key(str(spec_id)) == req_key:
-                        target_id = spec_id
-                        break
+            target_id = getattr(reader, '_fast_id_map', {}).get(req_key)
             if target_id is not None:
                 spectrum = reader.get_by_id(target_id)
         except Exception:
@@ -327,7 +327,9 @@ def _get_spectrum_for_scan(mzml_path, requested_scan):
     if spectrum is None and ext_lower == '.raw' and _HAS_FISHER:
         try:
             scan_num = int(req_key)
-            raw_file = RawFile(mzml_path)
+            if mzml_path not in _fisher_reader_cache:
+                _fisher_reader_cache[mzml_path] = RawFile(mzml_path)
+            raw_file = _fisher_reader_cache[mzml_path]
             masses, intensities, _charges, _filt = raw_file.get_scan_from_scan_number(scan_num)
             mz_arr = np.asarray(masses, dtype=np.float64)
             int_arr = np.asarray(intensities, dtype=np.float64)
@@ -1025,7 +1027,13 @@ class ResultsViewer:
                 self.root.after_cancel(self._mirror_debounce_id)
             except Exception:
                 pass
-        self._mirror_debounce_id = self.root.after(1, self._on_qc_tree_select)
+        
+        # Flash a loading message immediately before the process-heavy plot runs
+        self._qc_mirror_info_var.set("Loading mirror plot... Please wait.")
+        self.root.update_idletasks()
+
+        # Increase delay slightly to allow the UI to repaint the label text
+        self._mirror_debounce_id = self.root.after(20, self._on_qc_tree_select)
 
     def _on_qc_tree_select(self, event=None):
         """Draw mirror plot for the selected PSM row.
