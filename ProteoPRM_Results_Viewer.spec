@@ -44,7 +44,7 @@ hidden = [
     # ── MS data parsing ──────────────────────────────────────────────────────
     'pyteomics', 'pyteomics.mzml', 'pyteomics.proforma',
     'pyteomics.mass', 'pyteomics.auxiliary',
-    'fisher_py',
+    'fisher_py', 'clr', 'clr_loader', 'pythonnet',
 
     # ── scikit-learn (for any ML model loading in viewer) ────────────────────
     'sklearn', 'sklearn.utils._typedefs', 'sklearn.utils._cython_blas',
@@ -105,7 +105,15 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=['_C.pyd'],
+    upx_exclude=[
+        '_C.pyd',
+        'ThermoFisher.CommonCore.BackgroundSubtraction.dll',
+        'ThermoFisher.CommonCore.Data.dll',
+        'ThermoFisher.CommonCore.MassPrecisionEstimator.dll',
+        'ThermoFisher.CommonCore.RawFileReader.dll',
+        'OpenMcdf.dll', 'OpenMcdf.Extensions.dll',
+        'Python.Runtime.dll', 'clr.pyd'
+    ],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,

@@ -81,6 +81,14 @@ if _alphabase_spec and _alphabase_spec.submodule_search_locations:
     if _ab_const.is_dir():
         datas.append((str(_ab_const), 'alphabase/constants/const_files'))
 
+# xgboost package data (requires xgboost.dll in xgboost/lib)
+_xgboost_spec = _ilu.find_spec('xgboost')
+if _xgboost_spec and _xgboost_spec.submodule_search_locations:
+    _xgboost_pkg = Path(_xgboost_spec.submodule_search_locations[0])
+    _xgb_lib = _xgboost_pkg / 'lib'
+    if _xgb_lib.is_dir():
+        datas.append((str(_xgb_lib), 'xgboost/lib'))
+
 # calibrated_apd_models: ship only the manifest.json seed so the folder
 # exists next to the EXE and the code doesn't error on first launch.
 _cal_manifest = SPEC_DIR / 'calibrated_apd_models' / 'manifest.json'
@@ -148,11 +156,13 @@ hidden = [
     'ml_dtypes', 'opt_einsum', 'optree', 'flatbuffers', 'astunparse',
     'gast', 'termcolor', 'wrapt', 'grpc',
 
-    # ── numba / llvmlite ─────────────────────────────────────────────────────
+    # ── numba / llvmlite / pythonnet ─────────────────────────────────────────
     'numba', 'numba.core', 'llvmlite', 'llvmlite.binding',
+    'clr', 'clr_loader', 'pythonnet',
 
     # ── Misc ─────────────────────────────────────────────────────────────────
     'tqdm', 'requests', 'psutil', 'pkg_resources',
+    'xgboost',
     'xml.etree.ElementTree', 'lxml', 'lxml.etree',
     'importlib.util', 'importlib.metadata',
     'concurrent.futures', 'multiprocessing', 'threading',
@@ -164,7 +174,7 @@ hidden = [
 from PyInstaller.utils.hooks import collect_all
 my_binaries = []
 
-for pkg in ['fisher_py', 'peptdeep', 'ms2pip', 'deeplc']:
+for pkg in ['fisher_py', 'peptdeep', 'ms2pip', 'deeplc', 'xgboost']:
     d, b, h = collect_all(pkg)
     datas.extend(d)
     my_binaries.extend(b)
@@ -213,6 +223,14 @@ exe = EXE(
     upx_exclude=[
         # Don't UPX-compress PyTorch binaries – they self-verify at load time
         'torch_cpu.dll', 'torch_cuda.dll', '_C.pyd',
+        'xgboost.dll',
+        # Exclude .NET assemblies (UPX corrupts them)
+        'ThermoFisher.CommonCore.BackgroundSubtraction.dll',
+        'ThermoFisher.CommonCore.Data.dll',
+        'ThermoFisher.CommonCore.MassPrecisionEstimator.dll',
+        'ThermoFisher.CommonCore.RawFileReader.dll',
+        'OpenMcdf.dll', 'OpenMcdf.Extensions.dll',
+        'Python.Runtime.dll', 'clr.pyd',
     ],
     console=False,        # windowed GUI – no console window
     disable_windowed_traceback=False,
@@ -229,6 +247,14 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=['torch_cpu.dll', 'torch_cuda.dll', '_C.pyd'],
+    upx_exclude=[
+        'torch_cpu.dll', 'torch_cuda.dll', '_C.pyd', 'xgboost.dll',
+        'ThermoFisher.CommonCore.BackgroundSubtraction.dll',
+        'ThermoFisher.CommonCore.Data.dll',
+        'ThermoFisher.CommonCore.MassPrecisionEstimator.dll',
+        'ThermoFisher.CommonCore.RawFileReader.dll',
+        'OpenMcdf.dll', 'OpenMcdf.Extensions.dll',
+        'Python.Runtime.dll', 'clr.pyd'
+    ],
     name='ProteoPRM',     # output folder name inside dist/
 )

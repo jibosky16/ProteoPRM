@@ -208,6 +208,7 @@ def check_dependencies():
         'tensorflow':  'tensorflow',
         'numba':       'numba',
         'llvmlite':    'llvmlite',
+        'xgboost':     'xgboost',
         'openpyxl':    'openpyxl',
         'xlrd':        'xlrd',
         'xlsxwriter':  'xlsxwriter',
