@@ -406,7 +406,7 @@ ProteoPRM is provided for academic and research use. See the repository for lice
 
 If you use ProteoPRM in your research, please cite:
 
-> Fowowe M, Onigbinde S, Daramola O, Adeniyi M and Mechref Y. ProteoPRM: An Automated GUI Tool for the Analysis and Quantification of Parallel Reaction Monitoring Proteomics Data.
+> Fowowe M, Onigbinde S, Daramola O, Adeniyi M and Mechref Y. ProteoPRM: An Automated GUI for the Analysis and Quantification of Parallel Reaction Monitoring Proteomics Data.
 > GitHub: [https://github.com/jibosky16/ProteoPRM](https://github.com/jibosky16/ProteoPRM)
 
 ---
