@@ -44,7 +44,7 @@ ProteoPRM is an automated Python GUI for targeted PRM proteomics analysis. It el
 | **Chimeric deconvolution** | Probabilistic shared-ion deconvolution guided by predicted spectral libraries — correctly apportions intensity when isolation windows overlap |
 | **PSM scoring** | Mokapot Percolator-style SVM rescoring with automatic fallback to target-decoy FDR when discrimination is insufficient |
 | **Quantification** | Fragment-level EIC area integration with optional intensity-based quantification |
-| **Protein rollup** | Summation of peptide-level quantities to protein level with FASTA-aware mapping |
+| **Protein rollup** | Unique-peptide summation to protein level with FASTA-aware mapping; peptides shared between proteins roll up into protein-group rows (never double-counted) |
 | **Drift correction** | RT and mass-accuracy drift correction using reference peptides (direct offset or trend model) |
 | **Results Viewer** | Standalone interactive viewer with mirror plots, EIC traces, hierarchical clustering, and re-integration without reprocessing |
 | **Utilities** | PRM Inclusion List Generator, DeepLC/sklearn RT predictor, spectral QC viewer, peptide fragmentation calculator |
@@ -58,7 +58,7 @@ ProteoPRM is an automated Python GUI for targeted PRM proteomics analysis. It el
 - **Python:** 3.11 recommended (required for the full dependency stack).
 - **RAM:** 8 GB minimum, 16 GB+ recommended for large datasets.
 - **Disk:** ~2 GB for dependencies; additional space for raw files and results.
-- **GPU (optional):** NVIDIA GPU with CUDA for accelerated AlphaPeptDeep predictions. CPU fallback is automatic.
+- **GPU (optional):** NVIDIA GPU with a CUDA 12-capable driver for AlphaPeptDeep (PyTorch). CPU is the default and is used for fragment matching. AMD/Intel GPUs are not used. Do not install `cupy-cuda12x` unless you have a matching NVIDIA driver; see comments in `requirements.txt`.
 - **ProteoWizard:** Required for automatic vendor raw file conversion. Install from [proteowizard.sourceforge.net](https://proteowizard.sourceforge.net) and ensure `msconvert` is on your system `PATH`.
 
 ---
@@ -104,7 +104,7 @@ ProteoPRM requires two inputs:
 
 | Input | Description |
 |---|---|
-| **PRM Input File** | Excel workbook (`.xlsx`) containing the target peptide list. Required columns: `Sequence`, `Modifications`, `m/z`, `z` (charge), `Start [min]`, `Stop [min]`, `Top Apex RT [min]`. The RT window columns define when to look for each peptide. |
+| **PRM Input File** | Excel/CSV/TSV containing the target peptide list. Preferred headers: `Sequence`, `Modifications`, `m/z`, `z` (charge), `Start [min]`, `Stop [min]`, optional `Top Apex RT [min]`. If those names are missing, columns are read in that positional order. |
 | **Data Folder** | A folder containing mass spectrometry data files. Supported formats: Thermo `.raw`, Sciex `.wiff`, Bruker `.d`, or pre-converted `.mzML` files. Vendor files are automatically converted to mzML via ProteoWizard. |
 
 Optional inputs:
@@ -292,7 +292,7 @@ All results are saved as CSV files in the specified output folder:
 |---|---|
 | `PSM.csv` | All peptide-spectrum matches passing FDR threshold. Includes peptide sequence, modifications, charge, m/z, RT, mass accuracy, matched fragments, PSM score, Mokapot q-value/PEP, spectral angle, and per-file quantification values. |
 | `Peptide_Quantification.csv` | Peptide-level quantification aggregated across scans. One row per peptide per file with area and/or intensity values. |
-| `Protein_Quantification.csv` | Protein-level quantification. Peptide quantities summed to protein level using FASTA-derived mappings. |
+| `Protein_Quantification.csv` | Protein-level quantification. Unique-peptide quantities summed per protein; shared peptides appear under protein-group rows (Accession `P1;P2`) and are listed in the `Shared Peptides (excluded)` column. |
 | `Combined.csv` | Hierarchical protein → peptide layout combining protein and peptide quantification in a single wide-format table. |
 | `QC_Metrics.csv` | Per-file quality control metrics: median mass error, RT shifts, identification rates, and other diagnostics. (Optional — toggle in Preferences.) |
 | `EICs.csv` | Fragment-level extracted ion chromatogram data points for all matched ions across all scans. (Optional — toggle in Preferences.) |

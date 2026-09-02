@@ -105,50 +105,25 @@ xgboost==2.1.4
 zipp==3.23.0
 xlrd==2.0.1
 xlsxwriter==3.1.4
+
 # ============================================================================
-# OPTIONAL: GPU ACCELERATION
+# OPTIONAL: GPU ACCELERATION (NVIDIA CUDA only — not required)
 # ============================================================================
-# For NVIDIA GPU acceleration, install the appropriate packages for your CUDA version.
-# These are NOT required - the software will run on CPU if not installed.
+# Do NOT install these on CPU-only machines. The app runs on CPU without them.
+# AlphaPeptDeep uses PyTorch CUDA when `torch.cuda.is_available()` is True.
+# Fragment matching uses NumPy on CPU (faster for typical PRM spectra).
 #
-# Option 1: CuPy (GPU-accelerated NumPy) - Recommended for basic GPU acceleration
-# Check your CUDA version with: nvcc --version or nvidia-smi
-# Then install the matching CuPy version:
-#   CUDA 11.x: pip install cupy-cuda11x
-#   CUDA 12.x: pip install cupy-cuda12x
+# Check driver CUDA with: nvidia-smi
+#   CUDA 12.x: pip install "cupy-cuda12x==13.6.0" fastrlock==0.8.3
+#   CUDA 11.x: pip install cupy-cuda11x fastrlock
 #
-# Option 2: RAPIDS cuML (GPU-accelerated Machine Learning) - For advanced ML acceleration
+# Default `torch==2.10.0` above is whatever wheel PyPI serves. For an explicit
+# CUDA 12 PyTorch build:
+#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu124
+# CPU-only Torch:
+#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
 #
-# IMPORTANT: cuML is primarily designed for conda installation and has limited pip support.
+# cuML (RAPIDS) is optional and Linux/WSL2 oriented; scikit-learn is the fallback.
 #
-# Method A - Conda (Recommended if you have conda):
-#   conda install -c rapidsai -c conda-forge -c nvidia cuml
-#
-# Method B - pip (Limited support, may not work with all Python versions):
-#   pip install --extra-index-url https://pypi.nvidia.com cuml-cu12  # For CUDA 12
-#   pip install --extra-index-url https://pypi.nvidia.com cuml-cu11  # For CUDA 11
-#
-# Method C - Skip cuML entirely:
-#   The software uses scikit-learn as a fallback, which works great on CPU.
-#   cuML provides ~10-50x speedup on GPU for ML operations, but most of the
-#   compute time in this software is spent on I/O and fragment matching,
-#   not ML operations. So skipping cuML has minimal impact.
-#
-# Platform Notes:
-#   - cuML works best on Linux
-#   - Windows requires WSL2 for full RAPIDS support
-#   - If pip install fails, don't worry - scikit-learn will be used automatically
-#
-# Option 3: PyTorch with CUDA (alternative GPU detection)
-# pip install torch --index-url https://download.pytorch.org/whl/cu118
-#
-# ============================================================================
-# GPU REQUIREMENTS:
-# - NVIDIA GPU (GTX 1000 series or newer recommended)
-# - NVIDIA drivers installed (verify with: nvidia-smi)
-# - CUDA Toolkit (for building from source, not needed for pip packages)
-#
-# If you have Intel or AMD GPU:
-# - These GPUs are not supported for CUDA acceleration
-# - The software will automatically use CPU processing (which is still fast!)
+# Intel/AMD/Apple GPUs are not used. CPU processing is automatic.
 # ============================================================================

@@ -85,12 +85,25 @@ def _output_path(output_folder, sheet_name):
     return os.path.join(output_folder, f"{safe_name}.csv")
 
 
+def _get_sheet_disk_path(output_folder, sheet_name):
+    """Resolve on-disk path for a results sheet (Parquet-first for EICs)."""
+    safe_name = sheet_name.replace(' ', '_')
+    if sheet_name == 'EICs':
+        parquet_path = os.path.join(output_folder, f"{safe_name}.parquet")
+        if os.path.isfile(parquet_path):
+            return parquet_path
+    return _output_path(output_folder, sheet_name)
+
+
 def _get_cached_excel_sheet(filepath_or_folder, sheet_name):
     key = (filepath_or_folder, sheet_name)
     if key not in _excel_sheet_cache:
-        actual_path = _output_path(filepath_or_folder, sheet_name)
+        actual_path = _get_sheet_disk_path(filepath_or_folder, sheet_name)
         logging.debug(f"Reading '{sheet_name}' from {os.path.basename(actual_path)}")
-        _excel_sheet_cache[key] = pd.read_csv(actual_path)
+        if str(actual_path).lower().endswith('.parquet'):
+            _excel_sheet_cache[key] = pd.read_parquet(actual_path)
+        else:
+            _excel_sheet_cache[key] = pd.read_csv(actual_path)
     return _excel_sheet_cache[key]
 
 
@@ -507,7 +520,8 @@ class ResultsViewer:
                 self.mzml_entry.insert(0, mzml_folder)
                 self.mzml_entry.configure(state="readonly")
                 self.mzml_folder = mzml_folder
-            self._load_results(results_file)
+            # Avoid modal dialogs while startup splash is visible.
+            self._load_results(results_file, show_dialog=False)
 
     # --------------------------------------------------------------------- #
     # UI Construction
@@ -825,7 +839,7 @@ class ResultsViewer:
             self.mzml_folder = mzml_path
         self._load_results(path)
 
-    def _load_results(self, path):
+    def _load_results(self, path, show_dialog=True):
         """Load results folder and populate dropdowns."""
         _invalidate_cache(self.results_file)  # clear old cache
         self.results_file = path
@@ -857,10 +871,17 @@ class ResultsViewer:
             # Defer Spectral QC tab population (will load lazily when user clicks that tab)
             self._qc_tab_populated = False
             self._qc_data['filepath'] = path  # Store path for lazy loading
-            messagebox.showinfo("Loaded", f"Results loaded successfully.\n"
-                                f"{len(combos)} peptides, {len(files)} files.")
+            loaded_msg = f"Loaded: {len(combos)} peptides, {len(files)} files."
+            self._qc_status_var.set(loaded_msg)
+            if show_dialog:
+                messagebox.showinfo("Loaded", f"Results loaded successfully.\n"
+                                    f"{len(combos)} peptides, {len(files)} files.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load results: {e}")
+            self._qc_status_var.set(f"Load error: {e}")
+            if show_dialog:
+                messagebox.showerror("Error", f"Failed to load results: {e}")
+            else:
+                logging.exception("Auto-load failed during startup")
 
     # --------------------------------------------------------------------- #
     # Helpers
@@ -1833,25 +1854,28 @@ class ResultsViewer:
                     skipped += 1
                     continue
 
-                # Integrate: trapezoidal rule for each fragment
-                eic_filtered = eic_in_window.dropna(subset=["ion_type", "fragment_charge"])
-                main_ions = eic_filtered[
-                    eic_filtered["neutral_loss"].isnull() | (eic_filtered["neutral_loss"] == "")
-                ]
+                # Integrate: trapezoidal rule for each fragment.
+                # Harmonized with the main pipeline (calculate_fragment_eic_areas):
+                # - neutral-loss traces are included as separate fragments
+                #   (grouped by ion_type + neutral_loss + charge), and
+                # - each fragment needs at least 3 EIC points to integrate.
+                eic_filtered = eic_in_window.dropna(subset=["ion_type", "fragment_charge"]).copy()
+                eic_filtered["_nl_key"] = eic_filtered["neutral_loss"].fillna("").astype(str)
+                _frag_groups = ["ion_type", "_nl_key", "fragment_charge"]
 
                 total_area = 0.0
-                for (ion_type, frag_charge), grp in main_ions.groupby(["ion_type", "fragment_charge"]):
+                for _frag_key, grp in eic_filtered.groupby(_frag_groups):
                     df_rt = grp.groupby("rt").agg({"intensity": "max"}).reset_index().sort_values("rt")
-                    if len(df_rt) < 2:
+                    if len(df_rt) < 3:
                         continue
                     area = float(_trapz_fn(df_rt["intensity"].values, df_rt["rt"].values))
                     total_area += area
 
                 # Sum of max intensities per fragment within the window
                 total_intensity = 0.0
-                if not main_ions.empty:
+                if not eic_filtered.empty:
                     total_intensity = float(
-                        main_ions.groupby(["ion_type", "fragment_charge"])["intensity"].max().sum()
+                        eic_filtered.groupby(_frag_groups)["intensity"].max().sum()
                     )
 
                 mz_val = float(pep_psm["m_z"].values[0]) if "m_z" in pep_psm.columns else 0.0
@@ -2520,7 +2544,130 @@ def main():
     results_file = sys.argv[1] if len(sys.argv) > 1 else None
     mzml_folder = sys.argv[2] if len(sys.argv) > 2 else None
     root = tk.Tk()
+
+    def _resolve_app_icon_path():
+        base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base_dir, 'icon.ico')
+
+    def _load_splash_icon_image(icon_path, size=88):
+        if not icon_path or not os.path.exists(icon_path):
+            return None
+
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(icon_path).convert('RGBA').resize((size, size), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            pass
+
+        try:
+            return tk.PhotoImage(file=icon_path)
+        except Exception:
+            return None
+
+    def _show_startup_splash(root_window, icon_path):
+        splash = tk.Toplevel(root_window)
+        splash.overrideredirect(True)
+        splash.attributes('-topmost', True)
+        splash.configure(bg='#e5e7eb')
+
+        width, height = 480, 300
+        screen_w = splash.winfo_screenwidth()
+        screen_h = splash.winfo_screenheight()
+        x = int((screen_w - width) / 2)
+        y = int((screen_h - height) / 2)
+        splash.geometry(f"{width}x{height}+{x}+{y}")
+
+        card = tk.Frame(splash, bg='white', bd=1, relief='solid')
+        card.place(relx=0.5, rely=0.5, anchor='center', width=468, height=288)
+
+        icon_img = _load_splash_icon_image(icon_path, size=88)
+        if icon_img is not None:
+            splash._icon_img = icon_img
+            tk.Label(card, image=icon_img, bg='white').pack(pady=(22, 8))
+        else:
+            tk.Label(card, text='ProteoPRM', bg='white', fg='#2e7d32',
+                     font=('Segoe UI', 16, 'bold')).pack(pady=(28, 8))
+
+        tk.Label(
+            card,
+            text='ProteoPRM Results Viewer',
+            bg='white',
+            fg='#111827',
+            font=('Segoe UI', 21, 'bold')
+        ).pack()
+
+        tk.Label(
+            card,
+            text='Inspect, visualize, and re-integrate PRM results',
+            bg='white',
+            fg='#374151',
+            font=('Segoe UI', 10)
+        ).pack(pady=(4, 2))
+
+        tk.Label(
+            card,
+            text='Loading interface...',
+            bg='white',
+            fg='#6b7280',
+            font=('Segoe UI', 10)
+        ).pack(pady=(10, 10))
+
+        progress = ttk.Progressbar(card, mode='indeterminate', length=320)
+        progress.pack()
+        progress.start(12)
+
+        splash.update_idletasks()
+        splash.update()
+        return splash, progress
+
+    app_icon_path = _resolve_app_icon_path()
+    startup_splash = None
+    startup_splash_progress = None
+
+    try:
+        root.withdraw()
+        startup_splash, startup_splash_progress = _show_startup_splash(root, app_icon_path)
+    except Exception:
+        startup_splash = None
+        startup_splash_progress = None
+
+    try:
+        import ctypes
+        # Ensure Windows correctly groups the taskbar icon instead of using the default python icon
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("proteoprm.results_viewer.app.1.0")
+    except Exception:
+        pass
+
+    # Set the window/taskbar icon if running from bundled executable or source repo
+    try:
+        if os.path.exists(app_icon_path):
+            root.iconbitmap(app_icon_path)
+            try:
+                # Register as Tk default so future Toplevel windows inherit it.
+                root.iconbitmap(default=app_icon_path)
+            except TypeError:
+                pass
+    except Exception:
+        pass
+
     ResultsViewer(root, results_file=results_file, mzml_folder=mzml_folder)
+
+    try:
+        if startup_splash_progress is not None:
+            startup_splash_progress.stop()
+        if startup_splash is not None and startup_splash.winfo_exists():
+            startup_splash.destroy()
+    except Exception:
+        pass
+
+    root.deiconify()
+    root.lift()
+    try:
+        root.focus_force()
+    except Exception:
+        pass
+
     root.mainloop()
 
 

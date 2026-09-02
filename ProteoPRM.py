@@ -1,6 +1,39 @@
 import warnings
 warnings.filterwarnings('ignore')
 
+import sqlite3
+# Do not patch the C-level _sqlite3.connect — that bypasses the Python
+# DB-API thread guard for every connection in the process.
+# sqlite3.connect is wrapped only to set a busy timeout. Callers that need
+# cross-thread use of a *shared* connection must pass check_same_thread=False
+# themselves (and serialize access).
+_orig_sqlite3_connect = sqlite3.connect
+
+
+def _patched_sqlite3_connect(*args, **kwargs):
+    kwargs.setdefault('timeout', 30.0)
+    conn = _orig_sqlite3_connect(*args, **kwargs)
+    try:
+        conn.execute('PRAGMA busy_timeout=30000')
+    except Exception:
+        pass
+    return conn
+
+
+def _ensure_sqlite_threadsafe_patch():
+    """Re-apply the sqlite3.connect timeout wrapper (needed after some frozen-EXE library imports)."""
+    try:
+        sqlite3.connect = _patched_sqlite3_connect
+    except Exception:
+        pass
+    try:
+        sqlite3.dbapi2.connect = _patched_sqlite3_connect
+    except Exception:
+        pass
+
+
+_ensure_sqlite_threadsafe_patch()
+
 import numpy as np
 import importlib
 
@@ -78,6 +111,7 @@ def _warmup_startup_modules():
         ("scipy.cluster.hierarchy", lambda: hierarchy.linkage(np.array([[0.0], [1.0]]), method='single')),
         ("openpyxl", lambda: importlib.import_module('openpyxl')),
         ("pyteomics.mzml", lambda: importlib.import_module('pyteomics.mzml')),
+        ("gpu detection", lambda: _ensure_gpu_detected(auto_install=False)),
     ]
 
     print("[startup] Warm-up started (background).", flush=True)
@@ -141,6 +175,7 @@ import re
 import xml.etree.ElementTree as ET
 import multiprocessing
 import pickle
+_RT_MODEL_MAGIC = b'PROTEOPRM_RTMODEL_V1\n'
 from functools import lru_cache
 import importlib.util
 import contextlib
@@ -223,6 +258,21 @@ def _ensure_peptdeep():
         _pre_disabled = _root_logger.disabled
         import peptdeep  # noqa: F811
         from peptdeep.pretrained_models import ModelManager as _MM
+        
+        # Prevent AlphaPeptDeep from automatically downloading default models during __init__
+        import peptdeep.pretrained_models
+        def _no_download(*args, **kwargs):
+            raise RuntimeError("Model download suppressed.")
+        peptdeep.pretrained_models.download_models = _no_download
+
+        _orig_load_installed = _MM.load_installed_models
+        def _safe_load_installed(self, *args, **kwargs):
+            try:
+                _orig_load_installed(self, *args, **kwargs)
+            except Exception:
+                pass # Suppress download/load errors during init, we load external models directly
+        _MM.load_installed_models = _safe_load_installed
+
         # Remove any StreamHandler that alphabase silently added to root.
         for _h in list(_root_logger.handlers):
             if _h not in _pre_handlers and isinstance(_h, logging.StreamHandler) \
@@ -643,27 +693,34 @@ def detect_gpu_hardware():
         except Exception as e:
             logging.debug(f"WMI GPU detection failed: {e}")
     
-    # Method 3: Try DirectX diagnostic (Windows fallback)
+    # Method 3: Try DirectX diagnostic (Windows fallback) — write to a unique temp file
     if not hw_info['has_nvidia_gpu'] and sys.platform == 'win32':
+        dxdiag_path = None
         try:
-            import subprocess
-            result = subprocess.run(['dxdiag', '/t', 'dxdiag_output.txt'], capture_output=True, timeout=30, **_subprocess_no_window())
-            import time
-            time.sleep(2)  # Wait for file to be written
-            if os.path.exists('dxdiag_output.txt'):
-                with open('dxdiag_output.txt', 'r') as f:
+            fd, dxdiag_path = tempfile.mkstemp(prefix='proteoprm_dxdiag_', suffix='.txt')
+            os.close(fd)
+            subprocess.run(
+                ['dxdiag', '/t', dxdiag_path],
+                capture_output=True, timeout=30, **_subprocess_no_window()
+            )
+            time.sleep(2)
+            if os.path.exists(dxdiag_path):
+                with open(dxdiag_path, 'r', errors='ignore') as f:
                     content = f.read()
                     if 'NVIDIA' in content.upper():
                         hw_info['has_nvidia_gpu'] = True
                         hw_info['detection_method'] = 'dxdiag'
-                        # Try to parse GPU name
-                        import re
                         match = re.search(r'Card name:\s*(.+)', content)
                         if match:
                             hw_info['device_name'] = match.group(1).strip()
-                os.remove('dxdiag_output.txt')
         except Exception as e:
             logging.debug(f"DXDiag GPU detection failed: {e}")
+        finally:
+            if dxdiag_path and os.path.exists(dxdiag_path):
+                try:
+                    os.remove(dxdiag_path)
+                except Exception:
+                    pass
     
     return hw_info
 
@@ -800,14 +857,15 @@ def get_cupy_package_name(cuda_version):
 def silent_install_package(package_name, timeout=300):
     """
     Silently install a Python package using pip.
-    
-    Args:
-        package_name: Name of the package to install
-        timeout: Maximum time to wait for installation (seconds)
-    
-    Returns:
-        tuple: (success: bool, message: str)
+
+    Disabled in frozen (PyInstaller) builds: sys.executable is the GUI EXE,
+    not a pip-capable interpreter.
     """
+    if getattr(sys, 'frozen', False):
+        return False, (
+            "Automatic package install is disabled in the packaged application. "
+            f"From a Python 3.11 venv run: pip install {package_name}"
+        )
     import subprocess
     import sys
     
@@ -843,16 +901,18 @@ def silent_install_package(package_name, timeout=300):
 
 def auto_install_cupy_if_needed(cuda_version, force=False):
     """
-    Automatically install CuPy if NVIDIA GPU is detected but CuPy is not available.
-    
-    Args:
-        cuda_version: Detected CUDA version string
-        force: If True, reinstall even if already installed
-    
-    Returns:
-        tuple: (installed: bool, message: str)
+    Install CuPy when an NVIDIA GPU is present but CuPy is missing.
+
+    Never runs in a frozen EXE. Prefer a manual venv install; this is only
+    offered from the GPU diagnostics UI for source runs.
     """
     global CUPY_AVAILABLE, cp
+
+    if getattr(sys, 'frozen', False):
+        return False, (
+            "Automatic CuPy install is disabled in the packaged application. "
+            "AlphaPeptDeep still uses PyTorch CUDA when torch.cuda.is_available()."
+        )
     
     # Check if CuPy is already working
     if not force:
@@ -903,7 +963,7 @@ def auto_install_cupy_if_needed(cuda_version, force=False):
     else:
         return False, message
 
-def detect_gpu(auto_install=True):
+def detect_gpu(auto_install=False):
     """
     Comprehensive GPU detection - detects hardware and software capabilities.
     Returns a dict with complete GPU information.
@@ -952,8 +1012,10 @@ def detect_gpu(auto_install=True):
             logging.info(f"GPU DETECTED: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB)")
             logging.info(f"  Driver: {GPU_DRIVER_VERSION}, CUDA: {GPU_CUDA_VERSION}")
             
-            # AUTO-INSTALL: Attempt to install CuPy automatically
-            if auto_install:
+            # Never auto-install CUDA wheels as a side effect of detection.
+            # Frozen EXEs cannot pip-install; source users should use the
+            # GPU dialog or requirements comments.
+            if auto_install and not getattr(sys, 'frozen', False):
                 logging.info("Attempting automatic CuPy installation...")
                 install_success, install_msg = auto_install_cupy_if_needed(GPU_CUDA_VERSION)
                 gpu_info['auto_install_attempted'] = True
@@ -993,7 +1055,10 @@ def get_gpu_status():
     elif not GPU_ENABLED:
         return f"GPU disabled ({GPU_DEVICE_NAME})"
     elif not CUPY_AVAILABLE:
-        return f"GPU detected: {GPU_DEVICE_NAME} (install CuPy to enable)"
+        return (
+            f"GPU detected: {GPU_DEVICE_NAME} "
+            "(matching uses CPU; AlphaPeptDeep uses PyTorch CUDA if available)"
+        )
     else:
         accel_features = []
         if CUPY_AVAILABLE:
@@ -1055,27 +1120,16 @@ def set_gpu_enabled(enabled):
     else:
         logging.debug(f"GPU acceleration disabled")
 
-# GPU-accelerated array operations (falls back to NumPy if unavailable)
 def get_array_module():
-    """Get the appropriate array module (CuPy for GPU, NumPy for CPU)."""
-    if GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE:
-        return cp
+    """Array module for numerical work. Peak matching stays on NumPy/CPU."""
     return np
 
 def to_gpu(array):
-    """Transfer array to GPU if available, otherwise return as-is."""
-    if GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE:
-        import cupy as cp
-        if isinstance(array, np.ndarray):
-            return cp.asarray(array)
+    """Identity: fragment matching is CPU-only (searchsorted is faster for PRM)."""
     return array
 
 def to_cpu(array):
-    """Transfer array from GPU to CPU if needed."""
-    if GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE:
-        import cupy as cp
-        if isinstance(array, cp.ndarray):
-            return cp.asnumpy(array)
+    """Identity companion of to_gpu()."""
     return array
 
 def gpu_accelerated_mass_matching(observed_mzs, observed_intensities, theoretical_mzs, tolerance, tolerance_unit='ppm'):
@@ -1159,13 +1213,13 @@ def gpu_accelerated_batch_scoring(features_array, weights=None):
 # GPU detection is deferred until first use (processing start or GPU prefs)
 _gpu_info = None   # populated lazily by _ensure_gpu_detected()
 
-def _ensure_gpu_detected():
+def _ensure_gpu_detected(auto_install=False):
     """Run GPU detection once, on first access. Avoids slow startup."""
     global _gpu_info
     if _gpu_info is not None:
         return _gpu_info
     try:
-        _gpu_info = detect_gpu()
+        _gpu_info = detect_gpu(auto_install=auto_install)
     except Exception as e:
         logging.warning(f"GPU detection failed: {e}")
         _gpu_info = {'available': False}
@@ -1243,11 +1297,23 @@ def _output_path(output_folder, sheet_name):
     """Return the CSV file path for a given result sheet inside *output_folder*.
 
     Each result sheet is stored as a separate CSV:
-      PSM.csv, Peptide_Quantification.csv, Protein_Quantification.csv,
-      Combined.csv, QC_Metrics.csv, EICs.csv
+            PSM.csv, Peptide_Quantification.csv, Protein_Quantification.csv,
+            Combined.csv, QC_Metrics.csv
+        EIC data is stored as EICs.parquet for better size/performance,
+        with legacy EICs.csv still supported for backward compatibility.
     """
     safe_name = sheet_name.replace(' ', '_')
     return os.path.join(output_folder, f"{safe_name}.csv")
+
+
+def _get_sheet_disk_path(output_folder, sheet_name):
+        """Resolve on-disk path for a results sheet (Parquet-first for EICs)."""
+        safe_name = sheet_name.replace(' ', '_')
+        if sheet_name == 'EICs':
+                parquet_path = os.path.join(output_folder, f"{safe_name}.parquet")
+                if os.path.isfile(parquet_path):
+                        return parquet_path
+        return _output_path(output_folder, sheet_name)
 
 
 def _get_cached_excel_sheet(output_folder, sheet_name):
@@ -1255,9 +1321,12 @@ def _get_cached_excel_sheet(output_folder, sheet_name):
     global _excel_sheet_cache
     cache_key = (output_folder, sheet_name)
     if cache_key not in _excel_sheet_cache:
-        file_path = _output_path(output_folder, sheet_name)
+        file_path = _get_sheet_disk_path(output_folder, sheet_name)
         logging.debug(f"Reading '{sheet_name}' from {os.path.basename(file_path)} (first access, will cache)")
-        _excel_sheet_cache[cache_key] = pd.read_csv(file_path)
+        if str(file_path).lower().endswith('.parquet'):
+            _excel_sheet_cache[cache_key] = pd.read_parquet(file_path)
+        else:
+            _excel_sheet_cache[cache_key] = pd.read_csv(file_path)
     return _excel_sheet_cache[cache_key]
 
 def _invalidate_excel_cache(output_folder=None):
@@ -1942,9 +2011,14 @@ def load_default_modifications(fixed_tree, variable_tree):
     # Save these default modifications to the global variables
     save_modifications(fixed_tree, variable_tree)
 
-def load_unimod_from_csv_file(csv_path="/mnt/data/unimod.csv"):
+def load_unimod_from_csv_file(csv_path=None):
     """Load modifications from a local Unimod CSV file."""
     global UNIMOD_MODIFICATIONS, UNIMOD_LAST_FETCH
+    if csv_path is None:
+        csv_path = get_resource_path('unimod.csv')
+    if not csv_path:
+        logging.warning("Unimod CSV path not provided and unimod.csv was not found.")
+        return {}
     try:
         df = pd.read_csv(csv_path)
         modifications = {}
@@ -2360,6 +2434,15 @@ def _check_fisher_available():
     global _FISHER_AVAILABLE
     if _FISHER_AVAILABLE is None:
         try:
+            import sys
+            import os
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass and hasattr(os, 'add_dll_directory'):
+                try:
+                    os.add_dll_directory(meipass)
+                except Exception:
+                    pass
+                
             from fisher_py import RawFile
             _FISHER_AVAILABLE = True
             logging.debug("fisher_py detected — will use direct .raw file reading.")
@@ -2368,8 +2451,8 @@ def _check_fisher_available():
             logging.debug("fisher_py not installed — will use msconvert for .raw files.")
         except Exception as exc:
             _FISHER_AVAILABLE = False
-            logging.exception(
-                "fisher_py import failed (assembly/CLR issue or other error). Falling back to msconvert for .raw files."
+            logging.warning(
+                f"fisher_py import failed ({str(exc).strip():.150s}). Falling back to msconvert for .raw files."
             )
     return _FISHER_AVAILABLE
 
@@ -2574,6 +2657,48 @@ def read_raw_with_fisher(raw_path):
             continue
 
 
+def _mzml_contains_nulls(mzml_path):
+    """Return True if *mzml_path* contains a NUL byte (read-only scan)."""
+    import mmap
+    try:
+        with open(mzml_path, 'rb') as f:
+            f.seek(0, 2)
+            if f.tell() == 0:
+                return False
+            f.seek(0)
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                return mm.find(b'\x00') != -1
+    except Exception:
+        return False
+
+
+def _scrub_mzml_nulls_inplace(mzml_path):
+    """
+    Replace NUL bytes (0x00) with spaces in *mzml_path* using mmap.
+
+    Only call this on a disposable copy — never on the user's original file.
+    """
+    import mmap
+    try:
+        with open(mzml_path, 'r+b') as f:
+            f.seek(0, 2)
+            if f.tell() == 0:
+                return
+            with mmap.mmap(f.fileno(), 0) as mm:
+                idx = mm.find(b'\x00')
+                if idx == -1:
+                    return
+                logging.warning(
+                    f"[{os.path.basename(mzml_path)}] Scrubbing illegal null (0x00) "
+                    "bytes from a temporary mzML copy (original file is unchanged)."
+                )
+                while idx != -1:
+                    mm[idx] = 32
+                    idx = mm.find(b'\x00', idx + 1)
+    except Exception as e:
+        logging.warning(f"Failed to scrub null bytes from {mzml_path}: {e}")
+
+
 def read_spectra(file_path, use_preindexed=False):
     """Unified spectrum reader: uses fisher_py for .raw files when available,
     otherwise falls back to pyteomics mzml reader.
@@ -2603,13 +2728,34 @@ def read_spectra(file_path, use_preindexed=False):
             yield read_raw_with_fisher(file_path)
         return _fisher_ctx()
     
-    # Default: mzML reader
-    if use_preindexed:
-        from pyteomics.mzml import PreIndexedMzML
-        return PreIndexedMzML(file_path)
-    else:
-        from pyteomics import mzml
-        return mzml.read(file_path)
+    @contextmanager
+    def _mzml_ctx():
+        read_path = file_path
+        tmp_path = None
+        try:
+            if _mzml_contains_nulls(file_path):
+                fd, tmp_path = tempfile.mkstemp(prefix='proteoprm_mzml_', suffix='.mzML')
+                os.close(fd)
+                shutil.copy2(file_path, tmp_path)
+                _scrub_mzml_nulls_inplace(tmp_path)
+                read_path = tmp_path
+
+            if use_preindexed:
+                from pyteomics.mzml import PreIndexedMzML
+                with PreIndexedMzML(read_path, huge_tree=True) as reader:
+                    yield reader
+            else:
+                from pyteomics import mzml
+                with mzml.read(read_path, huge_tree=True) as reader:
+                    yield reader
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                
+    return _mzml_ctx()
 
 
 # ============================================================================
@@ -2866,14 +3012,8 @@ def download_and_install_proteowizard():
 # END MSCONVERT AUTO-DETECTION
 # ============================================================================
 
-# IS_FROZEN is defined at the top of the file
-try:
-    import mokapot
-    from scipy.stats import zscore
-    HAS_MOKAPOT = True
-except ImportError:
-    HAS_MOKAPOT = False
-    # Don't log here - logging not yet configured
+# Mokapot is imported on first use via _ensure_mokapot() to keep GUI startup fast.
+HAS_MOKAPOT = _MOKAPOT_SPEC is not None
 
 # Create a temporary log file
 temp_log_file = os.path.join(tempfile.gettempdir(), 'prm_quantification.log')
@@ -3628,7 +3768,76 @@ def find_ms2_spectra(mzml_file, precursor_mz, start_rt, stop_rt, tolerance_ppm=1
     logging.debug(f"Found {len(ms2_spectra)} MS2 spectra")
     return ms2_spectra
 
-# GPU-accelerated version of calculate_fragment_intensity below
+def _greedy_exclusive_matches(theo_mz_list, exp_mz_sorted, exp_int_sorted,
+                              tolerance, unit, intensity_threshold,
+                              eligible_mask=None):
+    """One-to-one greedy assignment of experimental peaks to theoretical ions.
+
+    All (theoretical ion, experimental peak) pairs within tolerance are
+    ranked by absolute mass error (ppm), tie-broken by higher peak
+    intensity, then assigned greedily so each experimental peak is claimed
+    by at most ONE theoretical ion (and vice versa). This prevents a single
+    physical peak from being counted multiple times across ion series,
+    charge states, and neutral-loss variants — which matters because
+    matched intensities feed quantification, not just identification.
+    Sorting by mass error (not intensity) makes the m/z agreement — the
+    actual identity evidence — decide contested peaks.
+
+    Parameters
+    ----------
+    theo_mz_list : sequence of float — theoretical fragment m/z values
+    exp_mz_sorted, exp_int_sorted : np.ndarray — experimental peaks sorted by m/z
+    tolerance, unit : matching tolerance ('ppm' or Da)
+    intensity_threshold : absolute minimum peak intensity
+    eligible_mask : optional boolean per theoretical ion (e.g. scan window)
+
+    Returns
+    -------
+    dict {theo_idx: exp_idx} of accepted one-to-one assignments.
+    """
+    theo_mz_arr = np.asarray(theo_mz_list, dtype=np.float64)
+    if len(theo_mz_arr) == 0 or exp_mz_sorted.size == 0:
+        return {}
+
+    if unit == 'ppm':
+        tol_arr = theo_mz_arr * tolerance / 1e6
+    else:
+        tol_arr = np.full(len(theo_mz_arr), tolerance, dtype=np.float64)
+
+    lo_indices = np.searchsorted(exp_mz_sorted, theo_mz_arr - tol_arr, side='left')
+    hi_indices = np.searchsorted(exp_mz_sorted, theo_mz_arr + tol_arr, side='right')
+
+    # Collect every candidate pair within tolerance (not just the best per
+    # ion) so that an ion whose closest peak is claimed by a better-matching
+    # ion can still fall back to its next candidate peak.
+    candidates = []
+    for t_idx in range(len(theo_mz_arr)):
+        if eligible_mask is not None and not eligible_mask[t_idx]:
+            continue
+        lo = lo_indices[t_idx]
+        hi = hi_indices[t_idx]
+        if lo >= hi:
+            continue
+        theo_mz = theo_mz_arr[t_idx]
+        for e_idx in range(lo, hi):
+            peak_int = exp_int_sorted[e_idx]
+            if peak_int < intensity_threshold:
+                continue
+            abs_ppm = abs(exp_mz_sorted[e_idx] - theo_mz) / theo_mz * 1e6
+            candidates.append((abs_ppm, -peak_int, t_idx, e_idx))
+
+    candidates.sort()
+
+    assignments = {}
+    used_peaks = set()
+    for _abs_ppm, _neg_int, t_idx, e_idx in candidates:
+        if t_idx in assignments or e_idx in used_peaks:
+            continue
+        assignments[t_idx] = e_idx
+        used_peaks.add(e_idx)
+    return assignments
+
+
 def calculate_fragment_intensity(
     theoretical_ions, experimental_spectrum, tolerance, unit='ppm',
     scan_window_lower=None, scan_window_upper=None,
@@ -3638,10 +3847,11 @@ def calculate_fragment_intensity(
     """
     Match theoretical fragment ions to experimental spectrum, summing intensities,
     and only considering fragments within the scan window limits for this scan.
-    
-    GPU ACCELERATED: Automatically uses GPU if available and enabled,
-    otherwise falls back to CPU with identical results.
-    
+
+    EXCLUSIVE MATCHING: assignment is one-to-one — each experimental peak
+    can be claimed by at most one theoretical ion (greedy, ranked by
+    absolute ppm mass error). See _greedy_exclusive_matches.
+
     Parameters:
     -----------
     min_intensity_threshold : float
@@ -3650,37 +3860,18 @@ def calculate_fragment_intensity(
     """
     matched_ions = []
     total_intensity = 0
-    
-    # Check if GPU acceleration is available and enabled
-    use_gpu = GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE
-    
-    if use_gpu:
-        try:
-            import cupy as cp
-            xp = cp
-        except:
-            xp = np
-            use_gpu = False
-    else:
-        xp = np
 
-    # Convert experimental data to arrays (GPU or CPU)
+    # Peak matching uses CPU searchsorted (O(T log E)). A CuPy pairwise
+    # distance matrix plus per-ion GPU→CPU copies is slower for typical PRM
+    # spectra. CUDA is reserved for AlphaPeptDeep via PyTorch.
     exp_mz_np = np.array(experimental_spectrum['m/z array'])
     exp_intensity_np = np.array(experimental_spectrum['intensity array'])
-    
+
     if exp_mz_np.size == 0:
         return matched_ions, total_intensity
-    
-    # Transfer to GPU if available
-    if use_gpu:
-        exp_mz = cp.asarray(exp_mz_np)
-        exp_intensity = cp.asarray(exp_intensity_np)
-    else:
-        exp_mz = exp_mz_np
-        exp_intensity = exp_intensity_np
-    
+
     # Calculate base peak intensity for threshold filtering
-    base_peak_intensity = float(xp.max(exp_intensity)) if exp_intensity.size > 0 else 0
+    base_peak_intensity = float(np.max(exp_intensity_np)) if exp_intensity_np.size > 0 else 0
     intensity_threshold = (min_intensity_threshold / 100.0) * base_peak_intensity
 
     # --- Extract scan window for this scan (CPU operation - metadata parsing) ---
@@ -3726,124 +3917,44 @@ def calculate_fragment_intensity(
     if not theo_mz_list:
         return matched_ions, total_intensity
     
+    # EXCLUSIVE GREEDY MATCHING (one-to-one):
+    # Each experimental peak may be claimed by at most one theoretical ion.
+    # Candidate pairs are ranked by absolute mass error (ppm), tie-broken by
+    # intensity — see _greedy_exclusive_matches for rationale.
+    sort_idx = np.argsort(exp_mz_np)
+    exp_mz_sorted = exp_mz_np[sort_idx]
+    exp_int_sorted = exp_intensity_np[sort_idx]
+
+    assignments = _greedy_exclusive_matches(
+        theo_mz_list, exp_mz_sorted, exp_int_sorted,
+        tolerance, unit, intensity_threshold
+    )
+
     matched_fragments = set()
-    
-    # GPU-ACCELERATED VECTORIZED MATCHING
-    if use_gpu and len(theo_mz_list) > 10:  # Only use GPU for sufficient workload
-        theo_mz = cp.asarray(theo_mz_list, dtype=cp.float64)
-        
-        # Calculate tolerances for each theoretical m/z
-        if unit == 'ppm':
-            tolerances = theo_mz * tolerance / 1e6
-        else:
-            tolerances = cp.full(len(theo_mz), tolerance, dtype=cp.float64)
-        
-        # VECTORIZED DISTANCE CALCULATION (GPU parallelism)
-        # Shape: (n_theoretical, n_experimental)
-        # This is the key GPU acceleration - computing all distances in parallel
-        distances = cp.abs(theo_mz[:, cp.newaxis] - exp_mz[cp.newaxis, :])
-        
-        # Find matches within tolerance (boolean mask)
-        within_tolerance = distances <= tolerances[:, cp.newaxis]
-        
-        # Process matches
-        for idx in range(len(theo_mz_list)):
-            mask = within_tolerance[idx]
-            if not cp.any(mask):
-                continue
-            
-            # Get indices of matches and find best (highest intensity)
-            match_indices = cp.where(mask)[0]
-            matched_intensities = exp_intensity[match_indices]
-            best_local_idx = cp.argmax(matched_intensities)
-            best_idx = match_indices[best_local_idx]
-            
-            # Transfer results back to CPU for metadata processing
-            matched_intensity = float(cp.asnumpy(exp_intensity[best_idx]))
-            matched_mz = float(cp.asnumpy(exp_mz[best_idx]))
-            
-            # Apply minimum intensity threshold filter
-            if matched_intensity < intensity_threshold:
-                continue
-            
-            # Get metadata for this theoretical ion
-            ion_type, charge, i, ion_count = theo_metadata[idx]
-            theoretical_mz = theo_mz_list[idx]
-            
-            mass_accuracy_ppm = (matched_mz - theoretical_mz) / theoretical_mz * 1e6
-            nl_type = None
-            base_ion_type = ion_type
-            if '-' in ion_type:
-                base_ion_type, nl_type = ion_type.split('-', 1)
-            fragment_position = i + 1
-            
-            unique_id = f"{base_ion_type}{fragment_position}_{charge}_{nl_type or 'none'}"
-            if unique_id in matched_fragments:
-                continue
-            matched_fragments.add(unique_id)
-            
-            fragment_info = (
-                base_ion_type, theoretical_mz, charge, matched_intensity,
-                mass_accuracy_ppm, nl_type, fragment_position
-            )
-            matched_ions.append(fragment_info)
-            total_intensity += matched_intensity
-    
-    else:
-        # CPU VECTORIZED MATCHING using searchsorted — O(T * log(E)) instead of O(T * E)
-        # Sort experimental spectrum by m/z for binary search
-        sort_idx = np.argsort(exp_mz_np)
-        exp_mz_sorted = exp_mz_np[sort_idx]
-        exp_int_sorted = exp_intensity_np[sort_idx]
-        
-        theo_mz_arr = np.array(theo_mz_list, dtype=np.float64)
-        
-        # Compute per-ion tolerances
-        if unit == 'ppm':
-            tol_arr = theo_mz_arr * tolerance / 1e6
-        else:
-            tol_arr = np.full(len(theo_mz_arr), tolerance, dtype=np.float64)
-        
-        # Vectorized searchsorted for all theoretical ions at once
-        lo_indices = np.searchsorted(exp_mz_sorted, theo_mz_arr - tol_arr, side='left')
-        hi_indices = np.searchsorted(exp_mz_sorted, theo_mz_arr + tol_arr, side='right')
-        
-        for idx in range(len(theo_mz_list)):
-            lo = lo_indices[idx]
-            hi = hi_indices[idx]
-            if lo >= hi:
-                continue
-            
-            theoretical_mz = theo_mz_list[idx]
-            ion_type, charge, i, ion_count = theo_metadata[idx]
-            
-            # Find the match with highest intensity in the window
-            window_intensities = exp_int_sorted[lo:hi]
-            best_local = np.argmax(window_intensities)
-            matched_intensity = window_intensities[best_local]
-            
-            # Apply minimum intensity threshold filter
-            if matched_intensity < intensity_threshold:
-                continue
-            
-            matched_mz = exp_mz_sorted[lo + best_local]
-            mass_accuracy_ppm = (matched_mz - theoretical_mz) / theoretical_mz * 1e6
-            nl_type = None
-            base_ion_type = ion_type
-            if '-' in ion_type:
-                base_ion_type, nl_type = ion_type.split('-', 1)
-            fragment_position = i + 1
-            unique_id = f"{base_ion_type}{fragment_position}_{charge}_{nl_type or 'none'}"
-            if unique_id in matched_fragments:
-                continue
-            matched_fragments.add(unique_id)
-            fragment_info = (
-                base_ion_type, theoretical_mz, charge, matched_intensity,
-                mass_accuracy_ppm, nl_type, fragment_position
-            )
-            matched_ions.append(fragment_info)
-            total_intensity += matched_intensity
-    
+    for idx in sorted(assignments.keys()):
+        e_idx = assignments[idx]
+        theoretical_mz = theo_mz_list[idx]
+        ion_type, charge, i, ion_count = theo_metadata[idx]
+
+        matched_intensity = exp_int_sorted[e_idx]
+        matched_mz = exp_mz_sorted[e_idx]
+        mass_accuracy_ppm = (matched_mz - theoretical_mz) / theoretical_mz * 1e6
+        nl_type = None
+        base_ion_type = ion_type
+        if '-' in ion_type:
+            base_ion_type, nl_type = ion_type.split('-', 1)
+        fragment_position = i + 1
+        unique_id = f"{base_ion_type}{fragment_position}_{charge}_{nl_type or 'none'}"
+        if unique_id in matched_fragments:
+            continue
+        matched_fragments.add(unique_id)
+        fragment_info = (
+            base_ion_type, theoretical_mz, charge, matched_intensity,
+            mass_accuracy_ppm, nl_type, fragment_position
+        )
+        matched_ions.append(fragment_info)
+        total_intensity += matched_intensity
+
     return matched_ions, total_intensity
 
 def calculate_fragment_eic_areas(
@@ -3855,24 +3966,18 @@ def calculate_fragment_eic_areas(
     Calculate the area under EIC curve for each fragment across multiple scans,
     grouping by ion type and position (e.g., b3, y5, b3-H2O), not by m/z.
     Only consider fragments within the scan window of each scan.
-    
-    GPU ACCELERATED: Uses GPU for batch spectrum processing when available.
-    
+
+    EXCLUSIVE MATCHING: within each scan, assignment is one-to-one — each
+    peak contributes to at most one fragment's EIC (greedy, ranked by
+    absolute ppm mass error). See _greedy_exclusive_matches.
+
     Parameters:
     -----------
     min_intensity_threshold : float
         Minimum fragment intensity as percentage of base peak (0-100).
         Data points below this threshold will be excluded. Default: 2.0%
     """
-    # Check if GPU acceleration is available
-    use_gpu = GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE
-    
-    if use_gpu:
-        try:
-            import cupy as cp
-        except:
-            use_gpu = False
-    
+    # EIC matching stays on CPU (same reason as calculate_fragment_intensity).
     fragment_intensities = {}
     
     # Pre-flatten theoretical ions for vectorized matching
@@ -3902,21 +4007,7 @@ def calculate_fragment_eic_areas(
         return {}, 0
     
     theo_mz_array = np.array(theo_mz_list, dtype=np.float64)
-    
-    # Pre-transfer theoretical m/z to GPU once (not per spectrum)
-    theo_mz_gpu = None
-    gpu_tolerances = None
-    if use_gpu and len(theo_mz_list) > 20:
-        try:
-            theo_mz_gpu = cp.asarray(theo_mz_array)
-            if unit == 'ppm':
-                gpu_tolerances = theo_mz_gpu * tolerance / 1e6
-            else:
-                gpu_tolerances = cp.full(len(theo_mz_gpu), tolerance, dtype=cp.float64)
-        except Exception:
-            theo_mz_gpu = None
-            gpu_tolerances = None
-    
+
     for spectrum in ms2_spectra:
         rt = spectrum.get('scanList', {}).get('scan', [{}])[0].get('scan start time', 0)
         exp_mz = np.array(spectrum['m/z array'])
@@ -3947,69 +4038,37 @@ def calculate_fragment_eic_areas(
         if sw_upper is None:
             sw_upper = scan_window_upper if scan_window_upper is not None else np.inf
 
-        # GPU-accelerated matching for this spectrum
-        if use_gpu and theo_mz_gpu is not None:
-            exp_mz_gpu = cp.asarray(exp_mz)
-            exp_intensity_gpu = cp.asarray(exp_intensity)
-            
-            # Vectorized distance calculation (theo_mz_gpu and gpu_tolerances pre-computed)
-            distances = cp.abs(theo_mz_gpu[:, cp.newaxis] - exp_mz_gpu[cp.newaxis, :])
-            within_tolerance = distances <= gpu_tolerances[:, cp.newaxis]
-            
-            # Process each theoretical ion
-            for idx in range(len(theo_mz_list)):
-                fragment_label, charge, theoretical_mz = theo_metadata[idx]
-                
-                # Check scan window
-                if not (sw_lower <= theoretical_mz <= sw_upper):
-                    continue
-                
-                mask = within_tolerance[idx]
-                if not cp.any(mask):
-                    continue
-                
-                match_indices = cp.where(mask)[0]
-                max_intensity = float(cp.asnumpy(cp.max(exp_intensity_gpu[match_indices])))
-                
-                if max_intensity >= intensity_threshold:
-                    fragment_key = (fragment_label, charge)
-                    if fragment_key not in fragment_intensities:
-                        fragment_intensities[fragment_key] = {}
-                    fragment_intensities[fragment_key][rt] = max_intensity
+        # EXCLUSIVE GREEDY MATCHING per scan (one-to-one): each peak in a
+        # scan contributes to at most one fragment's EIC, so overlapping
+        # theoretical m/z values can no longer double-count the same signal.
+        sort_idx = np.argsort(exp_mz)
+        exp_mz_sorted = exp_mz[sort_idx]
+        exp_int_sorted = exp_intensity[sort_idx]
+
+        eligible = (theo_mz_array >= sw_lower) & (theo_mz_array <= sw_upper)
+
+        # Preserve output shape of the previous implementation: any eligible
+        # fragment with candidate peaks in range gets a key (an empty trace
+        # integrates to area 0 downstream).
+        if unit == 'ppm':
+            tol_arr = theo_mz_array * tolerance / 1e6
         else:
-            # CPU vectorized matching using searchsorted — O(T * log(E)) per spectrum
-            sort_idx = np.argsort(exp_mz)
-            exp_mz_sorted = exp_mz[sort_idx]
-            exp_int_sorted = exp_intensity[sort_idx]
-            
-            # Compute per-ion tolerances
-            if unit == 'ppm':
-                tol_arr = theo_mz_array * tolerance / 1e6
-            else:
-                tol_arr = np.full(len(theo_mz_array), tolerance, dtype=np.float64)
-            
-            # Vectorized searchsorted for all theoretical ions
-            lo_indices = np.searchsorted(exp_mz_sorted, theo_mz_array - tol_arr, side='left')
-            hi_indices = np.searchsorted(exp_mz_sorted, theo_mz_array + tol_arr, side='right')
-            
-            for idx in range(len(theo_mz_list)):
-                fragment_label, charge, theoretical_mz = theo_metadata[idx]
-                
-                # Check scan window
-                if not (sw_lower <= theoretical_mz <= sw_upper):
-                    continue
-                
-                lo = lo_indices[idx]
-                hi = hi_indices[idx]
-                
-                fragment_key = (fragment_label, charge)
-                if fragment_key not in fragment_intensities:
-                    fragment_intensities[fragment_key] = {}
-                    
-                if lo < hi:
-                    max_intensity = np.max(exp_int_sorted[lo:hi])
-                    if max_intensity >= intensity_threshold:
-                        fragment_intensities[fragment_key][rt] = max_intensity
+            tol_arr = np.full(len(theo_mz_array), tolerance, dtype=np.float64)
+        lo_indices = np.searchsorted(exp_mz_sorted, theo_mz_array - tol_arr, side='left')
+        hi_indices = np.searchsorted(exp_mz_sorted, theo_mz_array + tol_arr, side='right')
+        for idx in range(len(theo_mz_list)):
+            if eligible[idx] and lo_indices[idx] < hi_indices[idx]:
+                fragment_label, charge, _theo_mz = theo_metadata[idx]
+                fragment_intensities.setdefault((fragment_label, charge), {})
+
+        assignments = _greedy_exclusive_matches(
+            theo_mz_list, exp_mz_sorted, exp_int_sorted,
+            tolerance, unit, intensity_threshold,
+            eligible_mask=eligible
+        )
+        for idx, e_idx in assignments.items():
+            fragment_label, charge, _theo_mz = theo_metadata[idx]
+            fragment_intensities.setdefault((fragment_label, charge), {})[rt] = float(exp_int_sorted[e_idx])
 
     # Integrate each fragment's EIC
     fragment_eic_areas = {}
@@ -4042,20 +4101,53 @@ def calculate_rt_accuracy(experimental_rt, known_rt):
 
 
 def _get_file_acquisition_time(file_name, mzml_folder=None):
-    """Try to extract the acquisition timestamp of a data file.
+    """Extract acquisition timestamp for run-order / drift models.
 
     Strategy (in order):
-    1. File modification time (os.path.getmtime) — reliable proxy for
-       acquisition time when files haven't been copied/moved.
-    2. Falls back to alphabetical/original order when the folder is unknown.
+    1. mzML ``startTimeStamp`` in the file header (not affected by copy/sync).
+    2. File modification time as a last resort.
+    3. 0.0 when the file cannot be found (preserves original order).
     """
     if mzml_folder:
-        for ext in ('', '.mzML', '.raw'):
-            candidate = os.path.join(mzml_folder, file_name if ext == '' else
-                                     os.path.splitext(file_name)[0] + ext)
-            if os.path.isfile(candidate):
+        stems = [file_name, os.path.splitext(file_name)[0]]
+        candidates = []
+        for stem in stems:
+            candidates.append(os.path.join(mzml_folder, stem))
+            candidates.append(os.path.join(mzml_folder, stem + '.mzML'))
+            candidates.append(os.path.join(mzml_folder, stem + '.mzml'))
+            candidates.append(os.path.join(mzml_folder, stem + '.raw'))
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen or not os.path.isfile(candidate):
+                continue
+            seen.add(candidate)
+            ext = os.path.splitext(candidate)[1].lower()
+            if ext in ('.mzml', '.mzxml'):
+                ts = _parse_mzml_start_timestamp(candidate)
+                if ts is not None:
+                    return ts
+            try:
                 return os.path.getmtime(candidate)
-    return 0.0  # unknown — preserve original order
+            except OSError:
+                continue
+    return 0.0
+
+
+def _parse_mzml_start_timestamp(path):
+    """Read startTimeStamp from the beginning of an mzML file. Returns UNIX time or None."""
+    try:
+        with open(path, 'rb') as fh:
+            header = fh.read(262144)
+        match = re.search(br'startTimeStamp="([^"]+)"', header)
+        if not match:
+            return None
+        ts = match.group(1).decode('ascii', errors='ignore').replace('Z', '+00:00')
+        dt = datetime.datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            return dt.timestamp()
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
 def apply_rt_drift_correction(results_df, reference_peptides,
@@ -4666,31 +4758,31 @@ def _apply_mass_file_offset(results_df, file_mask, offset_ppm, sigma_mass):
 
 
 def calculate_continuity_score(matched_fragments):
-    # Group fragments by ion type
+    """Fraction of consecutive backbone positions covered in each ion series.
+
+    Positions are unique per (ion type, position): a primary ion, a charge
+    variant, and a neutral-loss ion at the same cleavage (e.g. y5, y5 2+,
+    y5-H2O) all represent one backbone site. Counting them separately would
+    insert duplicate positions into the series, splitting a true consecutive
+    ladder (4, 5, 6) into (4, 5, 5, 6) and understating continuity.
+    """
     ion_series = {}
     for ion in matched_fragments:
         ion_type = ion[0]  # b, y, etc.
         fragment_position = ion[6]  # position number
-        
-        if ion_type not in ion_series:
-            ion_series[ion_type] = []
-        ion_series[ion_type].append(fragment_position)
-    
-    # Calculate continuity for each ion series
+        ion_series.setdefault(ion_type, set()).add(fragment_position)
+
     continuity_scores = []
     for ion_type, positions in ion_series.items():
         positions = sorted(positions)
-        consecutive_count = 0
-        for i in range(len(positions)-1):
-            if positions[i+1] - positions[i] == 1:
-                consecutive_count += 1
-        
-        # Normalize by maximum possible consecutive matches
-        if len(positions) > 1:
-            continuity = consecutive_count / (len(positions) - 1)
-            continuity_scores.append(continuity)
-    
-    # Average continuity across all ion types
+        if len(positions) <= 1:
+            continue
+        consecutive_count = sum(
+            1 for i in range(len(positions) - 1)
+            if positions[i + 1] - positions[i] == 1
+        )
+        continuity_scores.append(consecutive_count / (len(positions) - 1))
+
     return np.mean(continuity_scores) if continuity_scores else 0
 
 def calculate_complementarity_score(matched_fragments, peptide_length):
@@ -7050,9 +7142,32 @@ def compute_spectral_similarity(matched_ions, predicted_intensities, method='SA'
 
 # --------------- Chimeric deconvolution: responsibility weights --------------
 
+def _precursor_sigma_ppm(tolerance, unit, precursor_mz):
+    """Gaussian σ for precursor m/z, always in ppm.
+
+    When *unit* is Da, convert using *precursor_mz* so a 0.5 Da window is not
+    treated as 0.5 ppm.
+    """
+    try:
+        tol = float(tolerance)
+    except (TypeError, ValueError):
+        tol = 10.0
+    unit_l = str(unit or 'ppm').strip().lower()
+    mz = None
+    try:
+        mz = float(precursor_mz) if precursor_mz is not None else None
+    except (TypeError, ValueError):
+        mz = None
+    if unit_l in ('da', 'u', 'amu', 'th') and mz and mz > 0:
+        ppm_tol = (tol / mz) * 1e6
+        return max(ppm_tol / 3.0, 1e-9)
+    return max(tol / 3.0, 1e-9)
+
+
 def compute_precursor_evidence(unique_ions, all_matched_ions, predicted_intensities,
                                rt_error, rt_window_width, precursor_mz_error_ppm,
-                               precursor_tol_ppm=10.0):
+                               precursor_tol_ppm=10.0, precursor_unit='ppm',
+                               precursor_mz=None):
     """
     Multi-evidence score for how strongly a candidate precursor is supported
     in this scan.  Combines:
@@ -7075,8 +7190,8 @@ def compute_precursor_evidence(unique_ions, all_matched_ions, predicted_intensit
     else:
         rt_score = 0.5
 
-    # 3. Precursor m/z fit  (weight 0.20)
-    sigma_prec = precursor_tol_ppm / 3.0
+    # 3. Precursor m/z fit  (weight 0.20) — sigma is always in ppm
+    sigma_prec = _precursor_sigma_ppm(precursor_tol_ppm, precursor_unit, precursor_mz)
     prec_score = float(np.exp(-0.5 * (precursor_mz_error_ppm / sigma_prec) ** 2)) if precursor_mz_error_ppm is not None else 0.5
 
     # 4. Mean mass accuracy of unique ions  (weight 0.20)
@@ -7172,6 +7287,7 @@ def precompute_evidence_by_scan(
     rt_err_arr = np.empty(n_pairs)
     rt_ww_arr = np.empty(n_pairs)
     prec_ppm_arr = np.empty(n_pairs)
+    prec_mz_arr = np.empty(n_pairs)
     mass_acc_arr = np.empty(n_pairs)
     has_rt = np.ones(n_pairs, dtype=bool)
     has_prec = np.ones(n_pairs, dtype=bool)
@@ -7182,6 +7298,10 @@ def precompute_evidence_by_scan(
         pep_idx = pair_pep_idxs[i]
         pinfo = pair_pep_infos[i]
         peptide, precursor_mz, charge, modification, start_rt, stop_rt, known_rt = pinfo
+        try:
+            prec_mz_arr[i] = float(precursor_mz)
+        except (TypeError, ValueError):
+            prec_mz_arr[i] = 0.0
         scan_id = pair_scan_ids[i]
         ambig_set = ambiguous_by_scan[scan_id]
 
@@ -7239,8 +7359,18 @@ def precompute_evidence_by_scan(
     rt_scores = np.exp(-0.5 * (rt_err_arr / sigma_rt) ** 2)
     rt_scores[~has_rt] = 0.5
 
-    sigma_prec = precursor_tolerance / 3.0
-    prec_scores = np.exp(-0.5 * (prec_ppm_arr / max(sigma_prec, 1e-9)) ** 2)
+    unit_l = str(precursor_unit or 'ppm').strip().lower()
+    if unit_l in ('da', 'u', 'amu', 'th'):
+        sigma_prec = np.where(
+            prec_mz_arr > 0,
+            (float(precursor_tolerance) / prec_mz_arr) * 1e6 / 3.0,
+            1e-9,
+        )
+        np.clip(sigma_prec, 1e-9, None, out=sigma_prec)
+        prec_scores = np.exp(-0.5 * (prec_ppm_arr / sigma_prec) ** 2)
+    else:
+        sigma_prec = max(float(precursor_tolerance) / 3.0, 1e-9)
+        prec_scores = np.exp(-0.5 * (prec_ppm_arr / sigma_prec) ** 2)
     prec_scores[~has_prec] = 0.5
 
     mass_scores = np.exp(-0.5 * (mass_acc_arr / 5.0) ** 2)
@@ -7544,17 +7674,8 @@ def calculate_psm_scores_batch(mass_accuracies, fragment_counts, rt_accuracies, 
     numpy.ndarray
         Array of PSM scores in [0, 1].
     """
-    use_gpu = GPU_AVAILABLE and GPU_ENABLED and CUPY_AVAILABLE
-
-    if use_gpu:
-        try:
-            import cupy as cp
-            xp = cp
-        except Exception:
-            xp = np
-            use_gpu = False
-    else:
-        xp = np
+    use_gpu = False
+    xp = np
 
     # Convert inputs to arrays
     mass_acc = xp.asarray(mass_accuracies, dtype=xp.float64)
@@ -8356,7 +8477,7 @@ def get_ms2_spectra(mzml_path, precursor_mz, start_rt, stop_rt, tolerance, unit=
 def process_raw_file(
     mzml_file, mzml_folder, peptides_info, 
     precursor_tolerance, fragment_tolerance, precursor_unit, fragment_unit, 
-    stop_event, eic_records=None, fragmentation_type="HCD", selected_neutral_losses=None,
+    stop_event, generate_eics=False, fragmentation_type="HCD", selected_neutral_losses=None,
     unique_frag_option="quant_only", flag_ambiguous=True,
     frag_index=None, all_theoretical_ions=None, peptides=None, modifications=None,
     min_intensity_threshold=2.0, fragment_mz_lower=None, fragment_mz_upper=None,
@@ -8367,8 +8488,9 @@ def process_raw_file(
     selected_neutral_losses = normalize_neutral_losses(selected_neutral_losses)
     if stop_event.is_set():
         logging.info(f"Stop requested before processing {os.path.basename(mzml_file)}; skipping file.")
-        return []
+        return [], []
     results = []
+    eic_records = [] if generate_eics else None
     mzml_path = os.path.join(mzml_folder, mzml_file)
     scan_window_lower, scan_window_upper = get_scan_window_limits(mzml_path)
 
@@ -8412,7 +8534,7 @@ def process_raw_file(
         if needs_ambiguity_map:
             if stop_event.is_set():
                 logging.info("Stop requested before building ambiguity map; aborting file processing.")
-                return results
+                return results, eic_records
             peptides_list = [p[0] for p in peptides_info]
             modifications_list = [p[3] for p in peptides_info]
             all_ms2_spectra = [spec for spectra in rt_windows.values() for spec in spectra]
@@ -8510,7 +8632,15 @@ def process_raw_file(
                         selected_neutral_losses
                     )
 
-                max_fragments = sum(len(ions) for ion_type in theoretical_ions.values() for ions in ion_type.values())
+                # Count only real m/z values; NL lists contain None placeholders
+                # (residues without that loss) that can never be matched.
+                max_fragments = sum(
+                    1
+                    for ion_type in theoretical_ions.values()
+                    for ions in ion_type.values()
+                    for mz in ions
+                    if mz is not None
+                )
 
                 fragment_eic_areas, total_eic_area = calculate_fragment_eic_areas(
                     ms2_spectra, theoretical_ions, fragment_tolerance, fragment_unit,
@@ -8741,7 +8871,12 @@ def process_raw_file(
                         ) if matched_ions else 0.0
 
                         continuity_score = calculate_continuity_score(matched_ions)
-                        complementarity_score = calculate_complementarity_score(matched_ions, len(peptide))
+                        # Use the bare sequence length: fragment positions are
+                        # generated from the stripped sequence, so including the
+                        # 'DECOY_' prefix would zero decoy complementarity and
+                        # teach Mokapot a label artifact instead of real signal.
+                        _bare_len = len(peptide[6:]) if peptide.startswith('DECOY_') else len(peptide)
+                        complementarity_score = calculate_complementarity_score(matched_ions, _bare_len)
 
                         # Spectral similarity (SA) against MS2PIP predictions
                         _spectral_angle, _matched_predicted_peaks = compute_spectral_similarity(
@@ -8887,11 +9022,11 @@ def process_raw_file(
                     for _ri in range(_results_start_idx, len(results)):
                         results[_ri]['eic_area'] = _deconv_total_eic
 
-        return results
+        return results, eic_records
     except Exception as e:
         logging.error(f"Error processing file {mzml_file}: {str(e)}")
         traceback.print_exc()
-        return []
+        return [], []
                         
 # Helper function to filter theoretical ions to only unique fragments
 def filter_ions_by_unique(theoretical_ions, unique_frags, tolerance=1e-6):
@@ -9048,10 +9183,17 @@ def rescore_with_mokapot(results_df, features, fdr_threshold=0.01):
     fdr_threshold : float
         FDR level passed to mokapot.brew(test_fdr=...). Defaults to 0.01 (1%).
     """
+    _ensure_mokapot()
     if not HAS_MOKAPOT:
         logging.info("Mokapot not available. Using simple FDR calculation.")
         return calculate_simple_fdr(results_df)
-    
+
+    try:
+        import mokapot
+    except ImportError:
+        logging.info("Mokapot import failed. Using simple FDR calculation.")
+        return calculate_simple_fdr(results_df)
+
     logging.info("Starting Mokapot rescoring...")
     n_records = len(results_df)
     logging.info(f"Processing {n_records:,} records for Mokapot rescoring")
@@ -9060,10 +9202,20 @@ def rescore_with_mokapot(results_df, features, fdr_threshold=0.01):
         # ---- Build PIN DataFrame using vectorized operations (memory-efficient) ----
         logging.info("Building PIN data (vectorized)...")
         
-        # Build SpecId column vectorized
+        # SpecId must be unique per PSM. PRM scans often contain several
+        # competing peptides (and decoys); file+scan alone collides and
+        # causes drop_duplicates to drop or mis-assign q-values.
         file_col = results_df['file'].fillna('unknown').astype(str)
         scan_col = results_df['scan_number'].astype(str) if 'scan_number' in results_df.columns else pd.Series(range(n_records), dtype=str)
-        spec_ids = file_col + '_' + scan_col
+        peptide_col = results_df['peptide'].fillna('').astype(str) if 'peptide' in results_df.columns else pd.Series([''] * n_records, dtype=str)
+        charge_col = results_df['charge'].astype(str) if 'charge' in results_df.columns else pd.Series([''] * n_records, dtype=str)
+        if 'modification' in results_df.columns:
+            mod_col = results_df['modification'].fillna('').astype(str)
+        else:
+            mod_col = pd.Series([''] * n_records, dtype=str)
+        spec_ids = file_col + '_' + scan_col + '_' + peptide_col + '_' + charge_col + '_' + mod_col
+        if spec_ids.duplicated().any():
+            spec_ids = spec_ids + '_' + pd.Series(np.arange(n_records), dtype=str)
         
         pin_df = pd.DataFrame({
             'SpecId': spec_ids.values,
@@ -9152,8 +9304,7 @@ def rescore_with_mokapot(results_df, features, fdr_threshold=0.01):
         # ---- Merge scores back using vectorized join (NOT row-by-row iterrows) ----
         logging.info("Merging Mokapot scores back to results (vectorized)...")
         
-        # Build spec_id for results_df
-        results_df['_spec_id'] = file_col.values + '_' + scan_col.values
+        results_df['_spec_id'] = spec_ids.values
         
         # Initialize default columns
         results_df['mokapot_score'] = np.float64(0.0)
@@ -9181,7 +9332,7 @@ def rescore_with_mokapot(results_df, features, fdr_threshold=0.01):
         
         mokapot_scores = psm_df[['SpecId', score_col, qval_col, pep_col]].copy()
         mokapot_scores.columns = ['_spec_id', '_mk_score', '_mk_qvalue', '_mk_pep']
-        mokapot_scores = mokapot_scores.drop_duplicates(subset='_spec_id', keep='first')
+        # Keep every PSM. Duplicate SpecIds should not occur after the unique-key construction above.
         
         # Vectorized merge
         results_df = results_df.merge(mokapot_scores, on='_spec_id', how='left')
@@ -9249,7 +9400,63 @@ def calculate_simple_fdr(results_df):
     # Sort in-place — avoids a full copy (~2 GB for 8M+ rows)
     results_df.sort_values(by='psm_score', ascending=False, inplace=True)
     results_df.reset_index(drop=True, inplace=True)
-    
+
+    # ── Target-decoy competition (per spectrum, per target/decoy pair) ──
+    # Each decoy is generated from one specific target by pseudo-reversal
+    # (an involution: applying it to the decoy sequence recovers the
+    # target). Within the same spectrum, a target and its paired decoy
+    # compete and only the better-scoring of the two is kept — standard
+    # TDC, which keeps the (D+1)/T estimate from being anti-conservative
+    # when many candidate PSMs share a scan. Distinct co-isolated peptides
+    # form distinct pairs, so legitimate chimeric IDs are preserved.
+    if 'file' in results_df.columns and 'scan_number' in results_df.columns:
+        def _pair_sequence(pep):
+            pep = str(pep)
+            return _pseudo_reverse_sequence(pep[6:]) if pep.startswith('DECOY_') else pep
+
+        def _mod_names_key(mod):
+            # Position/residue-invariant mod key (decoy mods are remapped to
+            # different positions, but mod NAMES are identical to the target's).
+            text = str(mod).strip()
+            if not text or text.lower() in ('nan', 'none'):
+                return ''
+            names = []
+            for token in text.split(';'):
+                token = token.strip()
+                if token:
+                    names.append(token.split(':', 1)[1].strip() if ':' in token else token)
+            return '|'.join(sorted(names))
+
+        _seq_map = {p: _pair_sequence(p) for p in results_df['peptide'].astype(str).unique()}
+        if 'modification' in results_df.columns:
+            _mod_map = {m: _mod_names_key(m) for m in results_df['modification'].astype(str).unique()}
+            _mod_key = results_df['modification'].astype(str).map(_mod_map)
+        else:
+            _mod_key = pd.Series('', index=results_df.index)
+        _charge_key = (
+            results_df['charge'].astype(str) if 'charge' in results_df.columns
+            else pd.Series('', index=results_df.index)
+        )
+        _pair_key = (
+            results_df['file'].astype(str) + '|'
+            + results_df['scan_number'].astype(str) + '|'
+            + results_df['peptide'].astype(str).map(_seq_map) + '|'
+            + _charge_key + '|'
+            + _mod_key
+        )
+        # Rows are sorted by score descending, so the first row per pair key
+        # is the competition winner.
+        _loser_mask = _pair_key.duplicated(keep='first')
+        _n_losers = int(_loser_mask.sum())
+        if _n_losers > 0:
+            results_df.drop(index=results_df.index[_loser_mask], inplace=True)
+            results_df.reset_index(drop=True, inplace=True)
+            logging.info(
+                f"Target-decoy competition: removed {_n_losers:,} losing PSMs "
+                f"(kept best of each target/decoy pair per spectrum); "
+                f"{len(results_df):,} PSMs remain."
+            )
+
     is_target = results_df['Label'] == 1
     results_df['cum_targets'] = is_target.cumsum()
     results_df['cum_decoys'] = (~is_target).cumsum()
@@ -9377,7 +9584,14 @@ def build_qc_metrics_table(results_df):
         )
 
         rt_values = pd.to_numeric(df_slice.get('rt', pd.Series(dtype=float)), errors='coerce')
-        known_rt_values = pd.to_numeric(df_slice.get('known_rt', pd.Series(dtype=float)), errors='coerce')
+        # Prefer drift-corrected reference RTs when RT drift correction ran,
+        # so QC reflects the same reference the scoring actually used.
+        if 'known_rt_corrected' in df_slice.columns:
+            known_rt_values = pd.to_numeric(df_slice['known_rt_corrected'], errors='coerce')
+            _fallback = pd.to_numeric(df_slice.get('known_rt', pd.Series(dtype=float)), errors='coerce')
+            known_rt_values = known_rt_values.fillna(_fallback)
+        else:
+            known_rt_values = pd.to_numeric(df_slice.get('known_rt', pd.Series(dtype=float)), errors='coerce')
         valid_rt_mask = known_rt_values.notna() & (known_rt_values != 0) & rt_values.notna()
         rt_deviation = (rt_values[valid_rt_mask] - known_rt_values[valid_rt_mask]).abs()
 
@@ -9433,10 +9647,109 @@ def _safe_set_progress(value):
         pass
 
 
+def _read_tabular_input(path):
+    """Read a PRM/Excel/CSV/TSV table."""
+    lower = str(path).lower()
+    if lower.endswith(('.xlsx', '.xls')):
+        return pd.read_excel(path)
+    if lower.endswith('.csv'):
+        return pd.read_csv(path)
+    if lower.endswith('.tsv'):
+        return pd.read_csv(path, sep='\t')
+    raise ValueError(
+        f"Unsupported file format: {path}. Supported formats: .xlsx, .xls, .csv, .tsv"
+    )
+
+
+_PRM_COLUMN_ALIASES = {
+    'peptide': ('sequence', 'peptide', 'peptide sequence', 'annotated sequence'),
+    'modifications': ('modifications', 'modification', 'mods', 'mod'),
+    'mz': ('m/z', 'mz', 'precursor m/z', 'precursor mz', 'mass [m/z]'),
+    'charge': ('z', 'charge', 'charge state', 'precursor charge'),
+    'start_rt': ('start [min]', 'start rt', 'start rt [min]', 'start', 't start', 't_start'),
+    'stop_rt': ('stop [min]', 'stop rt', 'stop rt [min]', 'stop', 't stop', 't_stop'),
+    'known_rt': ('top apex rt [min]', 'top apex rt', 'known rt', 'apex rt', 'rt', 'retention time'),
+}
+
+
+def _normalize_header(name):
+    return re.sub(r'\s+', ' ', str(name).strip().lower())
+
+
+def _extract_prm_target_columns(data):
+    """Resolve PRM columns by header name, falling back to positional order.
+
+    Returns
+    -------
+    peptides, modifications, precursor_mzs, charges, start_rts, stop_rts, known_rts
+    """
+    colmap = {_normalize_header(c): c for c in data.columns}
+    resolved = {}
+    for key, aliases in _PRM_COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias in colmap:
+                resolved[key] = colmap[alias]
+                break
+
+    required = ('peptide', 'modifications', 'mz', 'charge', 'start_rt', 'stop_rt')
+    if all(k in resolved for k in required):
+        n = len(data)
+        peptides = data[resolved['peptide']].tolist()
+        modifications = data[resolved['modifications']].tolist()
+        precursor_mzs = data[resolved['mz']].tolist()
+        charges = data[resolved['charge']].tolist()
+        start_rts = data[resolved['start_rt']].tolist()
+        stop_rts = data[resolved['stop_rt']].tolist()
+        if 'known_rt' in resolved:
+            known_rts = data[resolved['known_rt']].tolist()
+        else:
+            known_rts = [None] * n
+        logging.info("PRM input columns matched by header name.")
+        return peptides, modifications, precursor_mzs, charges, start_rts, stop_rts, known_rts
+
+    if len(data.columns) < 6:
+        raise ValueError(
+            f"PRM input file must have named columns (Sequence, Modifications, m/z, z, "
+            f"Start [min], Stop [min]) or at least 6 positional columns. Found {len(data.columns)}."
+        )
+    logging.info("PRM input columns read by position (headers not recognized).")
+    peptides = data.iloc[:, 0].tolist()
+    modifications = data.iloc[:, 1].tolist()
+    precursor_mzs = data.iloc[:, 2].tolist()
+    charges = data.iloc[:, 3].tolist()
+    start_rts = data.iloc[:, 4].tolist()
+    stop_rts = data.iloc[:, 5].tolist()
+    known_rts = data.iloc[:, 6].tolist() if len(data.columns) > 6 else [None] * len(peptides)
+    return peptides, modifications, precursor_mzs, charges, start_rts, stop_rts, known_rts
+
+
+def _existing_result_outputs(output_folder):
+    """Basenames of ProteoPRM result files already in the output folder."""
+    names = (
+        'PSM', 'Peptide Quantification', 'Protein Quantification',
+        'Combined', 'QC Metrics', 'EICs',
+    )
+    found = []
+    for name in names:
+        path = _get_sheet_disk_path(output_folder, name)
+        if os.path.isfile(path):
+            found.append(os.path.basename(path))
+        csv_path = _output_path(output_folder, name)
+        if csv_path != path and os.path.isfile(csv_path):
+            found.append(os.path.basename(csv_path))
+    return found
+
+
+def _analysis_run_fingerprint(payload):
+    import hashlib
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
 def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, thread_capacity, 
                          precursor_tolerance, fragment_tolerance, precursor_unit, 
                          fragment_unit, fragmentation_type, fdr_threshold, quant_method="Both", generate_eics=False, selected_neutral_losses=None,
-                         fragment_mz_lower=None, fragment_mz_upper=None):
+                         fragment_mz_lower=None, fragment_mz_upper=None, file_processing_timeout_minutes=360):
     """Modified function to collect all PSMs once and track execution time"""
     global _parse_result_logged_once
     _parse_result_logged_once = False
@@ -9474,37 +9787,10 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
             
         # Load target peptides
         logging.info(f"Loading peptides from {prm_input_file}")
-        if prm_input_file.lower().endswith(('.xlsx', '.xls')):
-            data = pd.read_excel(prm_input_file)
-        elif prm_input_file.lower().endswith('.csv'):
-            data = pd.read_csv(prm_input_file)
-        elif prm_input_file.lower().endswith('.tsv'):
-            data = pd.read_csv(prm_input_file, sep='\t')
-        else:
-            raise ValueError(f"Unsupported file format: {prm_input_file}. Supported formats: .xlsx, .xls, .csv, .tsv")
-        
-        # Strict positional column ordering (column names are ignored):
-        # Column 0: Peptide sequence
-        # Column 1: Modifications
-        # Column 2: Precursor m/z
-        # Column 3: Precursor charge
-        # Column 4: Start RT
-        # Column 5: Stop RT
-        # Column 6: Known RT (optional)
-        
-        # Validate minimum required columns
-        if len(data.columns) < 6:
-            raise ValueError(f"PRM input file must have at least 6 columns. Found {len(data.columns)} columns.\n"
-                           f"Expected order: Peptide, Modifications, m/z, Charge, Start RT, Stop RT, [Known RT]")
-        
-        # Extract data using strict positional indices
-        peptides = data.iloc[:, 0].tolist()  # Column 0: Peptide sequence
-        modifications = data.iloc[:, 1].tolist()  # Column 1: Modifications
-        precursor_mzs = data.iloc[:, 2].tolist()  # Column 2: Precursor m/z
-        charges = data.iloc[:, 3].tolist()  # Column 3: Precursor charge
-        start_rts = data.iloc[:, 4].tolist()  # Column 4: Start RT
-        stop_rts = data.iloc[:, 5].tolist()  # Column 5: Stop RT
-        known_rts = data.iloc[:, 6].tolist() if len(data.columns) > 6 else [None] * len(peptides)  # Column 6: Known RT (optional)
+        data = _read_tabular_input(prm_input_file)
+        peptides, modifications, precursor_mzs, charges, start_rts, stop_rts, known_rts = (
+            _extract_prm_target_columns(data)
+        )
         
         # --- RT width override logic ---
         try:
@@ -9532,7 +9818,7 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
         decoy_info = []
         for decoy, orig_pep, precursor_mz, charge, modification, start_rt, stop_rt, known_rt in zip(
                 decoy_peptides, peptides, precursor_mzs, charges, modifications, start_rts, stop_rts, known_rts):
-            remapped_mod = remap_modification_for_decoy(modification, len(orig_pep))
+            remapped_mod = remap_modification_for_decoy(modification, orig_pep)
             decoy_info.append((decoy, precursor_mz, charge, remapped_mod, start_rt, stop_rt, known_rt))
         
         # Process mzML files (and .raw files when fisher_py is available) ONCE and collect ALL PSMs
@@ -9545,6 +9831,136 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                                     set(m.lower() for m in mzml_files)]
             mzml_files.extend(raw_files_direct)
         logging.info(f"Found {len(mzml_files)} data files to process")
+
+        # Resume support: reuse existing intermediate parquet batches only when
+        # the analysis-parameter fingerprint matches this run.
+        temp_results_files = []
+        temp_eic_files = []
+        processed_files_from_batches = set()
+        batch_number = 0
+        temp_dir = os.path.join(output_dir if output_dir else os.path.dirname(output_file), '.temp_results')
+        os.makedirs(temp_dir, exist_ok=True)
+
+        fingerprint_payload = {
+            'precursor_tolerance': precursor_tolerance,
+            'fragment_tolerance': fragment_tolerance,
+            'precursor_unit': precursor_unit,
+            'fragment_unit': fragment_unit,
+            'fragmentation_type': fragmentation_type,
+            'fdr_threshold': fdr_threshold,
+            'quant_method': quant_method,
+            'generate_eics': generate_eics,
+            'neutral_losses': list(normalized_neutral_losses) if normalized_neutral_losses else [],
+            'fragment_mz_lower': fragment_mz_lower,
+            'fragment_mz_upper': fragment_mz_upper,
+            'n_targets': len(peptides),
+        }
+        try:
+            st = os.stat(prm_input_file)
+            fingerprint_payload['prm_input'] = {
+                'name': os.path.basename(prm_input_file),
+                'size': st.st_size,
+                'mtime': int(st.st_mtime),
+            }
+        except OSError:
+            fingerprint_payload['prm_input'] = os.path.basename(str(prm_input_file))
+        try:
+            fingerprint_payload['fragment_usage'] = fragment_usage_var.get()
+            fingerprint_payload['pred_engine'] = (
+                pred_engine_var.get() if fingerprint_payload['fragment_usage'] == 'probabilistic' else None
+            )
+            fingerprint_payload['rt_width'] = rt_width_var.get()
+            fingerprint_payload['rt_drift'] = bool(rt_drift_enabled_var.get())
+            fingerprint_payload['mass_drift'] = bool(mass_drift_enabled_var.get())
+            fingerprint_payload['ref_peptides'] = rt_ref_peptides_var.get()
+        except Exception:
+            pass
+        run_fingerprint = _analysis_run_fingerprint(fingerprint_payload)
+        manifest_path = os.path.join(temp_dir, 'run_manifest.json')
+
+        resume_ok = False
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as mf:
+                    old_manifest = json.load(mf)
+                resume_ok = old_manifest.get('fingerprint') == run_fingerprint
+            except Exception as exc:
+                logging.warning(f"Could not read run manifest ({exc}); not resuming cached batches.")
+                resume_ok = False
+
+        if not resume_ok:
+            leftover = [
+                name for name in os.listdir(temp_dir)
+                if name.lower().endswith('.parquet') or name.lower() == 'run_manifest.json'
+            ]
+            if leftover:
+                logging.warning(
+                    "Discarding cached .temp_results batches because analysis parameters "
+                    "do not match the previous run (or no manifest was found)."
+                )
+                for name in leftover:
+                    try:
+                        os.remove(os.path.join(temp_dir, name))
+                    except Exception as exc:
+                        logging.debug(f"Could not remove {name}: {exc}")
+        else:
+            batch_pattern = re.compile(r'^batch_(\d+)\.parquet$', re.IGNORECASE)
+            available_input_files = set(mzml_files)
+            for name in sorted(os.listdir(temp_dir)):
+                match = batch_pattern.match(name)
+                if not match:
+                    continue
+
+                temp_file = os.path.join(temp_dir, name)
+                try:
+                    # Read only file identifiers to keep resume scan lightweight.
+                    _batch_files_series = pd.read_parquet(temp_file, columns=['file'])['file']
+                    _batch_file_set = {
+                        str(x) for x in _batch_files_series.dropna().astype(str).unique().tolist()
+                    }
+                except Exception as e:
+                    logging.warning(f"Skipping resume candidate {name}: could not read file column ({e})")
+                    continue
+
+                if not _batch_file_set.issubset(available_input_files):
+                    logging.warning(
+                        f"Ignoring {name} for resume: contains files not in current input folder."
+                    )
+                    continue
+
+                temp_results_files.append(temp_file)
+                processed_files_from_batches.update(_batch_file_set)
+                batch_number = max(batch_number, int(match.group(1)))
+
+            # Also restore EIC batches written by the previous (matching) run,
+            # so resumed runs with EIC export enabled keep earlier files' EICs.
+            eic_pattern = re.compile(r'^eic_batch_(\d+)\.parquet$', re.IGNORECASE)
+            for name in sorted(os.listdir(temp_dir)):
+                eic_match = eic_pattern.match(name)
+                if eic_match:
+                    temp_eic_files.append(os.path.join(temp_dir, name))
+                    # EIC batches share batch_number with PSM batches; bump it
+                    # so new writes never overwrite a restored EIC batch.
+                    batch_number = max(batch_number, int(eic_match.group(1)))
+            if temp_eic_files:
+                logging.info(
+                    f"Resuming EIC export: {len(temp_eic_files)} existing EIC batch files restored."
+                )
+
+        try:
+            with open(manifest_path, 'w', encoding='utf-8') as mf:
+                json.dump({'fingerprint': run_fingerprint, 'params': fingerprint_payload}, mf, indent=2)
+        except Exception as exc:
+            logging.warning(f"Could not write run manifest: {exc}")
+
+        files_to_process = [f for f in mzml_files if f not in processed_files_from_batches]
+        if temp_results_files:
+            logging.info(
+                f"Resuming file processing: {len(temp_results_files)} existing batch files found; "
+                f"{len(processed_files_from_batches)} raw files already processed."
+            )
+            logging.info(f"Continuing with {len(files_to_process)} remaining files.")
+
         logging.info("Processing raw files concurrently")
         
         # Dynamic batch processing configuration based on available system RAM
@@ -9599,14 +10015,18 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
         # IMPORTANT: Limit concurrent file processing to prevent:
         # 1. File handle exhaustion (Windows ~512-8192 handles)
         # 2. I/O starvation where concurrent disk reads cause massive slowdowns
+        # 3. Memory exhaustion (Out Of Memory errors during array allocations)
         # Testing shows files process in ~3 min solo but timeout at 60 min with 12 concurrent
-        MAX_CONCURRENT_FILES = min(thread_capacity, BATCH_SIZE)  # Controlled by user setting
-        logging.info(f"Processing with max {MAX_CONCURRENT_FILES} concurrent files (thread capacity: {thread_capacity})")
-        
-        temp_results_files = []  # Track temporary parquet files
-        temp_dir = os.path.join(output_dir if output_dir else os.path.dirname(output_file), '.temp_results')
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
+        import psutil
+        try:
+            available_ram_mb = psutil.virtual_memory().available / (1024 ** 2)
+            # Assume ~800 MB peak RAM per concurrent file to be safe
+            safe_max_threads = max(1, int(available_ram_mb / 800))
+        except Exception:
+            safe_max_threads = thread_capacity
+
+        MAX_CONCURRENT_FILES = min(thread_capacity, BATCH_SIZE, safe_max_threads)  # Controlled by user setting and RAM
+        logging.info(f"Processing with max {MAX_CONCURRENT_FILES} concurrent files (user capacity: {thread_capacity}, RAM safe limit: {safe_max_threads})")
         
         all_results = []
         eic_records = [] if generate_eics else None  # Initialize EIC records list if needed
@@ -9685,12 +10105,13 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                             _apd_cal_nce = None
 
                     # --- Auto-detect instrument from the first data file ---
-                    if mzml_files:
-                        _detected_inst = _detect_instrument_from_file(mzml_files[0])
+                    _first_data_file = files_to_process[0] if files_to_process else (mzml_files[0] if mzml_files else None)
+                    if _first_data_file:
+                        _detected_inst = _detect_instrument_from_file(_first_data_file)
                         if _detected_inst and _detected_inst != _apd_inst:
                             logging.warning(
                                 f"AlphaPeptDeep: auto-detected instrument '{_detected_inst}' "
-                                f"from {os.path.basename(mzml_files[0])} differs from "
+                                f"from {os.path.basename(_first_data_file)} differs from "
                                 f"selected '{_apd_inst}'.  Consider changing the Instrument "
                                 f"setting for best prediction accuracy."
                             )
@@ -9787,38 +10208,53 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
         except Exception:
             pass
 
-        # ---- Dynamic timeout: scales with workload size ----
-        # Base 5 min + 3 sec per peptide + 3 min if probabilistic
-        _n_peps = len(peptides_info) + len(decoy_info)
-        _per_file_timeout = 300 + (3 * _n_peps)
-        if _frag_usage == "probabilistic":
-            _per_file_timeout += 180  # extra headroom for deconvolution math
-        _per_file_timeout = max(300, min(_per_file_timeout, 900))  # clamp 5-15 min
-        logging.info(f"Dynamic per-file timeout: {_per_file_timeout}s "
-                     f"({_per_file_timeout / 60:.1f} min) for {_n_peps} peptides")
+        # ---- Timeout processing: strictly adhere to user preference ----
+        try:
+            _timeout_ceiling = max(300, int(file_processing_timeout_minutes) * 60)
+        except (TypeError, ValueError):
+            _timeout_ceiling = 21600  # Default 6 hours fallback
+        _per_file_timeout = _timeout_ceiling
+        
+        logging.info(f"File processing timeout set to {_per_file_timeout}s "
+                     f"({_per_file_timeout / 60:.1f} min) based on user preference cap")
 
         # Process files in controlled batches to prevent file handle exhaustion
-        total_files = len(mzml_files)
+        total_files = len(files_to_process)
         files_processed = 0
-        batch_number = 0
         failed_files = []  # Track failed files for retry
         
         try:
-            with TqdmToTk(total=total_files, desc="Processing raw files",
+            if total_files == 0:
+                logging.info("No remaining files to process in this run; proceeding to result aggregation.")
+
+            with TqdmToTk(total=len(mzml_files), initial=len(processed_files_from_batches),
+                          desc="Processing raw files",
                           progress_bar=progress_bar, root=root,
                           start_pct=12, end_pct=95) as pbar:
+                pbar.update(0)  # update UI immediately with any resumed progress
                 
-                # Process files in batches of MAX_CONCURRENT_FILES
-                for batch_start in range(0, total_files, MAX_CONCURRENT_FILES):
+                # Process files in dynamic batches to adjust to available RAM in real-time
+                while files_processed < total_files:
                     if stop_event.is_set():
                         logging.info("Stop requested before processing batch.")
                         break
+                        
+                    # Recalculate safe concurrent files based on CURRENT available RAM
+                    try:
+                        import psutil
+                        _current_ram_mb = psutil.virtual_memory().available / (1024 ** 2)
+                        _safe_threads = max(1, int(_current_ram_mb / 800))
+                    except Exception:
+                        _safe_threads = thread_capacity
+                        
+                    current_concurrent_files = min(thread_capacity, BATCH_SIZE, _safe_threads)
                     
-                    batch_end = min(batch_start + MAX_CONCURRENT_FILES, total_files)
-                    batch_files = mzml_files[batch_start:batch_end]
+                    batch_start = files_processed
+                    batch_end = min(batch_start + current_concurrent_files, total_files)
+                    batch_files = files_to_process[batch_start:batch_end]
                     
                     # Create executor for this batch only
-                    executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FILES)
+                    executor = ThreadPoolExecutor(max_workers=current_concurrent_files)
                     with executor_lock:
                         active_executor = executor
                     
@@ -9833,8 +10269,9 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                                 process_raw_file, mzml_file, mzml_folder,
                                 peptides_info + decoy_info,
                                 precursor_tolerance, fragment_tolerance,
-                                precursor_unit, fragment_unit, stop_event, eic_records,
-                                fragmentation_type, normalized_neutral_losses,
+                                precursor_unit, fragment_unit, stop_event, generate_eics,
+                                fragmentation_type=fragmentation_type,
+                                selected_neutral_losses=normalized_neutral_losses,
                                 unique_frag_option=_frag_usage,
                                 flag_ambiguous=flag_ambiguous_var.get(),
                                 frag_index=precomputed_frag_index,
@@ -9853,10 +10290,18 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                             if stop_event.is_set():
                                 break
                             try:
-                                results = future.result(timeout=_per_file_timeout)
-                                if results:
-                                    all_results.extend(results)
-                                files_processed += 1
+                                res_eic = future.result(timeout=_per_file_timeout)
+                                if res_eic:
+                                    try:
+                                        res, _eics = res_eic
+                                        if res:
+                                            all_results.extend(res)
+                                        if _eics and eic_records is not None:
+                                            eic_records.extend(_eics)
+                                    except ValueError:
+                                        # Fallback in case unpacking fails
+                                        if res_eic:
+                                            all_results.extend(res_eic)
                             except TimeoutError:
                                 logging.error(f"Timeout processing file {futures[future]} "
                                               f"(exceeded {_per_file_timeout / 60:.0f} min)")
@@ -9870,6 +10315,7 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                                 if "Invalid argument" in error_msg or "Errno 22" in error_msg:
                                     failed_files.append(futures[future])
                             finally:
+                                files_processed += 1
                                 pbar.update()
                         
                     finally:
@@ -9886,15 +10332,24 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                         gc.collect()
                     
                     # Save intermediate results to disk after each batch to prevent memory overflow
-                    if all_results and len(all_results) >= BATCH_SIZE * 50:  # Save when we have substantial data
+                    if all_results and len(all_results) >= BATCH_SIZE * 500:  # Increased from 50 to 500 for faster I/O
                         batch_number += 1
                         temp_file = os.path.join(temp_dir, f'batch_{batch_number}.parquet')
                         batch_df = pd.DataFrame(all_results)
                         batch_df.to_parquet(temp_file, index=False)
                         temp_results_files.append(temp_file)
-                        logging.info(f"Saved batch {batch_number} with {len(all_results)} records to disk (freeing memory)")
+                        logging.info(f"Saved PSM batch {batch_number} with {len(all_results)} records to disk (freeing memory)")
                         all_results = []  # Clear memory
-                        gc.collect()
+                        
+                    if eic_records and len(eic_records) >= BATCH_SIZE * 5000:  # Increased from 500 to 5000
+                        eic_temp_file = os.path.join(temp_dir, f'eic_batch_{batch_number}.parquet')
+                        eic_batch_df = pd.DataFrame(eic_records)
+                        eic_batch_df.to_parquet(eic_temp_file, index=False)
+                        temp_eic_files.append(eic_temp_file)
+                        logging.info(f"Saved EIC batch {batch_number} with {len(eic_records)} records to disk (freeing memory)")
+                        eic_records = []  # Clear memory
+                        
+                    gc.collect()
                     
                     # Small delay between batches to allow file handles to be released
                     if batch_end < total_files and not stop_event.is_set():
@@ -9908,12 +10363,13 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                         break
                     try:
                         # Reuse already-precomputed fragment index (computed once above)
-                        results = process_raw_file(
+                        res_eic = process_raw_file(
                             mzml_file, mzml_folder,
                             peptides_info + decoy_info,
                             precursor_tolerance, fragment_tolerance,
-                            precursor_unit, fragment_unit, stop_event, eic_records,
-                            fragmentation_type, normalized_neutral_losses,
+                            precursor_unit, fragment_unit, stop_event, generate_eics,
+                            fragmentation_type=fragmentation_type,
+                            selected_neutral_losses=normalized_neutral_losses,
                             unique_frag_option=fragment_usage_var.get(),
                             flag_ambiguous=flag_ambiguous_var.get(),
                             frag_index=precomputed_frag_index,
@@ -9924,8 +10380,15 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                             fragment_mz_lower=float(fragment_mz_lower_entry.get()) if fragment_mz_lower_entry.get() else None,
                             fragment_mz_upper=float(fragment_mz_upper_entry.get()) if fragment_mz_upper_entry.get() else None
                         )
-                        if results:
-                            all_results.extend(results)
+                        if res_eic:
+                            try:
+                                res, _eics = res_eic
+                                if res:
+                                    all_results.extend(res)
+                                if _eics and eic_records is not None:
+                                    eic_records.extend(_eics)
+                            except ValueError:
+                                all_results.extend(res_eic)
                         logging.info(f"Retry successful for {mzml_file}")
                     except Exception as e:
                         logging.error(f"Retry failed for {mzml_file}: {str(e)}")
@@ -9939,9 +10402,18 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                 batch_df = pd.DataFrame(all_results)
                 batch_df.to_parquet(temp_file, index=False)
                 temp_results_files.append(temp_file)
-                logging.info(f"Saved final batch {batch_number} with {len(all_results)} records to disk")
+                logging.info(f"Saved final PSM batch {batch_number} with {len(all_results)} records to disk")
                 all_results = []
-                gc.collect()
+                
+            if eic_records:
+                eic_temp_file = os.path.join(temp_dir, f'eic_batch_{batch_number}_final.parquet')
+                eic_batch_df = pd.DataFrame(eic_records)
+                eic_batch_df.to_parquet(eic_temp_file, index=False)
+                temp_eic_files.append(eic_temp_file)
+                logging.info(f"Saved final EIC batch with {len(eic_records)} records to disk")
+                eic_records = []
+                
+            gc.collect()
 
             if stop_event.is_set():
                 logging.info("Processing halted by user.")
@@ -9954,19 +10426,20 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
         # Convert results to DataFrame for processing
         # Load and combine all batch files if batch processing was used
         if temp_results_files:
-            logging.info(f"Loading and combining {len(temp_results_files)} batch files...")
-            batch_dfs = []
-            for temp_file in temp_results_files:
-                try:
-                    batch_df = pd.read_parquet(temp_file)
-                    batch_dfs.append(batch_df)
-                except Exception as e:
-                    logging.error(f"Error reading batch file {temp_file}: {str(e)}")
-            
-            if batch_dfs:
-                results_df = pd.concat(batch_dfs, ignore_index=True)
+            logging.info(f"Loading and combining {len(temp_results_files)} batch files out-of-core...")
+            try:
+                import pyarrow.dataset as ds
+                # Efficient out-of-core merging and loading into a single PyArrow table
+                dataset = ds.dataset(temp_results_files, format="parquet")
+                table = dataset.to_table()
+                
+                # Convert to Pandas destructively to save peak memory (reduces memory usage by 50% vs pd.concat)
+                results_df = table.to_pandas(split_blocks=True, self_destruct=True)
+                del table
+                
                 logging.info(f"Combined {len(temp_results_files)} batches into {len(results_df)} total records")
-                # Clean up temporary files
+                
+                # Clean up PSM temporary files (EIC temp files are kept until EIC generation step)
                 for temp_file in temp_results_files:
                     try:
                         os.remove(temp_file)
@@ -9976,11 +10449,35 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                     os.rmdir(temp_dir)
                 except Exception:
                     pass  # Directory may not be empty or may not exist
-                # Free memory from batch dataframes
-                del batch_dfs
                 gc.collect()
-            else:
-                results_df = pd.DataFrame()
+                
+            except Exception as e:
+                logging.error(f"Error during out-of-core merging: {str(e)}")
+                # Fallback to standard loading if PyArrow fails
+                batch_dfs = []
+                for temp_file in temp_results_files:
+                    try:
+                        batch_df = pd.read_parquet(temp_file)
+                        batch_dfs.append(batch_df)
+                    except Exception as err:
+                        logging.error(f"Error reading batch file {temp_file} in fallback: {str(err)}")
+                
+                if batch_dfs:
+                    results_df = pd.concat(batch_dfs, ignore_index=True)
+                    logging.info(f"Combined {len(temp_results_files)} batches into {len(results_df)} total records (fallback)")
+                    for temp_file in temp_results_files:
+                        try:
+                            os.remove(temp_file)
+                        except Exception as err:
+                            pass
+                    try:
+                        os.rmdir(temp_dir)
+                    except Exception:
+                        pass
+                    del batch_dfs
+                    gc.collect()
+                else:
+                    results_df = pd.DataFrame()
         else:
             results_df = pd.DataFrame(all_results)
         end_time = time.time()
@@ -10081,58 +10578,15 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                 else:
                     logging.warning("Mass Drift Correction enabled but no reference peptides provided. Skipping.")
 
-            # ── Spurious PSM pre-filter ─────────────────────────────────────
-            # Remove clearly unreliable PSMs before Mokapot rescoring,
-            # inspired by CHIMERYS cutoff criteria:
-            #   1. Minimum 3 matched fragment ions
-            #   2. At least one matched fragment must be the predicted base
-            #      peak (most intense predicted fragment)
-            #   3. At least one matched fragment must be among the top-3
-            #      most-intense predicted fragments
-            # These hard cutoffs remove noise PSMs that would otherwise
-            # dilute the SVM training set.
-            _n_before_filter = len(results_df)
-            _min_frag_mask = results_df['matched_fragments'] >= 3
-
-            # For criteria 2 & 3, check per-PSM boolean fields computed
-            # during scan processing (compare matched ions against the FULL
-            # predicted spectrum, not just matched-ion intensities).
-            # Only apply when probabilistic deconv is active AND predictions
-            # actually succeeded (at least some PSMs have True values).
-            _base_peak_mask = pd.Series(True, index=results_df.index)
-            _top3_mask = pd.Series(True, index=results_df.index)
-            _pred_filter_applied = False
-            if _frag_usage == "probabilistic":
-                _has_bp = 'predicted_base_peak_matched' in results_df.columns
-                _has_t3 = 'predicted_top3_matched' in results_df.columns
-                _bp_any_true = _has_bp and results_df['predicted_base_peak_matched'].astype(bool).any()
-                _t3_any_true = _has_t3 and results_df['predicted_top3_matched'].astype(bool).any()
-                if _bp_any_true or _t3_any_true:
-                    if _has_bp:
-                        _base_peak_mask = results_df['predicted_base_peak_matched'].astype(bool)
-                    if _has_t3:
-                        _top3_mask = results_df['predicted_top3_matched'].astype(bool)
-                    _pred_filter_applied = True
-                else:
-                    logging.info(
-                        "Spurious PSM pre-filter: prediction coverage columns are all False — "
-                        "predictions likely unavailable. Skipping prediction-based criteria "
-                        "(applying min 3 fragments only)."
-                    )
-
-            _spurious_mask = _min_frag_mask & _base_peak_mask & _top3_mask
-            _n_spurious = (~_spurious_mask).sum()
-            if _n_spurious > 0:
-                results_df = results_df[_spurious_mask].copy()
-                _filter_desc = "min 3 fragments + predicted peak coverage" if _pred_filter_applied else "min 3 fragments"
-                logging.info(
-                    f"Spurious PSM pre-filter: removed {_n_spurious:,} of "
-                    f"{_n_before_filter:,} PSMs ({_filter_desc}). "
-                    f"{len(results_df):,} PSMs remain."
-                )
-            else:
-                logging.info("Spurious PSM pre-filter: all PSMs passed quality checks.")
-            gc.collect()
+            # NOTE: No hard PSM pre-filter is applied before Mokapot.
+            # Quality signals (matched_fragments, predicted_base_peak_matched,
+            # predicted_top3_matched, ...) are supplied to Mokapot as FEATURES,
+            # so the model weighs them in a calibrated way. Hard-filtering
+            # before FDR estimation preferentially removes decoys (their
+            # predicted spectra rarely match the observed chance peaks),
+            # shrinking the decoy population and making q-values
+            # anti-conservative. A quality gate for quantification is applied
+            # AFTER the FDR threshold instead (see below).
 
             # Prepare features and run Mokapot rescoring
             log_memory_usage("Before Mokapot")
@@ -10168,6 +10622,22 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
             logging.info(f"Applying FDR threshold of {fdr_threshold} on '{qvalue_col}'...")
             filtered_results_df = results_df[results_df[qvalue_col] <= fdr_threshold]
             logging.info(f"PSMs passing FDR threshold: {len(filtered_results_df)} out of {len(results_df)}")
+
+            # ── Post-FDR quantification quality gate ────────────────────────
+            # Applied AFTER FDR so it cannot bias the target/decoy statistics:
+            # PSMs quantified downstream must have at least 3 matched
+            # fragment ions (standard minimum for reliable PRM quant).
+            if 'matched_fragments' in filtered_results_df.columns:
+                _n_before_gate = len(filtered_results_df)
+                filtered_results_df = filtered_results_df[
+                    pd.to_numeric(filtered_results_df['matched_fragments'], errors='coerce').fillna(0) >= 3
+                ]
+                _n_gated = _n_before_gate - len(filtered_results_df)
+                if _n_gated > 0:
+                    logging.info(
+                        f"Quantification quality gate: excluded {_n_gated:,} FDR-passing PSMs "
+                        f"with <3 matched fragments; {len(filtered_results_df):,} PSMs remain for quant."
+                    )
             
             # Prepare data for Peptide Quantification sheet with selected quantification method
             logging.info("Aggregating peptide quantification (memory-safe)...")
@@ -10221,18 +10691,37 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
             # Filter out decoy peptides from peptide_quant_data
             peptide_quant_data = peptide_quant_data[~peptide_quant_data['peptide'].str.startswith('DECOY_')]
             
-            # Parse FASTA once and share across protein-quant and combined-results (Fix P6)
-            _fasta_proteins = parse_fasta_file(fasta_file_entry.get())
+            _fasta_path = (fasta_file_entry.get() or "").strip()
+            _has_fasta = bool(_fasta_path and os.path.isfile(_fasta_path))
+            if _has_fasta:
+                # Parse FASTA once and share across protein-quant and combined-results.
+                _fasta_proteins = parse_fasta_file(_fasta_path)
 
-            # Prepare data for Protein Quantification sheet based on selected method
-            protein_quantities = calculate_protein_quantities_with_method(
-                peptide_quant_data, fasta_file_entry.get(), mzml_files, quant_method,
-                proteins=_fasta_proteins)
-            
-            # Prepare data for Combined sheet based on selected method
-            combined_results = prepare_combined_results_with_method(
-                peptide_quant_data, protein_quantities, mzml_files, quant_method,
-                proteins=_fasta_proteins)
+                # Prepare data for Protein Quantification sheet based on selected method
+                protein_quantities = calculate_protein_quantities_with_method(
+                    peptide_quant_data, _fasta_path, mzml_files, quant_method,
+                    proteins=_fasta_proteins)
+
+                # Prepare data for Combined sheet based on selected method
+                combined_results = prepare_combined_results_with_method(
+                    peptide_quant_data, protein_quantities, mzml_files, quant_method,
+                    proteins=_fasta_proteins)
+            else:
+                logging.info("No FASTA file provided - skipping protein mapping/quantification.")
+                protein_quantities = pd.DataFrame([
+                    {
+                        'Accession': 'N/A',
+                        'Protein Name': 'No FASTA provided',
+                        'Peptides Used': 0,
+                    }
+                ])
+                combined_results = pd.DataFrame([
+                    {
+                        'Accession': '',
+                        'Protein Name': 'Combined protein view unavailable (no FASTA provided)',
+                        'Peptides Used': '',
+                    }
+                ])
             
             # ...after preparing combined_results...
             logging.debug(f"filtered_results_df shape: {filtered_results_df.shape}")
@@ -10246,10 +10735,10 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
             if peptide_quant_data.empty:
                 logging.error("No peptide quantification data. Nothing to save.")
                 return
-            if protein_quantities.empty:
+            if _has_fasta and protein_quantities.empty:
                 logging.error("No protein quantification data. Nothing to save.")
                 return
-            if combined_results.empty:
+            if _has_fasta and combined_results.empty:
                 logging.error("No combined results data. Nothing to save.")
                 return
 
@@ -10316,14 +10805,46 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                     logging.info("QC Metrics file excluded from output (disabled in Preferences)")
 
                 # --- EICs (optional) ---
-                if eic_records and include_eic_sheet_var.get():
-                    eic_df = pd.DataFrame(eic_records)
-                    if 'scan_number' in eic_df.columns:
-                        _scan_ext = eic_df['scan_number'].astype(str).str.extract(r'scan=(\d+)', expand=False)
-                        eic_df['scan_number'] = _scan_ext.fillna(eic_df['scan_number'])
-                    _eic_path = _output_path(output_file, 'EICs')
-                    logging.info(f"Writing {len(eic_records)} EIC data points to {_eic_path}")
-                    eic_df.to_csv(_eic_path, index=False)
+                if temp_eic_files and generate_eics:
+                    try:
+                        import pyarrow.dataset as ds
+                        import pyarrow.parquet as pq
+                    except ImportError:
+                        logging.error("Fatal: pyarrow is required for out-of-core EIC merging. Pip install pyarrow")
+                        return
+
+                    logging.info(f"Loading and combining {len(temp_eic_files)} EIC batch files out-of-core...")
+                    eic_df = pd.DataFrame() # fallback empty df
+                    try:
+                        dataset = ds.dataset(temp_eic_files, format="parquet")
+                        
+                        # If the user wants EIC exported, write it as a compact parquet file
+                        if include_eic_sheet_var.get():
+                            _eic_path = os.path.join(output_file, 'EICs.parquet')
+                            logging.info(f"Writing EIC data points out-of-core to {_eic_path}...")
+
+                            _rows_written = 0
+                            _writer = None
+                            try:
+                                for batch in dataset.scanner().to_reader():
+                                    if _writer is None:
+                                        _writer = pq.ParquetWriter(
+                                            _eic_path,
+                                            batch.schema,
+                                            compression='zstd'
+                                        )
+                                    _writer.write_batch(batch)
+                                    _rows_written += batch.num_rows
+                            finally:
+                                if _writer is not None:
+                                    _writer.close()
+
+                            logging.info(
+                                f"Successfully wrote {_rows_written:,} EIC rows to {_eic_path}"
+                            )
+                            
+                    except Exception as e:
+                        logging.error(f"Error combining out-of-core EIC chunks: {e}")
 
                 logging.info(f"Results successfully saved to folder: {output_file}")
 
@@ -10344,13 +10865,13 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
                     _excel_sheet_cache[(output_file, 'Peptide Quantification')] = peptide_quant_data.copy()
                     _excel_sheet_cache[(output_file, 'Protein Quantification')] = protein_quantities.copy()
                     _excel_sheet_cache[(output_file, 'Combined')] = combined_results.copy()
-                    if eic_records:
+                    if temp_eic_files and generate_eics:
                         # Reuse the DataFrame created for CSV export if available.
-                        # Avoid rebuilding a large DataFrame from eic_records again.
-                        if 'eic_df' in locals() and isinstance(eic_df, pd.DataFrame):
+                        if 'eic_df' in locals() and isinstance(eic_df, pd.DataFrame) and not eic_df.empty:
                             eic_df_cache = eic_df
                         else:
-                            eic_df_cache = pd.DataFrame(eic_records)
+                            # if not available, we won't memory-crush here. The UI caches it when requested.
+                            eic_df_cache = pd.DataFrame()
                         _excel_sheet_cache[(output_file, 'EICs')] = eic_df_cache
 
                         # Do not block run completion on heavy EIC indexing.
@@ -10369,6 +10890,14 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
             except Exception as e:
                 logging.error(f"Error saving results to {output_file}: {str(e)}")
                 raise
+                
+            try:
+                import shutil
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    logging.info(f"Cleaned up temporary out-of-core chunks at {temp_dir}")
+            except Exception as e:
+                pass
             
             # Calculate and log execution time
             logging.info(f"Total execution time: {time_str}")
@@ -10387,9 +10916,12 @@ def diagnose_all_peptides(prm_input_file, mzml_folder, output_file, stop_event, 
 def run_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file, log_widget, 
                  stop_event, thread_capacity, show_logs, precursor_tolerance, 
                  fragment_tolerance, precursor_unit, fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics, selected_neutral_losses=None,
-                 fragment_mz_lower=None, fragment_mz_upper=None, cleanup_mzml_paths=None):
+                 fragment_mz_lower=None, fragment_mz_upper=None, cleanup_mzml_paths=None,
+                 file_processing_timeout_minutes=360):
     global diagnosis_thread
     try:
+        # Re-assert sqlite thread-safe patch for consecutive runs in EXE mode.
+        _ensure_sqlite_threadsafe_patch()
         start_time = time.time()  # Start timing
         
         # Logging handler is managed globally by initialize_logging() /
@@ -10403,7 +10935,8 @@ def run_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file, log_widg
                                   thread_capacity, precursor_tolerance, fragment_tolerance,
                                   precursor_unit, fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics,
                                   selected_neutral_losses=selected_neutral_losses,
-                                  fragment_mz_lower=fragment_mz_lower, fragment_mz_upper=fragment_mz_upper)
+                                  fragment_mz_lower=fragment_mz_lower, fragment_mz_upper=fragment_mz_upper,
+                                  file_processing_timeout_minutes=file_processing_timeout_minutes)
                 
         # Get FASTA file path
         if fasta_file:
@@ -10449,7 +10982,7 @@ def start_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file,
                    precursor_tolerance, fragment_tolerance, precursor_unit, 
                    fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics, selected_neutral_losses=None,
                    fragment_mz_lower=None, fragment_mz_upper=None, clear_log=True,
-                   cleanup_mzml_paths=None):
+                   cleanup_mzml_paths=None, file_processing_timeout_minutes=360):
     """Start the diagnosis process with specified parameters"""
     global diagnosis_thread, cached_eic_data
     cached_eic_data = None  # Clear stale EIC data
@@ -10471,7 +11004,8 @@ def start_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file,
             log_widget, stop_event, thread_capacity, show_logs,
             precursor_tolerance, fragment_tolerance, precursor_unit,
             fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics, selected_neutral_losses,
-            fragment_mz_lower, fragment_mz_upper, cleanup_mzml_paths
+            fragment_mz_lower, fragment_mz_upper, cleanup_mzml_paths,
+            file_processing_timeout_minutes
         ),
         daemon=True
     )
@@ -10613,69 +11147,65 @@ def convert_raw_to_mzml(raw_path, output_folder, progress_bar=None, root=None):
         return None
 
 def generate_decoy_peptides(peptides):
-    """Generate decoy peptides using sequence reversal (standard target-decoy approach).
-    Returns list of (decoy_peptide, remapped_modification) tuples when called with modifications,
-    or list of decoy_peptide strings for backwards compatibility.
+    """Generate decoy peptides using pseudo-reversal (termini fixed).
+
+    Returns a list of decoy sequence strings prefixed with ``DECOY_``.
+    Modification remapping is handled separately by
+    :func:`remap_modification_for_decoy`.
     """
     decoy_peptides = []
     for peptide in peptides:
-        # Reverse the peptide sequence (standard method used by Comet, MaxQuant, Percolator)
-        # Keep first and last amino acids fixed (pseudo-reverse) to preserve tryptic termini
-        if len(peptide) > 2:
-            decoy_seq = peptide[0] + peptide[-2:0:-1] + peptide[-1]
-        else:
-            decoy_seq = peptide[::-1]
-        decoy_peptide = 'DECOY_' + decoy_seq
-        decoy_peptides.append(decoy_peptide)
+        decoy_peptides.append('DECOY_' + _pseudo_reverse_sequence(peptide))
     return decoy_peptides
 
 
-def remap_modification_for_decoy(modification, peptide_length):
+def _pseudo_reverse_sequence(peptide):
+    """Keep first and last residues; reverse the interior (Comet/MaxQuant style)."""
+    peptide = str(peptide)
+    if len(peptide) > 2:
+        return peptide[0] + peptide[-2:0:-1] + peptide[-1]
+    return peptide[::-1]
+
+
+def _pseudo_reverse_position(pos, peptide_length):
+    """Map a 1-based residue position through pseudo-reversal."""
+    if pos == 1 or pos == peptide_length:
+        return pos
+    if 2 <= pos <= peptide_length - 1:
+        return peptide_length + 1 - pos
+    return pos
+
+
+def remap_modification_for_decoy(modification, original_peptide):
     """Remap modification positions after pseudo-reversal.
-    
-    Pseudo-reversal keeps the first and last residues fixed, and reverses
-    positions 2..(n-1).
-    
-    Modification strings use **1-based** positions in brackets (e.g.
-    ``1xOxidation [M5]`` means residue 5, the 5th amino acid).  The
-    ``parse_modifications`` function converts these to 0-based internally.
-    
-    1-based mapping:
-      - p=1         -> 1           (first residue kept)
-      - p=n         -> n           (last residue kept)
-      - 2<=p<=n-1   -> n+1-p       (middle reversed)
-    
-    Handles both single-position (``[M5]``) and multi-position
-    (``[C4; C10]``) bracket entries by remapping every ``[A-Z]\\d+``
-    token found inside each bracket group.
+
+    The PTM travels with the amino acid. After reversing the interior
+    sequence, each ``[A-Z]\\d+`` token is rewritten with the residue letter
+    now at the mapped site in the decoy sequence (which matches the moved
+    amino acid when the position map is correct).
     """
     if not modification or (isinstance(modification, float) and np.isnan(modification)):
         return modification
-    
-    import re
-    
+
+    original_peptide = str(original_peptide)
+    n = len(original_peptide)
+    decoy_seq = _pseudo_reverse_sequence(original_peptide)
+
     def _remap_pos_in_bracket(bracket_match):
-        """Remap every residue-position token inside a ``[…]`` group."""
-        bracket_content = bracket_match.group(0)  # e.g. "[C4; C10]"
-        
+        bracket_content = bracket_match.group(0)
+
         def _remap_single(pos_match):
-            residue = pos_match.group(1)  # e.g. "C"
-            pos = int(pos_match.group(2))  # e.g. 4
-            # Apply pseudo-reversal mapping (1-based positions)
-            if pos == 1 or pos == peptide_length:
-                new_pos = pos  # endpoints stay fixed
-            elif 2 <= pos <= peptide_length - 1:
-                new_pos = peptide_length + 1 - pos  # middle is reversed
+            pos = int(pos_match.group(2))
+            new_pos = _pseudo_reverse_position(pos, n)
+            if 1 <= new_pos <= len(decoy_seq):
+                new_residue = decoy_seq[new_pos - 1]
             else:
-                new_pos = pos  # out of range, keep as-is
-            return f"{residue}{new_pos}"
-        
-        # Match each [A-Z]\d+ token inside the bracket (e.g. C4, C10, M5)
+                new_residue = pos_match.group(1)
+            return f"{new_residue}{new_pos}"
+
         return re.sub(r'([A-Z])(\d+)', _remap_single, bracket_content)
-    
-    # Match every bracket group [...] and remap positions inside each one
-    remapped = re.sub(r'\[[^\]]+\]', _remap_pos_in_bracket, str(modification))
-    return remapped
+
+    return re.sub(r'\[[^\]]+\]', _remap_pos_in_bracket, str(modification))
 
 def parse_fasta_file(fasta_file):
     """Parse FASTA file and return dictionary of sequences and protein names.
@@ -10847,6 +11377,7 @@ class _ThirdPartyWarningFilter(logging.Filter):
         'gpu will not be used',
         'wsl2',
         'directml',
+        '\x1b[a',
     )
 
     def filter(self, record):
@@ -10969,6 +11500,119 @@ if multiprocessing.current_process().name != 'MainProcess':
 
 # GUI setup
 root = tk.Tk()
+
+def _resolve_app_icon_path():
+    """Resolve app icon path for both source and PyInstaller builds."""
+    base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, 'icon.ico')
+
+def _load_splash_icon_image(icon_path, size=96):
+    """Load icon image for splash screen with graceful fallback."""
+    if not icon_path or not os.path.exists(icon_path):
+        return None
+
+    # Prefer Pillow for robust ICO decoding and resizing.
+    try:
+        from PIL import Image, ImageTk
+        img = Image.open(icon_path).convert('RGBA').resize((size, size), Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        pass
+
+    # Fallback for environments where Tk can open .ico directly.
+    try:
+        return tk.PhotoImage(file=icon_path)
+    except Exception:
+        return None
+
+def _show_startup_splash(root_window, icon_path):
+    """Create and display a centered startup splash while UI initializes."""
+    splash = tk.Toplevel(root_window)
+    splash.overrideredirect(True)
+    splash.attributes('-topmost', True)
+    splash.configure(bg='#e5e7eb')
+
+    width, height = 500, 320
+    screen_w = splash.winfo_screenwidth()
+    screen_h = splash.winfo_screenheight()
+    x = int((screen_w - width) / 2)
+    y = int((screen_h - height) / 2)
+    splash.geometry(f"{width}x{height}+{x}+{y}")
+
+    card = tk.Frame(splash, bg='white', bd=1, relief='solid')
+    card.place(relx=0.5, rely=0.5, anchor='center', width=488, height=308)
+
+    icon_img = _load_splash_icon_image(icon_path, size=96)
+    if icon_img is not None:
+        splash._icon_img = icon_img  # keep reference to avoid GC
+        tk.Label(card, image=icon_img, bg='white').pack(pady=(26, 10))
+    else:
+        tk.Label(card, text='ProteoPRM', bg='white', fg='#2e7d32',
+                 font=('Segoe UI', 18, 'bold')).pack(pady=(32, 10))
+
+    tk.Label(
+        card,
+        text='ProteoPRM',
+        bg='white',
+        fg='#111827',
+        font=('Segoe UI', 24, 'bold')
+    ).pack()
+
+    tk.Label(
+        card,
+        text='Peptide PRM Quantification Tool',
+        bg='white',
+        fg='#374151',
+        font=('Segoe UI', 11)
+    ).pack(pady=(4, 2))
+
+    tk.Label(
+        card,
+        text='Loading modules, models, and interface...',
+        bg='white',
+        fg='#6b7280',
+        font=('Segoe UI', 10)
+    ).pack(pady=(12, 10))
+
+    progress = ttk.Progressbar(card, mode='indeterminate', length=340)
+    progress.pack()
+    progress.start(12)
+
+    splash.update_idletasks()
+    splash.update()
+    return splash, progress
+
+_APP_ICON_PATH = _resolve_app_icon_path()
+_startup_splash = None
+_startup_splash_progress = None
+
+# Show splash immediately while the rest of the Tk UI is being constructed.
+try:
+    root.withdraw()
+    _startup_splash, _startup_splash_progress = _show_startup_splash(root, _APP_ICON_PATH)
+except Exception:
+    _startup_splash = None
+    _startup_splash_progress = None
+
+try:
+    import ctypes
+    # Ensure Windows correctly groups the taskbar icon instead of using the default python icon
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("proteoprm.quantification.app.1.0")
+except Exception:
+    pass
+
+# Set the window/taskbar icon if running from bundled executable or source repo
+try:
+    if os.path.exists(_APP_ICON_PATH):
+        root.iconbitmap(_APP_ICON_PATH)
+        try:
+            # Register as Tk default so future Toplevel windows inherit it.
+            root.iconbitmap(default=_APP_ICON_PATH)
+        except TypeError:
+            pass
+except Exception:
+    pass
+
 root.resizable(True, True)
 root.title("ProteoPRM - Peptide PRM Quantification Tool v1.0")
 sv_ttk.set_theme("light")  # Sun Valley theme — use "dark" for dark mode
@@ -11033,17 +11677,16 @@ prm_input_entry = ttk.Entry(frame, width=50, state='readonly')
 prm_input_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
 ToolTip(prm_input_entry,
         "CSV, TSV, or Excel file with target peptides.\n\n"
-        "Columns are read by POSITION (index), not by name.\n"
-        "Required order (6 columns minimum):\n\n"
-        "  Col 0 — Peptide Sequence  (plain amino acids, e.g. PEPTIDEK)\n"
-        "  Col 1 — Modifications  (e.g. 'C4(Carbamidomethyl)', or blank)\n"
-        "  Col 2 — Precursor m/z  (numeric, e.g. 523.7891)\n"
-        "  Col 3 — Charge  (integer, e.g. 2)\n"
-        "  Col 4 — Start RT [min]  (numeric)\n"
-        "  Col 5 — Stop RT [min]  (numeric)\n\n"
-        "Optional:\n"
-        "  Col 6 — Known RT [min]  (Top Apex RT; used for RT window override)\n\n"
-        "A header row is expected but column names are ignored.")
+        "Headers are matched when present (Sequence, Modifications, m/z, z,\n"
+        "Start [min], Stop [min], optional Top Apex RT [min]).\n\n"
+        "If headers are not recognized, columns are read by position:\n"
+        "  Col 0 — Peptide Sequence\n"
+        "  Col 1 — Modifications\n"
+        "  Col 2 — Precursor m/z\n"
+        "  Col 3 — Charge\n"
+        "  Col 4 — Start RT [min]\n"
+        "  Col 5 — Stop RT [min]\n"
+        "  Col 6 — Known / Top Apex RT [min] (optional)")
 ttk.Button(frame, text="Browse", command=lambda: browse_file(prm_input_entry, "prm")).grid(row=0, column=2, padx=5, pady=5, sticky='ew')
 
 ttk.Label(frame, text="Raw Files/mzML Folder:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
@@ -11723,15 +12366,37 @@ def get_selected_neutral_losses():
             selected.append(key)
     return selected
 
-def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file, log_widget, stop_event, thread_capacity, show_logs):
+def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta_file, log_widget, stop_event, thread_capacity, show_logs,
+                                 file_processing_timeout_minutes=360):
     global prm_file_valid
     
     fdr_threshold = fdr_threshold_var.get() / 100.0
     quant_method = quant_method_var.get()
     generate_eics = generate_eics_var.get()
 
-    if not prm_input_file or not mzml_folder or not output_file or not fasta_file:
-        messagebox.showerror("Error", "All fields are required!")
+    if not prm_input_file or not mzml_folder or not output_file:
+        messagebox.showerror("Error", "PRM input file, Raw Files/mzML folder, and Output folder are required.")
+        return
+
+    try:
+        if confirm_overwrite_var.get():
+            existing = _existing_result_outputs(output_file)
+            if existing:
+                proceed = messagebox.askyesno(
+                    "Overwrite results?",
+                    "The output folder already contains ProteoPRM result files:\n\n"
+                    + "\n".join(existing[:10])
+                    + ("\n..." if len(existing) > 10 else "")
+                    + "\n\nOverwrite these files?"
+                )
+                if not proceed:
+                    return
+    except Exception as exc:
+        logging.debug(f"Overwrite confirmation skipped: {exc}")
+
+    # FASTA is optional; validate only when user provided a path.
+    if fasta_file and not os.path.isfile(fasta_file):
+        messagebox.showerror("Error", "The selected FASTA file does not exist.")
         return
         
     # Check if PRM file is valid
@@ -11776,15 +12441,9 @@ def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta
             return
         # Check that reference peptides exist in the PRM input file
         try:
-            if prm_input_file.lower().endswith(('.xlsx', '.xls')):
-                _prm_df = pd.read_excel(prm_input_file)
-            elif prm_input_file.lower().endswith('.csv'):
-                _prm_df = pd.read_csv(prm_input_file)
-            elif prm_input_file.lower().endswith('.tsv'):
-                _prm_df = pd.read_csv(prm_input_file, sep='\t')
-            else:
-                _prm_df = pd.read_excel(prm_input_file)
-            _prm_peptides = set(_prm_df.iloc[:, 0].dropna().astype(str).str.strip().str.upper())
+            _prm_df = _read_tabular_input(prm_input_file)
+            _peptides, *_rest = _extract_prm_target_columns(_prm_df)
+            _prm_peptides = set(str(p).strip().upper() for p in _peptides if pd.notna(p))
             _missing = [p for p in _ref_peps if p not in _prm_peptides]
             if _missing:
                 messagebox.showerror("RT Drift Error",
@@ -11813,15 +12472,9 @@ def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta
             return
         # Check that reference peptides exist in the PRM input file
         try:
-            if prm_input_file.lower().endswith(('.xlsx', '.xls')):
-                _prm_df = pd.read_excel(prm_input_file)
-            elif prm_input_file.lower().endswith('.csv'):
-                _prm_df = pd.read_csv(prm_input_file)
-            elif prm_input_file.lower().endswith('.tsv'):
-                _prm_df = pd.read_csv(prm_input_file, sep='\t')
-            else:
-                _prm_df = pd.read_excel(prm_input_file)
-            _prm_peptides = set(_prm_df.iloc[:, 0].dropna().astype(str).str.strip().str.upper())
+            _prm_df = _read_tabular_input(prm_input_file)
+            _peptides, *_rest = _extract_prm_target_columns(_prm_df)
+            _prm_peptides = set(str(p).strip().upper() for p in _peptides if pd.notna(p))
             _missing = [p for p in _mass_ref_peps if p not in _prm_peptides]
             if _missing:
                 messagebox.showerror("Mass Drift Error",
@@ -12004,7 +12657,8 @@ def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta
                         fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics,
                         selected_neutral_losses=selected_neutral_losses,
                         clear_log=False,
-                        cleanup_mzml_paths=converted_mzml_paths if _cleanup_mzml else None
+                        cleanup_mzml_paths=converted_mzml_paths if _cleanup_mzml else None,
+                        file_processing_timeout_minutes=file_processing_timeout_minutes
                     )
 
                 # Schedule start_diagnosis on the main thread (it accesses tk widgets)
@@ -12039,7 +12693,8 @@ def validate_and_start_diagnosis(prm_input_file, mzml_folder, output_file, fasta
         log_widget, stop_event, thread_capacity, show_logs,
         precursor_tolerance, fragment_tolerance, precursor_unit, 
         fragment_unit, fragmentation_type, fdr_threshold, quant_method, generate_eics,
-        selected_neutral_losses=selected_neutral_losses
+        selected_neutral_losses=selected_neutral_losses,
+        file_processing_timeout_minutes=file_processing_timeout_minutes
     )
 
 progress_bar_height = 32
@@ -12385,7 +13040,8 @@ start_button = RoundedCanvasButton(button_frame, text="Start",
                             log_widget,
                             stop_event,
                             get_thread_capacity(thread_capacity_var_menu.get()),
-                            show_logs_var.get()
+                            show_logs_var.get(),
+                            file_processing_timeout_var.get()
                         ))
 start_button.grid(row=0, column=0, padx=10, pady=5, sticky='nsew')
 
@@ -12419,9 +13075,23 @@ def on_app_close():
 root.protocol("WM_DELETE_WINDOW", on_app_close)
 
 def calculate_protein_quantities_with_method(peptide_quant_data, fasta_file, mzml_files, quant_method="Both", proteins=None):
-    """Calculate protein quantities with configurable quantification method.
+    """Calculate protein quantities using UNIQUE peptides only.
 
-    Each peptide is reported under every protein it matches.
+    Rollup strategy (targeted-proteomics best practice):
+
+    - A peptide mapping to exactly ONE protein contributes its full
+      intensity/area to that protein.
+    - A peptide shared by 2+ proteins is NEVER summed into the individual
+      proteins: full-counting would double-count the same physical signal
+      into every mapped protein (a change in protein A would bleed into
+      protein B's numbers), and razor-style assignment would be biased by
+      the user's assay design (how many unique peptides happen to be
+      targeted per protein), not by biology. Instead, the shared peptide
+      rolls up into a PROTEIN GROUP row (Accession "P1;P2;...") so its
+      signal remains visible without being double-counted.
+    - 'Peptides Used' counts unique peptides for protein rows and shared
+      peptides for group rows. 'Shared Peptides (excluded)' lists, per
+      protein, the shared peptides that were excluded from its rollup.
 
     Parameters
     ----------
@@ -12453,38 +13123,82 @@ def calculate_protein_quantities_with_method(peptide_quant_data, fasta_file, mzm
     for pep in unique_peptides:
         pep_to_proteins[pep] = match_peptide_to_protein(pep, proteins=proteins)
 
+    def _new_row(accession, protein_name):
+        row = {
+            'Accession': accession,
+            'Protein_Name': protein_name,
+            'Peptides_Used': 0,
+            '_shared_excluded': set(),
+        }
+        if use_intensity:
+            for f in mzml_files:
+                row[f'{f}_intensity'] = 0
+        if use_area:
+            for f in mzml_files:
+                row[f'{f}_eic_area'] = 0
+        return row
+
+    def _add_quantities(row, idx):
+        row['Peptides_Used'] += 1
+        for f in mzml_files:
+            if use_intensity:
+                row[f'{f}_intensity'] += int_arrays[f][idx]
+            if use_area:
+                row[f'{f}_eic_area'] += area_arrays[f][idx]
+
+    n_shared_peptides = 0
     for idx in range(n_rows):
         peptide = peptides_arr[idx]
         matching = pep_to_proteins.get(peptide, [])
+        if not matching:
+            continue
 
-        for accession, protein_name in matching:
+        if len(matching) == 1:
+            # Unique peptide: full contribution to its single protein.
+            accession, protein_name = matching[0]
             if accession not in protein_quantities:
-                protein_quantities[accession] = {
-                    'Accession': accession,
-                    'Protein_Name': protein_name,
-                    'Peptides_Used': 0
-                }
-                if use_intensity:
-                    for f in mzml_files:
-                        protein_quantities[accession][f'{f}_intensity'] = 0
-                if use_area:
-                    for f in mzml_files:
-                        protein_quantities[accession][f'{f}_eic_area'] = 0
+                protein_quantities[accession] = _new_row(accession, protein_name)
+            _add_quantities(protein_quantities[accession], idx)
+        else:
+            # Shared peptide: roll up into a protein-group row only.
+            n_shared_peptides += 1
+            members = sorted(matching, key=lambda m: m[0])
+            group_acc = ';'.join(acc for acc, _name in members)
+            if group_acc not in protein_quantities:
+                group_name = 'Protein group (shared peptides): ' + '; '.join(
+                    name for _acc, name in members)
+                protein_quantities[group_acc] = _new_row(group_acc, group_name)
+            _add_quantities(protein_quantities[group_acc], idx)
 
-            protein_quantities[accession]['Peptides_Used'] += 1
-            for f in mzml_files:
-                if use_intensity:
-                    protein_quantities[accession][f'{f}_intensity'] += int_arrays[f][idx]
-                if use_area:
-                    protein_quantities[accession][f'{f}_eic_area'] += area_arrays[f][idx]
+            # Annotate every member protein so the exclusion is visible
+            # (creates a zero-quantity row if the protein has no unique
+            # peptides — an honest representation of what the data supports).
+            for accession, protein_name in members:
+                if accession not in protein_quantities:
+                    protein_quantities[accession] = _new_row(accession, protein_name)
+                protein_quantities[accession]['_shared_excluded'].add(str(peptide))
 
-    protein_df = pd.DataFrame(list(protein_quantities.values()))
-    
+    if n_shared_peptides:
+        logging.info(
+            f"Protein rollup: {n_shared_peptides} shared peptide entries were "
+            f"rolled up into protein-group rows (unique-peptide rollup; no double counting)."
+        )
+
+    rows = []
+    for row in protein_quantities.values():
+        row = dict(row)
+        shared = row.pop('_shared_excluded')
+        row['Shared_Peptides_Excluded'] = '; '.join(sorted(shared)) if shared else ''
+        rows.append(row)
+
+    protein_df = pd.DataFrame(rows)
+
     protein_df = protein_df.rename(columns={
         'Protein_Name': 'Protein Name',
-        'Peptides_Used': 'Peptides Used'
+        'Peptides_Used': 'Peptides Used',
+        'Shared_Peptides_Excluded': 'Shared Peptides (excluded)',
     })
-    
+
     return protein_df
 
 def prepare_combined_results_with_method(peptide_results, protein_quantities, mzml_files, quant_method="Both", fasta_file=None, proteins=None):
@@ -12508,29 +13222,37 @@ def prepare_combined_results_with_method(peptide_results, protein_quantities, mz
     
     combined_results = []
     
-    # Build protein data dict from protein_quantities DataFrame
+    # Build protein data dict from protein_quantities DataFrame.
+    # Keys include protein-group rows ("P1;P2") for shared peptides.
     protein_data = {}
     for row_dict in protein_quantities.to_dict('records'):
-        accession = row_dict['Accession']
-        pdata = {}
-        if use_intensity:
-            pdata.update({f'{f}_intensity': row_dict.get(f'{f}_intensity', 0) for f in mzml_files})
-        if use_area:
-            pdata.update({f'{f}_eic_area': row_dict.get(f'{f}_eic_area', 0) for f in mzml_files})
-        protein_data[accession] = pdata
+        protein_data[row_dict['Accession']] = row_dict
 
     # Pre-convert peptide rows to list-of-dicts (faster than repeated iterrows)
     peptide_rows = peptide_results.to_dict('records')
-    
-    # Iterate only quantified proteins, not full FASTA (Fix #4)
-    for accession in protein_data:
-        protein_info = proteins.get(accession)
-        if protein_info is None:
+
+    # Map each quantified peptide to its proteins once (consistent with the
+    # unique-only rollup in calculate_protein_quantities_with_method).
+    pep_group_key = {}
+    for prow in peptide_rows:
+        pep = str(prow['peptide'])
+        matching = match_peptide_to_protein(pep, proteins=proteins)
+        if not matching:
             continue
-        
-        protein_name = protein_info['name']
-        protein_seq = protein_info['sequence']
-        
+        # Rollup key: the single accession for unique peptides, the sorted
+        # joined accessions for shared peptides.
+        pep_group_key[pep] = ';'.join(sorted(acc for acc, _name in matching))
+
+    # Iterate only quantified proteins/groups, not full FASTA (Fix #4)
+    for accession, row_dict in protein_data.items():
+        # Resolve display name: FASTA for plain accessions, the group label
+        # stored by the rollup for "P1;P2" group accessions.
+        protein_info = proteins.get(accession)
+        if protein_info is not None:
+            protein_name = protein_info['name']
+        else:
+            protein_name = row_dict.get('Protein Name', accession)
+
         # Track header index for O(1) peptide-count update (Fix #2)
         protein_header_idx = len(combined_results)
         
@@ -12542,18 +13264,21 @@ def prepare_combined_results_with_method(peptide_results, protein_quantities, mz
         
         if use_intensity:
             for f in mzml_files:
-                protein_row[f'{f}_intensity'] = protein_data[accession].get(f'{f}_intensity', 0)
+                protein_row[f'{f}_intensity'] = row_dict.get(f'{f}_intensity', 0)
                 
         if use_area:
             for f in mzml_files:
-                protein_row[f'{f}_eic_area'] = protein_data[accession].get(f'{f}_eic_area', 0)
+                protein_row[f'{f}_eic_area'] = row_dict.get(f'{f}_eic_area', 0)
         
         combined_results.append(protein_row)
         
+        # List exactly the peptides whose quantities were rolled up into this
+        # row: unique peptides under their protein, shared peptides under
+        # their protein-group row.
         peptide_count = 0
         for prow in peptide_rows:
-            peptide = prow['peptide']
-            if peptide in protein_seq:
+            peptide = str(prow['peptide'])
+            if pep_group_key.get(peptide) == accession:
                 peptide_data = {
                     'Accession': '',
                     'Protein Name': peptide,
@@ -12674,7 +13399,7 @@ def plot_eic_for_peptide(peptide, mzml_file, mzml_folder, canvas_frame, theoreti
         _out_folder = output_file_entry.get()
         if not use_saved_eics and _out_folder and os.path.isdir(_out_folder):
             try:
-                _eic_file = _output_path(_out_folder, 'EICs')
+                _eic_file = _get_sheet_disk_path(_out_folder, 'EICs')
                 if os.path.isfile(_eic_file):
                     logging.debug("Using saved EIC data from output folder")
                     eic_df = _get_cached_excel_sheet(_out_folder, 'EICs')
@@ -13968,6 +14693,7 @@ def save_settings():
         # Add new parallel execution settings
         "file_conversion_concurrency": file_conversion_concurrency.get(),
         "cleanup_mzml": cleanup_mzml_var.get(),
+        "file_processing_timeout_minutes": file_processing_timeout_var.get(),
         # Add filter settings
         "rt_width": rt_width_var.get(),
         "fragment_mz_lower": fragment_mz_lower_entry.get(),
@@ -14108,6 +14834,11 @@ def load_settings():
         
         if "cleanup_mzml" in settings:
             cleanup_mzml_var.set(settings["cleanup_mzml"])
+        if "file_processing_timeout_minutes" in settings:
+            try:
+                file_processing_timeout_var.set(int(settings["file_processing_timeout_minutes"]))
+            except (TypeError, ValueError):
+                file_processing_timeout_var.set(360)
         
         # Load filter settings
         if "rt_width" in settings:
@@ -14385,6 +15116,7 @@ menu_bar.add_cascade(label="File", menu=file_menu)
 # ============================================================================
 file_conversion_concurrency = tk.IntVar(value=4)
 cleanup_mzml_var = tk.BooleanVar(value=False)
+file_processing_timeout_var = tk.IntVar(value=360)
 thread_capacity_var_menu = thread_capacity_var          # alias used by the dialog
 gpu_enabled_var = tk.BooleanVar(value=GPU_ENABLED)
 include_psm_sheet_var = tk.BooleanVar(value=True)
@@ -14404,7 +15136,7 @@ def open_preferences_dialog():
     """Open a tabbed Preferences dialog with all application settings."""
     pref_win = tk.Toplevel(root)
     pref_win.title("Preferences")
-    pref_win.geometry("560x480")
+    pref_win.geometry("560x540")
     pref_win.resizable(False, False)
 
     nb = ttk.Notebook(pref_win)
@@ -14486,41 +15218,58 @@ def open_preferences_dialog():
                     variable=thread_capacity_var_menu, value="Medium").grid(
                         row=7, column=0, columnspan=3, sticky='w', padx=8, pady=2)
 
+    ttk.Separator(perf_frame, orient='horizontal').grid(row=8, column=0, columnspan=3, sticky='ew', pady=10)
+
+    ttk.Label(perf_frame, text="File Processing Timeout",
+              font=('Segoe UI', 11, 'bold')).grid(row=9, column=0, columnspan=3, sticky='w', pady=(0, 6))
+    timeout_row = ttk.Frame(perf_frame)
+    timeout_row.grid(row=10, column=0, columnspan=3, sticky='w', padx=8, pady=2)
+    timeout_cap_label = ttk.Label(timeout_row, text="Timeout cap (minutes):")
+    timeout_cap_label.pack(side='left')
+    timeout_spinbox = ttk.Spinbox(
+        timeout_row,
+        from_=5,
+        to=360,
+        increment=5,
+        width=8,
+        textvariable=file_processing_timeout_var,
+    )
+    timeout_spinbox.pack(side='left', padx=(8, 6))
+    ToolTip(timeout_cap_label, "Used as the maximum per-file wait time.")
+    ToolTip(timeout_spinbox, "Used as the maximum per-file wait time.")
+
     # ---- GPU Acceleration tab -----------------------------------------------
-    _ensure_gpu_detected()   # lazy GPU detection — first time user opens prefs
+    gpu_detect_pending = (_gpu_info is None)
     gpu_frame = ttk.Frame(nb, padding=15)
     nb.add(gpu_frame, text="GPU Acceleration")
 
     ttk.Checkbutton(gpu_frame, text="Enable GPU Acceleration",
                     variable=gpu_enabled_var,
                     command=toggle_gpu_acceleration).grid(
-                        row=0, column=0, columnspan=2, sticky='w', pady=(0, 8))
+                        row=0, column=0, columnspan=2, sticky='w', pady=(0, 4))
+    ttk.Label(
+        gpu_frame,
+        text="Fragment matching uses the CPU. AlphaPeptDeep uses PyTorch CUDA when available.",
+        font=('Segoe UI', 9),
+    ).grid(row=1, column=0, columnspan=2, sticky='w', pady=(0, 8))
 
-    ttk.Separator(gpu_frame, orient='horizontal').grid(row=1, column=0, columnspan=2, sticky='ew', pady=4)
+    ttk.Separator(gpu_frame, orient='horizontal').grid(row=2, column=0, columnspan=2, sticky='ew', pady=4)
 
-    info_row = 2
-    gpu_info_text = f"Detected: {GPU_DEVICE_NAME}" if GPU_AVAILABLE else "No NVIDIA GPU detected"
-    ttk.Label(gpu_frame, text=gpu_info_text,
+    info_row = 3
+    gpu_info_var = tk.StringVar(
+        value=(
+            "Detecting GPU capabilities..."
+            if gpu_detect_pending
+            else (f"Detected: {GPU_DEVICE_NAME}" if GPU_AVAILABLE else "No NVIDIA GPU detected")
+        )
+    )
+    ttk.Label(gpu_frame, textvariable=gpu_info_var,
               font=('Segoe UI', 10)).grid(row=info_row, column=0, columnspan=2, sticky='w', pady=2)
     info_row += 1
 
-    if GPU_AVAILABLE:
-        ttk.Label(gpu_frame, text=f"Memory: {GPU_MEMORY_GB:.1f} GB").grid(
-            row=info_row, column=0, columnspan=2, sticky='w', padx=15, pady=1)
-        info_row += 1
-        ttk.Label(gpu_frame, text=f"Driver: {GPU_DRIVER_VERSION}   CUDA: {GPU_CUDA_VERSION}").grid(
-            row=info_row, column=0, columnspan=2, sticky='w', padx=15, pady=1)
-        info_row += 1
-
-        accel_parts = []
-        if CUPY_AVAILABLE:
-            accel_parts.append("CuPy")
-        if CUML_AVAILABLE:
-            accel_parts.append("cuML")
-        accel_str = ", ".join(accel_parts) if accel_parts else "None installed"
-        ttk.Label(gpu_frame, text=f"Accelerators: {accel_str}").grid(
-            row=info_row, column=0, columnspan=2, sticky='w', padx=15, pady=1)
-        info_row += 1
+    details_frame = ttk.Frame(gpu_frame)
+    details_frame.grid(row=info_row, column=0, columnspan=2, sticky='ew')
+    info_row += 1
 
     ttk.Separator(gpu_frame, orient='horizontal').grid(row=info_row, column=0, columnspan=2, sticky='ew', pady=8)
     info_row += 1
@@ -14528,43 +15277,106 @@ def open_preferences_dialog():
     btn_row_frame = ttk.Frame(gpu_frame)
     btn_row_frame.grid(row=info_row, column=0, columnspan=2, sticky='w')
 
-    if GPU_AVAILABLE and not CUPY_AVAILABLE:
-        def _quick_install():
-            ans = messagebox.askyesno("Install CuPy",
-                f"Install CuPy for GPU acceleration?\n\n"
-                f"GPU: {GPU_DEVICE_NAME}\nCUDA: {GPU_CUDA_VERSION}\n"
-                f"Package: {get_cupy_package_name(GPU_CUDA_VERSION)}\n\n"
-                f"This may take a few minutes.")
-            if not ans:
-                return
-            prog = tk.Toplevel(pref_win)
-            prog.title("Installing...")
-            prog.geometry("350x100")
-            prog.transient(pref_win)
-            ttk.Label(prog, text="Installing CuPy, please wait...",
-                      font=('Segoe UI', 10)).pack(pady=20)
-            pb = ttk.Progressbar(prog, mode='indeterminate', length=250)
-            pb.pack(pady=10); pb.start(10)
-            root.update()
-            def _do():
-                success, msg = auto_install_cupy_if_needed(GPU_CUDA_VERSION, force=True)
-                def _show():
-                    prog.destroy()
-                    if success:
-                        messagebox.showinfo("Success",
-                            "CuPy installed!\nRestart the application to enable GPU acceleration.")
-                    else:
-                        messagebox.showerror("Failed", f"Installation failed:\n{msg}")
-                root.after(0, _show)
-            threading.Thread(target=_do, daemon=True).start()
-        ttk.Button(btn_row_frame, text="Install CuPy Now...", command=_quick_install).pack(side='left', padx=5)
+    def _quick_install():
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo(
+                "Install CuPy from a venv",
+                "The packaged application cannot install Python packages.\n\n"
+                "Fragment matching already uses the CPU (faster for PRM).\n"
+                "AlphaPeptDeep uses PyTorch CUDA automatically when\n"
+                "torch.cuda.is_available() is True.\n\n"
+                "For CuPy in a source install:\n"
+                "  pip install cupy-cuda12x   # CUDA 12 drivers\n"
+                "  pip install cupy-cuda11x   # CUDA 11 drivers"
+            )
+            return
+        ans = messagebox.askyesno("Install CuPy",
+            f"Install CuPy for GPU acceleration?\n\n"
+            f"GPU: {GPU_DEVICE_NAME}\nCUDA: {GPU_CUDA_VERSION}\n"
+            f"Package: {get_cupy_package_name(GPU_CUDA_VERSION)}\n\n"
+            f"This may take a few minutes.")
+        if not ans:
+            return
+        prog = tk.Toplevel(pref_win)
+        prog.title("Installing...")
+        prog.geometry("350x100")
+        prog.transient(pref_win)
+        ttk.Label(prog, text="Installing CuPy, please wait...",
+                  font=('Segoe UI', 10)).pack(pady=20)
+        pb = ttk.Progressbar(prog, mode='indeterminate', length=250)
+        pb.pack(pady=10); pb.start(10)
+        root.update()
 
-    ttk.Button(btn_row_frame, text="GPU Diagnostics...", command=show_gpu_diagnostics).pack(side='left', padx=5)
+        def _do():
+            success, msg = auto_install_cupy_if_needed(GPU_CUDA_VERSION, force=True)
+
+            def _show():
+                prog.destroy()
+                if success:
+                    messagebox.showinfo("Success",
+                        "CuPy installed!\nRestart the application to enable GPU acceleration.")
+                else:
+                    messagebox.showerror("Failed", f"Installation failed:\n{msg}")
+
+            root.after(0, _show)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _render_gpu_details():
+        for w in details_frame.winfo_children():
+            w.destroy()
+        for w in btn_row_frame.winfo_children():
+            w.destroy()
+
+        if GPU_AVAILABLE:
+            ttk.Label(details_frame, text=f"Memory: {GPU_MEMORY_GB:.1f} GB").grid(
+                row=0, column=0, columnspan=2, sticky='w', padx=15, pady=1)
+            ttk.Label(details_frame, text=f"Driver: {GPU_DRIVER_VERSION}   CUDA: {GPU_CUDA_VERSION}").grid(
+                row=1, column=0, columnspan=2, sticky='w', padx=15, pady=1)
+
+            accel_parts = []
+            if CUPY_AVAILABLE:
+                accel_parts.append("CuPy")
+            if CUML_AVAILABLE:
+                accel_parts.append("cuML")
+            accel_str = ", ".join(accel_parts) if accel_parts else "None installed"
+            ttk.Label(details_frame, text=f"Accelerators: {accel_str}").grid(
+                row=2, column=0, columnspan=2, sticky='w', padx=15, pady=1)
+
+        if GPU_AVAILABLE and not CUPY_AVAILABLE and not getattr(sys, 'frozen', False):
+            ttk.Button(btn_row_frame, text="Install CuPy Now...", command=_quick_install).pack(side='left', padx=5)
+
+        ttk.Button(btn_row_frame, text="GPU Diagnostics...", command=show_gpu_diagnostics).pack(side='left', padx=5)
+
+    _render_gpu_details()
 
     # ---- Dialog buttons -----------------------------------------------------
     btn_frame = ttk.Frame(pref_win)
     btn_frame.pack(fill='x', padx=10, pady=10)
     ttk.Button(btn_frame, text="Close", command=pref_win.destroy).pack(side='right', padx=5)
+
+    # Run first-time GPU detection in the background so Preferences opens instantly.
+    if gpu_detect_pending:
+        def _detect_gpu_for_preferences():
+            try:
+                _ensure_gpu_detected(auto_install=False)
+            except Exception as exc:
+                logging.warning(f"Background GPU detection failed: {exc}")
+
+            def _refresh_gpu_label():
+                try:
+                    if pref_win.winfo_exists():
+                        gpu_info_var.set(
+                            f"Detected: {GPU_DEVICE_NAME}"
+                            if GPU_AVAILABLE else "No NVIDIA GPU detected"
+                        )
+                        _render_gpu_details()
+                except Exception:
+                    pass
+
+            root.after(0, _refresh_gpu_label)
+
+        threading.Thread(target=_detect_gpu_for_preferences, daemon=True).start()
 
 # ============================================================================
 # GPU DIAGNOSTICS DIALOG  (moved here so it can be called from Preferences)
@@ -14649,10 +15461,18 @@ Platform: {sys.platform}
 
     def refresh_detection():
         diag_window.destroy()
-        detect_gpu()
+        detect_gpu(auto_install=False)
         show_gpu_diagnostics()
 
     def install_cupy_now():
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo(
+                "Not available in the packaged app",
+                "Automatic CuPy install is disabled in ProteoPRM.exe.\n\n"
+                "Install CuPy in a Python 3.11 virtual environment instead:\n"
+                f"  pip install {get_cupy_package_name(GPU_CUDA_VERSION)}"
+            )
+            return
         if not GPU_AVAILABLE:
             messagebox.showwarning("No GPU", "No NVIDIA GPU detected.")
             return
@@ -14695,7 +15515,7 @@ Platform: {sys.platform}
 
     ttk.Button(btn_frame, text="Copy to Clipboard", command=copy_to_clipboard).pack(side='left', padx=5)
     ttk.Button(btn_frame, text="Refresh Detection", command=refresh_detection).pack(side='left', padx=5)
-    if GPU_AVAILABLE and not CUPY_AVAILABLE:
+    if GPU_AVAILABLE and not CUPY_AVAILABLE and not getattr(sys, 'frozen', False):
         ttk.Button(btn_frame, text="Install CuPy Now", command=install_cupy_now).pack(side='left', padx=5)
     ttk.Button(btn_frame, text="Close", command=diag_window.destroy).pack(side='right', padx=5)
 
@@ -15129,7 +15949,7 @@ settings_menu.add_command(label="Manage Chemical Modifications",
 settings_menu.add_command(label="Calibrate AlphaPeptDeep Model...",
                           command=open_apd_calibration_dialog)
 settings_menu.add_separator()
-settings_menu.add_command(label="Preferences...", command=open_preferences_dialog)
+settings_menu.add_command(label="Preferences", command=open_preferences_dialog)
 menu_bar.add_cascade(label="Settings", menu=settings_menu)
 
 # Add Help menu
@@ -15285,7 +16105,7 @@ def show_user_guide():
             'A single folder containing your .mzML, Thermo .raw, Sciex .wiff, or Bruker .d files. '
             'Vendor formats are converted to mzML automatically via ProteoWizard msconvert.')
     _bullet(t, 'Protein FASTA File',
-            'Standard FASTA file with target protein sequences for peptide\u2013protein mapping '
+            'Standard FASTA file with target protein sequences for peptide\u2013protein mapping (optional) '
             'and roll-up quantification.')
     _blank(t)
     _tip(t, 'You can generate a PRM input file from a Proteome Discoverer PSM export using '
@@ -15427,7 +16247,12 @@ def show_user_guide():
     _blank(t)
 
     _h3(t, 'How is protein quantification calculated?')
-    _p(t, 'Peptide quantities are rolled up to protein level by summing peptide intensities.')
+    _p(t, 'Peptide quantities are rolled up to protein level by summing UNIQUE peptides only '
+          '(peptides that map to exactly one protein in the FASTA). Peptides shared by two or '
+          'more proteins are never double-counted: they roll up into a separate protein-group '
+          'row (e.g. Accession "P1;P2") and are listed per protein in the '
+          '"Shared Peptides (excluded)" column. Compare protein quantities across samples for '
+          'the same protein; summed intensities are not comparable between different proteins.')
     _blank(t)
 
     _h3(t, 'Can I re-run quantification without reprocessing spectra?')
@@ -15489,7 +16314,7 @@ def add_tooltips():
     ToolTip(prm_input_entry, "Excel file with peptide sequences, m/z values, and retention time windows")
     ToolTip(mzml_folder_entry, "Folder containing mzML files or vendor raw files to be analyzed")
     ToolTip(output_file_entry, "Location to save the analysis results")
-    ToolTip(fasta_file_entry, "FASTA file with protein sequences for peptide-to-protein mapping")
+    ToolTip(fasta_file_entry, "FASTA file with protein sequences for peptide-to-protein mapping (optional)")
     
     # Parameter tooltips
     ToolTip(precursor_tolerance_entry, "Maximum allowed difference between expected and observed precursor m/z values")
@@ -15503,10 +16328,6 @@ def add_tooltips():
 
 # Call add_tooltips after the main GUI is set up
 add_tooltips()
-
-# Call add_tooltips after the main GUI is set up
-add_tooltips()
-
 
 # ============================================================================
 # SPECTRAL PREDICTION QC VIEWER
@@ -20505,7 +21326,8 @@ def open_rt_predictor():
 
         try:
             with open(fp, 'wb') as fh:
-                pickle.dump(payload, fh)
+                fh.write(_RT_MODEL_MAGIC)
+                pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
             status_var.set(f"Model saved: {os.path.basename(fp)}")
             messagebox.showinfo("Model Saved", f"Trained model saved to:\n{fp}", parent=win)
         except Exception as exc:
@@ -20522,7 +21344,22 @@ def open_rt_predictor():
 
         try:
             with open(fp, 'rb') as fh:
-                payload = pickle.load(fh)
+                header = fh.read(len(_RT_MODEL_MAGIC))
+                if header == _RT_MODEL_MAGIC:
+                    payload = pickle.load(fh)
+                else:
+                    # Legacy files have no magic header. Ask before unpickling.
+                    proceed = messagebox.askyesno(
+                        "Unverified model file",
+                        "This file does not have a ProteoPRM RT model header.\n\n"
+                        "Loading pickle files from untrusted sources can execute code.\n"
+                        "Load it only if you saved this model yourself?",
+                        parent=win,
+                    )
+                    if not proceed:
+                        return
+                    fh.seek(0)
+                    payload = pickle.load(fh)
         except Exception as exc:
             messagebox.showerror("Load Error", f"Could not load model:\n{exc}", parent=win)
             return
@@ -21113,14 +21950,17 @@ def validate_modifications_from_dataframe(df, file_path=""):
         return False
     
 def cache_eic_data(output_folder):
-    """Load and cache EIC data from the output folder's EICs.csv file."""
+    """Load and cache EIC data from output folder (Parquet-first, CSV fallback)."""
     global cached_eic_data
     try:
-        eic_file = _output_path(output_folder, 'EICs')
+        eic_file = _get_sheet_disk_path(output_folder, 'EICs')
         if os.path.isfile(eic_file):
             # Use a dictionary to store data by peptide+file for faster lookups
             cached_eic_data = {}
-            eic_df = pd.read_csv(eic_file)
+            if str(eic_file).lower().endswith('.parquet'):
+                eic_df = pd.read_parquet(eic_file)
+            else:
+                eic_df = pd.read_csv(eic_file)
             
             # Pre-organize data by peptide and file for quick access
             _eic_keys = eic_df['peptide'].astype(str) + '_' + eic_df['file'].astype(str)
@@ -21137,7 +21977,7 @@ def cache_eic_data(output_folder):
 def cache_eic_data_hdf5(output_folder):
     """Load and cache EIC data using HDF5 for better performance"""
     global cached_eic_data_index
-    eic_file = _output_path(output_folder, 'EICs')
+    eic_file = _get_sheet_disk_path(output_folder, 'EICs')
     hdf_cache_file = os.path.join(output_folder, 'eic_cache.h5')
     
     try:
@@ -21145,8 +21985,11 @@ def cache_eic_data_hdf5(output_folder):
         if (not os.path.exists(hdf_cache_file) or 
             (os.path.isfile(eic_file) and os.path.getmtime(eic_file) > os.path.getmtime(hdf_cache_file))):
             
-            # Read from CSV and save to HDF5
-            eic_df = pd.read_csv(eic_file)
+            # Read from Parquet/CSV and save to HDF5
+            if str(eic_file).lower().endswith('.parquet'):
+                eic_df = pd.read_parquet(eic_file)
+            else:
+                eic_df = pd.read_csv(eic_file)
             eic_df.to_hdf(hdf_cache_file, key='eics', mode='w')
             
             # Create an index of available peptides and files
@@ -21190,5 +22033,21 @@ initialize_modifications()
 
 # Initialize log display
 toggle_logs(log_widget, show_logs, buffer_handler, widget_handler)
+
+# Main window is ready; close splash and present UI.
+try:
+    if _startup_splash_progress is not None:
+        _startup_splash_progress.stop()
+    if _startup_splash is not None and _startup_splash.winfo_exists():
+        _startup_splash.destroy()
+except Exception:
+    pass
+
+root.deiconify()
+root.lift()
+try:
+    root.focus_force()
+except Exception:
+    pass
 
 root.mainloop()

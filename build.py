@@ -7,7 +7,6 @@ and creates an optional ZIP archive for download.
 
 Usage
 -----
-  cd Executable
   python build.py                  # full build + assemble + zip
   python build.py --no-zip         # build + assemble, skip zip
   python build.py --viewer-only    # rebuild viewer EXE only
@@ -29,7 +28,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-HERE        = Path(__file__).resolve().parent          # Executable/
+HERE        = Path(__file__).resolve().parent         
 
 # Use a local temporary path for build to avoid 4-hour OneDrive sync bottleneck
 LOCAL_TEMP  = Path(os.environ.get('TEMP', 'C:/Temp')) / 'PRM_Build_Work'

@@ -73,6 +73,19 @@ if _fisher_spec and _fisher_spec.submodule_search_locations:
     if (_fisher_pkg / 'dll').is_dir():
         datas.append((str(_fisher_pkg / 'dll'), 'fisher_py/dll'))
 
+# pythonnet and clr_loader (required for fisher_py to initialize .NET environment properly)
+_pythonnet_spec = _ilu.find_spec('pythonnet')
+if _pythonnet_spec and _pythonnet_spec.submodule_search_locations:
+    _pynet_pkg = Path(_pythonnet_spec.submodule_search_locations[0])
+    if (_pynet_pkg / 'runtime').is_dir():
+        datas.append((str(_pynet_pkg / 'runtime'), 'pythonnet/runtime'))
+
+_clr_loader_spec = _ilu.find_spec('clr_loader')
+if _clr_loader_spec and _clr_loader_spec.submodule_search_locations:
+    _clr_loader_pkg = Path(_clr_loader_spec.submodule_search_locations[0])
+    if (_clr_loader_pkg / 'ffi').is_dir():
+        datas.append((str(_clr_loader_pkg / 'ffi'), 'clr_loader/ffi'))
+
 # alphabase package data (required by peptdeep/alphabase runtime)
 _alphabase_spec = _ilu.find_spec('alphabase')
 if _alphabase_spec and _alphabase_spec.submodule_search_locations:
@@ -88,6 +101,9 @@ if _xgboost_spec and _xgboost_spec.submodule_search_locations:
     _xgb_lib = _xgboost_pkg / 'lib'
     if _xgb_lib.is_dir():
         datas.append((str(_xgb_lib), 'xgboost/lib'))
+    _xgb_version = _xgboost_pkg / 'VERSION'
+    if _xgb_version.is_file():
+        datas.append((str(_xgb_version), 'xgboost'))
 
 # calibrated_apd_models: ship only the manifest.json seed so the folder
 # exists next to the EXE and the code doesn't error on first launch.
@@ -174,11 +190,19 @@ hidden = [
 from PyInstaller.utils.hooks import collect_all
 my_binaries = []
 
-for pkg in ['fisher_py', 'peptdeep', 'ms2pip', 'deeplc', 'xgboost']:
-    d, b, h = collect_all(pkg)
+for pkg in ['fisher_py', 'peptdeep', 'ms2pip', 'deeplc']:
+    # Some third-party packages expose test-only submodules that import
+    # optional dependencies (for example: hypothesis). Ignore those failures
+    # so packaging can continue with runtime-relevant modules.
+    d, b, h = collect_all(pkg, on_error='ignore')
     datas.extend(d)
     my_binaries.extend(b)
     hidden.extend(h)
+
+# NOTE:
+# Do not use collect_all('xgboost'): xgboost.testing imports pytest/hypothesis
+# and can fail in PyInstaller's isolated child process. We already include
+# xgboost runtime assets via hiddenimports + xgboost/lib data collection above.
 
 
 a = Analysis(
