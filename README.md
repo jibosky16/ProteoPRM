@@ -58,7 +58,7 @@ ProteoPRM is an automated Python GUI for targeted PRM proteomics analysis. It el
 - **Python:** 3.11 recommended (required for the full dependency stack).
 - **RAM:** 8 GB minimum, 16 GB+ recommended for large datasets.
 - **Disk:** ~2 GB for dependencies; additional space for raw files and results.
-- **GPU (optional):** NVIDIA GPU with a CUDA 12-capable driver for AlphaPeptDeep (PyTorch). CPU is the default and is used for fragment matching. AMD/Intel GPUs are not used. Do not install `cupy-cuda12x` unless you have a matching NVIDIA driver; see comments in `requirements.txt`.
+- **GPU (optional):** Any CUDA-capable NVIDIA GPU accelerates AlphaPeptDeep spectrum/RT prediction and calibration via PyTorch — `setup_venv.py` detects the GPU and installs the right CUDA PyTorch build automatically, so it works out of the box. Fragment matching intentionally runs on CPU (faster for PRM). AMD/Intel GPUs are not CUDA-capable; those systems run fully on CPU.
 - **ProteoWizard:** Required for automatic vendor raw file conversion. Install from [proteowizard.sourceforge.net](https://proteowizard.sourceforge.net) and ensure `msconvert` is on your system `PATH`.
 
 ---
@@ -367,15 +367,20 @@ ProteoPRM is packaged as a standalone executable using PyInstaller.
 # Activate the virtual environment
 .\venv311\Scripts\Activate.ps1
 
-# Run the build script
-python build.py
+# Build BOTH the CPU suite and the CUDA GPU suite (recommended)
+python build.py --both
 ```
+
+That produces `dist/ProteoPRM_Suite_CPU/` and `dist/ProteoPRM_Suite_GPU/` (plus dated ZIPs). The GPU suite uses NVIDIA GPUs automatically and still runs on machines without one. The Results Viewer is built once and copied into both suites.
 
 Build options:
 
 | Flag | Description |
 |---|---|
-| `python build.py` | Build the full ProteoPRM Suite (main app + results viewer) |
+| `python build.py --both` | Build CPU and GPU suites (installs each PyTorch wheel in turn) |
+| `python build.py --cpu` | Build only the CPU suite (`ProteoPRM_Suite_CPU`) |
+| `python build.py --gpu` | Build only the CUDA GPU suite (`ProteoPRM_Suite_GPU`) |
+| `python build.py` | Build the full suite with the currently installed PyTorch wheel |
 | `python build.py --main-only` | Build only the main ProteoPRM application |
 | `python build.py --viewer-only` | Build only the Results Viewer |
 | `python build.py --no-zip` | Skip creating the distribution ZIP |

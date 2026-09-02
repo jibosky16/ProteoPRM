@@ -7,7 +7,10 @@ and creates an optional ZIP archive for download.
 
 Usage
 -----
-  python build.py                  # full build + assemble + zip
+  python build.py --both           # CPU + GPU suites (recommended)
+  python build.py --cpu            # CPU-only suite
+  python build.py --gpu            # CUDA GPU suite (also runs on CPU machines)
+  python build.py                  # full build with currently installed torch
   python build.py --no-zip         # build + assemble, skip zip
   python build.py --viewer-only    # rebuild viewer EXE only
   python build.py --main-only      # rebuild main app only
@@ -43,6 +46,12 @@ SUITE_NAME  = 'ProteoPRM_Suite'
 SUITE_DIR   = DIST / SUITE_NAME
 LOCAL_SUITE = HERE / 'dist' / SUITE_NAME
 
+# Must match setup_venv.py / requirements.txt. CUDA wheels include kernels for
+# all NVIDIA architectures PyTorch supports; CPU wheels keep the suite small.
+TORCH_PIN         = 'torch==2.10.0'
+TORCH_CPU_INDEX   = 'https://download.pytorch.org/whl/cpu'
+TORCH_CUDA_INDEX  = 'https://download.pytorch.org/whl/cu124'
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,6 +73,87 @@ def _run(cmd, label):
 
 def _find_python():
     return sys.executable
+
+
+def _suite_layout(variant=None):
+    """Return (suite_name, temp_suite_dir, project_suite_dir) for a torch variant."""
+    if variant in ('CPU', 'GPU'):
+        name = f'ProteoPRM_Suite_{variant}'
+    else:
+        name = SUITE_NAME
+    return name, DIST / name, HERE / 'dist' / name
+
+
+def _torch_info_subprocess():
+    """
+    Query torch in a fresh interpreter so a prior import (or a pip
+    reinstall mid-build) cannot leave this process with a stale module.
+    """
+    probe = (
+        'import torch; '
+        'print(torch.__version__); '
+        'print(getattr(getattr(torch, "version", None), "cuda", None) or "")'
+    )
+    result = subprocess.run(
+        [_find_python(), '-c', probe],
+        capture_output=True, text=True, timeout=300, cwd=str(HERE),
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or 'unknown error').strip()
+        raise RuntimeError(f'torch probe failed: {err}')
+    lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    version = lines[0] if lines else 'unknown'
+    cuda = lines[1] if len(lines) > 1 else ''
+    return version, cuda
+
+
+def install_torch(variant):
+    """Install the CPU or CUDA PyTorch wheel matching TORCH_PIN."""
+    if variant == 'GPU':
+        index = TORCH_CUDA_INDEX
+        label = 'CUDA PyTorch'
+    elif variant == 'CPU':
+        index = TORCH_CPU_INDEX
+        label = 'CPU PyTorch'
+    else:
+        raise ValueError(f'Unknown torch variant: {variant}')
+
+    print(f'\n  Installing {label} ({TORCH_PIN}) from {index}')
+    print('  This can take several minutes (CUDA wheel is ~2.5 GB).')
+    _run(
+        [_find_python(), '-m', 'pip', 'install', '--force-reinstall',
+         TORCH_PIN, '--index-url', index],
+        f'Install {label}',
+    )
+    version, cuda = _torch_info_subprocess()
+    if variant == 'GPU' and not cuda:
+        raise RuntimeError(
+            f'Installed torch {version} is still CPU-only after CUDA install. '
+            f'Check network access to {index}.'
+        )
+    if variant == 'CPU' and cuda:
+        raise RuntimeError(
+            f'Installed torch {version} still reports CUDA {cuda} after CPU install.'
+        )
+    print(f'  [OK]  torch {version}  (CUDA {cuda or "none"})')
+    return version, cuda
+
+
+def ensure_torch(variant):
+    """Install CPU/CUDA torch only if the current wheel does not already match."""
+    try:
+        version, cuda = _torch_info_subprocess()
+        have_cuda = bool(cuda)
+        want_cuda = variant == 'GPU'
+        if have_cuda == want_cuda:
+            print(f'  [OK]  torch {version} already matches {variant} '
+                  f'(CUDA {cuda or "none"}) — skipping reinstall.')
+            return version, cuda
+        print(f'  Current torch {version} (CUDA {cuda or "none"}) does not match '
+              f'{variant}; switching wheels.')
+    except Exception as exc:
+        print(f'  [!] Could not probe torch ({exc}); installing {variant} wheel.')
+    return install_torch(variant)
 
 
 def _pyinstaller():
@@ -175,6 +265,36 @@ def _ensure_pyinstaller_metadata_health():
         )
 
 
+def report_torch_build():
+    """
+    Report whether the build environment's PyTorch is a CUDA or CPU build.
+
+    The packaged EXE ships with whatever torch is installed HERE, so this
+    single decision determines whether end users get GPU AlphaPeptDeep
+    prediction out of the box:
+
+      * CUDA torch in build env -> GPU suite that uses any supported NVIDIA
+        GPU automatically and still runs fine on CPU-only machines.
+      * CPU torch in build env  -> smaller CPU suite, predictions always on CPU.
+
+    `python build.py --both` installs each wheel in turn and produces both suites.
+    """
+    try:
+        version, cuda = _torch_info_subprocess()
+        if cuda:
+            print(f'  [OK]  PyTorch {version} — CUDA {cuda} build')
+            print('        -> The packaged EXE will use NVIDIA GPUs automatically')
+            print('           (and falls back to CPU on machines without one).')
+        else:
+            print(f'  [OK]  PyTorch {version} — CPU-ONLY build')
+            print('        -> This wheel produces the CPU suite.')
+            print('           Use `python build.py --gpu` or `--both` for CUDA.')
+        return version, cuda
+    except Exception as exc:
+        print(f'  [X]   PyTorch not usable in the build environment: {exc}')
+        return None, None
+
+
 # ---------------------------------------------------------------------------
 # Dependency check
 # ---------------------------------------------------------------------------
@@ -184,6 +304,7 @@ def check_dependencies():
     _prune_broken_dist_info()
     _ensure_setuptools_pkg_resources_compat()
     _ensure_pyinstaller_metadata_health()
+    report_torch_build()
 
     required = {
         'PyInstaller': 'PyInstaller',
@@ -279,24 +400,15 @@ def build_viewer():
     )
 
 
-def assemble():
+def assemble(variant=None):
     """
-    Merge both build outputs into a single ProteoPRM_Suite/ delivery folder.
+    Merge both build outputs into a delivery folder.
 
-    Final layout of ProteoPRM_Suite/:
-      ProteoPRM.exe                       main launcher
-      ProteoPRM_Results_Viewer.exe        viewer (one-file, placed here)
-      _internal/                          Python runtime + shared DLLs
-      ms2pip_models/                      MS2PIP XGBoost model files
-      AlphaPeptDeep pretrained_models_v3/ APD pretrained model weights
-      Trained RT Models/                  .rtmodel files for RT prediction
-      calibrated_apd_models/              user-writable; manifest seed only
-      unimod.csv / unimod.xml
-      GradBoost.rtmodel
-      icon.ico
+    variant: 'CPU', 'GPU', or None (legacy ProteoPRM_Suite/).
     """
+    suite_name, suite_dir, local_suite = _suite_layout(variant)
     _hr()
-    print('Stage 3/3 - Assembling ProteoPRM_Suite/ ...')
+    print(f'Stage 3/3 - Assembling {suite_name}/ ...')
 
     main_dist   = DIST / 'ProteoPRM'
     viewer_exe  = DIST / 'ProteoPRM_Results_Viewer.exe'
@@ -307,15 +419,15 @@ def assemble():
             'Run build_main() first.'
         )
 
-    if SUITE_DIR.exists():
-        shutil.rmtree(SUITE_DIR)
-        print(f'  Removed old {SUITE_DIR.name}/')
+    if suite_dir.exists():
+        shutil.rmtree(suite_dir)
+        print(f'  Removed old {suite_dir.name}/')
 
-    shutil.copytree(str(main_dist), str(SUITE_DIR))
-    print(f'  Copied ProteoPRM dist -> {SUITE_DIR.name}/')
+    shutil.copytree(str(main_dist), str(suite_dir))
+    print(f'  Copied ProteoPRM dist -> {suite_dir.name}/')
 
     if viewer_exe.is_file():
-        dest = SUITE_DIR / viewer_exe.name
+        dest = suite_dir / viewer_exe.name
         shutil.copy2(str(viewer_exe), str(dest))
         mb = dest.stat().st_size / 1024 / 1024
         print(f'  Copied ProteoPRM_Results_Viewer.exe  ({mb:.1f} MB)')
@@ -323,51 +435,53 @@ def assemble():
         print(f'  [!] Viewer EXE not found at {viewer_exe} - skipped.')
 
     total_mb = sum(
-        f.stat().st_size for f in SUITE_DIR.rglob('*') if f.is_file()
+        f.stat().st_size for f in suite_dir.rglob('*') if f.is_file()
     ) / 1024 / 1024
     print(f'  Suite total size : {total_mb:.1f} MB')
-    print(f'  Output path      : {SUITE_DIR}')
+    print(f'  Output path      : {suite_dir}')
 
     print(f'  Copying final suite to project folder (OneDrive) ...')
-    LOCAL_SUITE.parent.mkdir(parents=True, exist_ok=True)
-    # Use robocopy /MIR for OneDrive-resilient mirroring (handles file locks)
+    local_suite.parent.mkdir(parents=True, exist_ok=True)
     rc = subprocess.run(
-        ['robocopy', str(SUITE_DIR), str(LOCAL_SUITE),
+        ['robocopy', str(suite_dir), str(local_suite),
          '/MIR', '/MT:8', '/R:3', '/W:5',
          '/NFL', '/NDL', '/NJH', '/NJS', '/NC', '/NS', '/NP'],
         capture_output=True, text=True,
     )
-    # robocopy exit codes 0-7 are success; >=8 is failure
     if rc.returncode >= 8:
         print(f'  [!] robocopy failed (exit {rc.returncode}). Falling back to shutil ...')
-        if LOCAL_SUITE.exists():
-            shutil.rmtree(LOCAL_SUITE, ignore_errors=True)
-        shutil.copytree(str(SUITE_DIR), str(LOCAL_SUITE), dirs_exist_ok=True)
-    print(f'  Local Project Path    : {LOCAL_SUITE}')
+        if local_suite.exists():
+            shutil.rmtree(local_suite, ignore_errors=True)
+        shutil.copytree(str(suite_dir), str(local_suite), dirs_exist_ok=True)
+    print(f'  Local Project Path    : {local_suite}')
+    return suite_name, suite_dir, local_suite
 
 
-def create_zip():
-    """Create a ZIP archive of ProteoPRM_Suite/ for upload to GitHub Releases."""
+def create_zip(variant=None):
+    """Create a ZIP archive of the assembled suite for GitHub Releases."""
+    suite_name, suite_dir, local_suite = _suite_layout(variant)
     _hr()
-    print('Creating distribution ZIP (ZIP_DEFLATED level 6) ...')
+    print(f'Creating distribution ZIP for {suite_name} (ZIP_DEFLATED level 6) ...')
     date_str  = datetime.now().strftime('%Y%m%d')
-    zip_path  = DIST / f'ProteoPRM_Suite_{date_str}.zip'
+    zip_name  = f'{suite_name}_{date_str}.zip'
+    zip_path  = DIST / zip_name
 
     if zip_path.exists():
         zip_path.unlink()
 
     n = 0
     with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for f in sorted(SUITE_DIR.rglob('*')):
+        for f in sorted(suite_dir.rglob('*')):
             if f.is_file():
-                arc = Path(SUITE_NAME) / f.relative_to(SUITE_DIR)
+                arc = Path(suite_name) / f.relative_to(suite_dir)
                 zf.write(str(f), str(arc))
                 n += 1
 
     mb = zip_path.stat().st_size / 1024 / 1024
     print(f'  [OK] {zip_path.name}  ({mb:.1f} MB,  {n:,} files)')
-    
+
     local_zip = HERE / 'dist' / zip_path.name
+    local_zip.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(zip_path), str(local_zip))
     print(f'  Copied ZIP to   : {local_zip}')
     return zip_path
@@ -376,6 +490,32 @@ def create_zip():
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _build_one_variant(variant, build_viewer_exe, assemble_suite, make_zip, main_only, viewer_only):
+    """Build one torch variant. Viewer is optionally skipped if already built."""
+    outputs = []
+    if viewer_only:
+        build_viewer()
+        return outputs
+
+    if variant:
+        print(f'\n  === {variant} suite ===')
+        ensure_torch(variant)
+
+    if main_only:
+        build_main()
+        return outputs
+
+    build_main()
+    if build_viewer_exe:
+        build_viewer()
+
+    if assemble_suite:
+        suite_name, suite_dir, local_suite = assemble(variant)
+        zip_path = create_zip(variant) if make_zip else None
+        outputs.append((suite_name, local_suite, zip_path))
+    return outputs
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Build the ProteoPRM executable suite',
@@ -387,6 +527,16 @@ def main():
     parser.add_argument('--viewer-only', action='store_true', help='Build viewer only')
     parser.add_argument('--no-assemble', action='store_true', help='Skip assembly step')
     parser.add_argument('--check',       action='store_true', help='Dependency check only')
+    torch_group = parser.add_mutually_exclusive_group()
+    torch_group.add_argument(
+        '--cpu', action='store_true',
+        help='Build the CPU-only suite (ProteoPRM_Suite_CPU)')
+    torch_group.add_argument(
+        '--gpu', action='store_true',
+        help='Build the CUDA GPU suite (ProteoPRM_Suite_GPU); also runs on CPU machines')
+    torch_group.add_argument(
+        '--both', action='store_true',
+        help='Build CPU and GPU suites (installs each torch wheel in turn)')
     args = parser.parse_args()
 
     _hr('=')
@@ -402,34 +552,42 @@ def main():
     if args.check:
         return
 
+    if args.both:
+        variants = ['CPU', 'GPU']
+    elif args.cpu:
+        variants = ['CPU']
+    elif args.gpu:
+        variants = ['GPU']
+    else:
+        variants = [None]
+
     t_start = time.time()
     full_build = not args.main_only and not args.viewer_only
+    all_outputs = []
 
     try:
         if args.viewer_only:
             build_viewer()
-        elif args.main_only:
-            build_main()
         else:
-            build_main()
-            build_viewer()
-
-        if full_build and not args.no_assemble:
-            assemble()
-            zip_path = None
-            if not args.no_zip:
-                zip_path = create_zip()
+            for i, variant in enumerate(variants):
+                build_viewer_exe = (i == 0) and not args.main_only
+                all_outputs.extend(_build_one_variant(
+                    variant,
+                    build_viewer_exe=build_viewer_exe,
+                    assemble_suite=full_build and not args.no_assemble,
+                    make_zip=full_build and not args.no_assemble and not args.no_zip,
+                    main_only=args.main_only,
+                    viewer_only=False,
+                ))
 
         elapsed = time.time() - t_start
         _hr('=')
         print(f'  BUILD SUCCESSFUL  ({elapsed / 60:.1f} min)')
-        if full_build and not args.no_assemble:
-            print(f'  Distributable : {LOCAL_SUITE}')
-            if not args.no_zip:
+        for suite_name, local_suite, zip_path in all_outputs:
+            print(f'  Distributable : {local_suite}')
+            if zip_path:
                 print(f'  ZIP Archive   : {HERE / "dist" / zip_path.name}')
-
-            if not args.no_zip and zip_path:
-                print(f'  ZIP archive   : {zip_path}')
+                print(f'  ZIP (temp)    : {zip_path}')
         _hr('=')
 
     except Exception as exc:

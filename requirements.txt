@@ -107,23 +107,28 @@ xlrd==2.0.1
 xlsxwriter==3.1.4
 
 # ============================================================================
-# OPTIONAL: GPU ACCELERATION (NVIDIA CUDA only — not required)
+# OPTIONAL: GPU ACCELERATION (NVIDIA CUDA via PyTorch — not required)
 # ============================================================================
-# Do NOT install these on CPU-only machines. The app runs on CPU without them.
-# AlphaPeptDeep uses PyTorch CUDA when `torch.cuda.is_available()` is True.
-# Fragment matching uses NumPy on CPU (faster for typical PRM spectra).
+# GPU acceleration in ProteoPRM = AlphaPeptDeep spectrum/RT prediction and
+# model calibration running on PyTorch CUDA. Fragment matching, EIC
+# extraction, and scoring intentionally run on CPU (faster for PRM spectra).
 #
-# Check driver CUDA with: nvidia-smi
-#   CUDA 12.x: pip install "cupy-cuda12x==13.6.0" fastrlock==0.8.3
-#   CUDA 11.x: pip install cupy-cuda11x fastrlock
+# EASIEST PATH (recommended): run  `python setup_venv.py`  — it detects an
+# NVIDIA GPU automatically (nvidia-smi) and installs the matching CUDA
+# PyTorch build. No manual steps, and CPU-only machines are unaffected.
 #
-# Default `torch==2.10.0` above is whatever wheel PyPI serves. For an explicit
-# CUDA 12 PyTorch build:
-#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu124
-# CPU-only Torch:
-#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+# MANUAL PATH: the plain `torch==2.10.0` pin above installs whatever wheel
+# PyPI serves (usually CPU-only on Windows). To switch to CUDA explicitly:
+#   CUDA 12 drivers: pip install torch==2.10.0 --force-reinstall --index-url https://download.pytorch.org/whl/cu124
+#   CUDA 11 drivers: pip install torch==2.10.0 --force-reinstall --index-url https://download.pytorch.org/whl/cu118
+#   CPU-only Torch:  pip install torch==2.10.0 --force-reinstall --index-url https://download.pytorch.org/whl/cpu
+# Check your driver's CUDA level with: nvidia-smi
 #
-# cuML (RAPIDS) is optional and Linux/WSL2 oriented; scikit-learn is the fallback.
+# The CUDA wheels bundle the CUDA runtime and kernels for every supported
+# NVIDIA architecture (plus PTX forward-compatibility for newer cards), so
+# one wheel covers GTX 900-series through the latest RTX generation — only
+# a reasonably recent NVIDIA driver is required. No CUDA Toolkit needed.
 #
-# Intel/AMD/Apple GPUs are not used. CPU processing is automatic.
+# CuPy / cuML are NOT used by ProteoPRM anymore and need not be installed.
+# Intel/AMD/Apple GPUs are not CUDA-capable; the app uses CPU automatically.
 # ============================================================================

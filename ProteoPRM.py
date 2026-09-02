@@ -450,16 +450,7 @@ def _load_apd_calibrated_model(folder_name_or_path):
         return None
 
     try:
-        # Auto-detect device
-        use_gpu = False
-        try:
-            import torch
-            if torch.cuda.is_available():
-                use_gpu = True
-        except ImportError:
-            pass
-
-        mgr = _APD_ModelManager(device='gpu' if use_gpu else 'cpu')
+        mgr = _APD_ModelManager(device=get_apd_device())
         rt_path = os.path.join(folder, 'rt.pth')
         ccs_path = os.path.join(folder, 'ccs.pth')
         chg_path = os.path.join(folder, 'charge.pth')
@@ -799,169 +790,29 @@ def detect_gpu_libraries():
     except Exception as e:
         pass
     
-    # Determine recommended library
-    if lib_info['cupy']['working']:
-        lib_info['recommended_library'] = 'cupy'
-    elif lib_info['pytorch']['working']:
+    # Determine recommended library (PyTorch is the one ProteoPRM uses)
+    if lib_info['pytorch']['working']:
         lib_info['recommended_library'] = 'pytorch'
+    elif lib_info['cupy']['working']:
+        lib_info['recommended_library'] = 'cupy'
     elif lib_info['tensorflow']['working']:
         lib_info['recommended_library'] = 'tensorflow'
-    
+
     # Provide installation recommendations
     if not any([lib_info['cupy']['working'], lib_info['pytorch']['working'], lib_info['tensorflow']['working']]):
-        lib_info['recommended_install'] = "pip install cupy-cuda12x  # For CUDA 12.x\n# OR\npip install cupy-cuda11x  # For CUDA 11.x"
+        lib_info['recommended_install'] = (
+            "pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA 12 drivers\n"
+            "# OR\n"
+            "pip install torch --index-url https://download.pytorch.org/whl/cu118  # CUDA 11 drivers"
+        )
     
     return lib_info
 
-def get_cuda_version_recommendation(driver_cuda_version):
-    """
-    Recommend the correct CuPy package based on detected CUDA version.
-    """
-    if not driver_cuda_version or driver_cuda_version == 'Unknown':
-        return "cupy-cuda12x  # Try this first, or cupy-cuda11x"
-    
-    try:
-        major_version = int(float(driver_cuda_version))
-        if major_version >= 12:
-            return f"cupy-cuda12x  # For CUDA {driver_cuda_version}"
-        elif major_version >= 11:
-            return f"cupy-cuda11x  # For CUDA {driver_cuda_version}"
-        elif major_version >= 10:
-            return f"cupy-cuda102  # For CUDA {driver_cuda_version}"
-        else:
-            return f"cupy-cuda{major_version}0  # For CUDA {driver_cuda_version}"
-    except:
-        return "cupy-cuda12x  # Default recommendation"
-
-def get_cupy_package_name(cuda_version):
-    """
-    Get the exact CuPy package name to install based on CUDA version.
-    Returns just the package name without comments.
-    """
-    if not cuda_version or cuda_version == 'Unknown':
-        return "cupy-cuda12x"  # Default to CUDA 12
-    
-    try:
-        major_version = int(float(cuda_version))
-        if major_version >= 12:
-            return "cupy-cuda12x"
-        elif major_version >= 11:
-            return "cupy-cuda11x"
-        elif major_version >= 10:
-            return "cupy-cuda102"
-        else:
-            return f"cupy-cuda{major_version}0"
-    except:
-        return "cupy-cuda12x"
-
-def silent_install_package(package_name, timeout=300):
-    """
-    Silently install a Python package using pip.
-
-    Disabled in frozen (PyInstaller) builds: sys.executable is the GUI EXE,
-    not a pip-capable interpreter.
-    """
-    if getattr(sys, 'frozen', False):
-        return False, (
-            "Automatic package install is disabled in the packaged application. "
-            f"From a Python 3.11 venv run: pip install {package_name}"
-        )
-    import subprocess
-    import sys
-    
-    logging.info(f"Attempting silent installation of {package_name}...")
-    
-    try:
-        # Use the same Python interpreter that's running this script
-        python_exe = sys.executable
-        
-        # Run pip install silently
-        result = subprocess.run(
-            [python_exe, "-m", "pip", "install", package_name, "--quiet"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            **_subprocess_no_window()
-        )
-        
-        if result.returncode == 0:
-            logging.info(f"Successfully installed {package_name}")
-            return True, f"Successfully installed {package_name}"
-        else:
-            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-            logging.warning(f"Failed to install {package_name}: {error_msg}")
-            return False, f"Installation failed: {error_msg}"
-            
-    except subprocess.TimeoutExpired:
-        logging.warning(f"Installation of {package_name} timed out after {timeout}s")
-        return False, f"Installation timed out after {timeout} seconds"
-    except Exception as e:
-        logging.warning(f"Error installing {package_name}: {str(e)}")
-        return False, f"Installation error: {str(e)}"
-
-def auto_install_cupy_if_needed(cuda_version, force=False):
-    """
-    Install CuPy when an NVIDIA GPU is present but CuPy is missing.
-
-    Never runs in a frozen EXE. Prefer a manual venv install; this is only
-    offered from the GPU diagnostics UI for source runs.
-    """
-    global CUPY_AVAILABLE, cp
-
-    if getattr(sys, 'frozen', False):
-        return False, (
-            "Automatic CuPy install is disabled in the packaged application. "
-            "AlphaPeptDeep still uses PyTorch CUDA when torch.cuda.is_available()."
-        )
-    
-    # Check if CuPy is already working
-    if not force:
-        try:
-            import cupy as test_cp
-            test_cp.cuda.runtime.getDeviceCount()
-            logging.info("CuPy already installed and working - skipping auto-install")
-            return True, "CuPy already installed and working"
-        except:
-            pass  # Not installed or not working, proceed with installation
-    
-    # Get the correct package name
-    package_name = get_cupy_package_name(cuda_version)
-    
-    logging.info(f"Auto-installing {package_name} for CUDA {cuda_version}...")
-    
-    # Attempt installation
-    success, message = silent_install_package(package_name)
-    
-    if success:
-        # Verify installation works
-        try:
-            # Need to reload the module
-            import importlib
-            if 'cupy' in sys.modules:
-                del sys.modules['cupy']
-            
-            import cupy as new_cp
-            device_count = new_cp.cuda.runtime.getDeviceCount()
-            
-            if device_count > 0:
-                CUPY_AVAILABLE = True
-                cp = new_cp
-                logging.info(f"CuPy auto-installation successful - {device_count} GPU(s) available")
-                return True, f"CuPy installed successfully - {device_count} GPU(s) ready"
-            else:
-                return False, "CuPy installed but no CUDA devices detected"
-                
-        except Exception as e:
-            error_msg = str(e)
-            logging.warning(f"CuPy installed but not working: {error_msg}")
-            
-            # Check if it's a driver version mismatch
-            if "cudaErrorInsufficientDriver" in error_msg:
-                return False, "CuPy installed but CUDA driver needs updating. Please update your NVIDIA drivers."
-            else:
-                return False, f"CuPy installed but error during verification: {error_msg}"
-    else:
-        return False, message
+# NOTE: The CuPy auto-install machinery (silent_install_package,
+# auto_install_cupy_if_needed, get_cupy_package_name) was removed:
+# ProteoPRM no longer uses CuPy for anything. GPU acceleration is
+# PyTorch CUDA for AlphaPeptDeep, selected via get_apd_device().
+# setup_venv.py installs the correct CUDA PyTorch build automatically.
 
 def detect_gpu(auto_install=False):
     """
@@ -989,7 +840,11 @@ def detect_gpu(auto_install=False):
         'memory_gb': hw_info['memory_total_gb'],
         'driver_version': hw_info['driver_version'],
         'cuda_version': hw_info['cuda_version'],
-        'recommended_cupy': get_cuda_version_recommendation(hw_info['cuda_version'])
+        'recommended_torch_index': (
+            'https://download.pytorch.org/whl/cu118'
+            if str(hw_info['cuda_version']).startswith('11')
+            else 'https://download.pytorch.org/whl/cu124'
+        ),
     }
     
     # Determine overall availability
@@ -1001,40 +856,28 @@ def detect_gpu(auto_install=False):
         GPU_DRIVER_VERSION = hw_info['driver_version']
         GPU_CUDA_VERSION = hw_info['cuda_version']
         
-        if lib_info['cupy']['working']:
+        if lib_info['pytorch']['working']:
             gpu_info['acceleration_ready'] = True
-            CUPY_AVAILABLE = True
-            logging.info(f"GPU READY: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) - CuPy acceleration enabled")
-        elif lib_info['pytorch']['working']:
-            gpu_info['acceleration_ready'] = True
-            logging.info(f"GPU READY: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) - PyTorch acceleration available")
+            logging.info(
+                f"GPU READY: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) - "
+                f"AlphaPeptDeep predictions will use PyTorch CUDA"
+            )
         else:
             logging.info(f"GPU DETECTED: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB)")
             logging.info(f"  Driver: {GPU_DRIVER_VERSION}, CUDA: {GPU_CUDA_VERSION}")
-            
-            # Never auto-install CUDA wheels as a side effect of detection.
-            # Frozen EXEs cannot pip-install; source users should use the
-            # GPU dialog or requirements comments.
-            if auto_install and not getattr(sys, 'frozen', False):
-                logging.info("Attempting automatic CuPy installation...")
-                install_success, install_msg = auto_install_cupy_if_needed(GPU_CUDA_VERSION)
-                gpu_info['auto_install_attempted'] = True
-                gpu_info['auto_install_result'] = install_msg
-                
-                if install_success:
-                    gpu_info['acceleration_ready'] = True
-                    logging.info(f"AUTO-INSTALL SUCCESS: {install_msg}")
-                else:
-                    logging.warning(f"AUTO-INSTALL FAILED: {install_msg}")
-                    if lib_info['cupy']['installed'] and not lib_info['cupy']['working']:
-                        logging.warning(f"  CuPy installed but not working: {lib_info['cupy']['error']}")
-                    logging.info(f"  Manual install: pip install {gpu_info['recommended_cupy']}")
+            if lib_info['pytorch']['installed']:
+                logging.info(
+                    "  PyTorch is installed but CUDA is not usable "
+                    "(CPU-only torch build or driver issue). To enable GPU prediction: "
+                    "pip install torch --index-url https://download.pytorch.org/whl/cu124 "
+                    "(or re-run setup_venv.py)."
+                )
             else:
-                if lib_info['cupy']['installed'] and not lib_info['cupy']['working']:
-                    logging.warning(f"  CuPy installed but not working: {lib_info['cupy']['error']}")
-                    logging.info(f"  Recommended: pip install {gpu_info['recommended_cupy']}")
-                else:
-                    logging.info(f"  To enable GPU acceleration: pip install {gpu_info['recommended_cupy']}")
+                logging.info(
+                    "  PyTorch not installed — AlphaPeptDeep predictions will use CPU."
+                )
+        if lib_info['cupy']['working']:
+            CUPY_AVAILABLE = True  # informational only; matching stays on CPU by design
     else:
         logging.debug("No NVIDIA GPU detected - using CPU acceleration")
         GPU_AVAILABLE = False
@@ -1052,21 +895,17 @@ def get_gpu_status():
     _ensure_gpu_detected()
     if not GPU_AVAILABLE:
         return "No NVIDIA GPU detected - using CPU"
-    elif not GPU_ENABLED:
+    if not GPU_ENABLED:
         return f"GPU disabled ({GPU_DEVICE_NAME})"
-    elif not CUPY_AVAILABLE:
+    if get_apd_device() == 'gpu':
         return (
-            f"GPU detected: {GPU_DEVICE_NAME} "
-            "(matching uses CPU; AlphaPeptDeep uses PyTorch CUDA if available)"
+            f"GPU enabled: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) — "
+            f"AlphaPeptDeep predictions run on CUDA (fragment matching uses CPU by design)"
         )
-    else:
-        accel_features = []
-        if CUPY_AVAILABLE:
-            accel_features.append("CuPy")
-        if CUML_AVAILABLE:
-            accel_features.append("cuML")
-        features_str = ", ".join(accel_features) if accel_features else "basic"
-        return f"GPU enabled: {GPU_DEVICE_NAME} ({GPU_MEMORY_GB:.1f} GB) [{features_str}]"
+    return (
+        f"GPU detected: {GPU_DEVICE_NAME}, but PyTorch CUDA is not usable — "
+        f"predictions run on CPU. See GPU Diagnostics for the fix."
+    )
 
 def get_gpu_detailed_info():
     """Return detailed GPU information for diagnostics."""
@@ -1079,22 +918,30 @@ def get_gpu_detailed_info():
     ]
     
     if GPU_AVAILABLE:
+        _pt = GPU_DETECTION_INFO.get('libraries', {}).get('pytorch', {}) if GPU_DETECTION_INFO else {}
+        _pt_state = (
+            'Working (CUDA verified)' if get_apd_device() == 'gpu'
+            else ('Installed, CUDA not usable' if _pt.get('installed') else 'Not installed')
+        )
         info_lines.extend([
             f"Device Name: {GPU_DEVICE_NAME}",
             f"Memory: {GPU_MEMORY_GB:.1f} GB",
             f"Driver Version: {GPU_DRIVER_VERSION}",
             f"CUDA Version: {GPU_CUDA_VERSION}",
             f"",
-            f"Acceleration Libraries:",
-            f"  CuPy: {'Working' if CUPY_AVAILABLE else 'Not available'}",
-            f"  cuML: {'Working' if CUML_AVAILABLE else 'Not available'}",
+            f"Acceleration (AlphaPeptDeep predictions):",
+            f"  PyTorch CUDA: {_pt_state}",
+            f"",
+            f"Fragment matching / EIC / scoring intentionally run on CPU",
+            f"(faster than GPU for typical PRM spectra).",
         ])
-        
-        if not CUPY_AVAILABLE and GPU_DETECTION_INFO.get('recommended_cupy'):
+
+        if get_apd_device() != 'gpu':
             info_lines.extend([
                 f"",
-                f"To enable GPU acceleration:",
-                f"  pip install {GPU_DETECTION_INFO['recommended_cupy']}",
+                f"To enable GPU prediction (source install):",
+                f"  pip install torch --index-url https://download.pytorch.org/whl/cu124",
+                f"Then restart the application.",
             ])
     else:
         info_lines.extend([
@@ -1113,102 +960,79 @@ def get_gpu_detailed_info():
 def set_gpu_enabled(enabled):
     """Enable or disable GPU acceleration."""
     _ensure_gpu_detected()
-    global GPU_ENABLED
+    global GPU_ENABLED, _APD_DEVICE_CACHE
     GPU_ENABLED = enabled and GPU_AVAILABLE
+    # Invalidate the AlphaPeptDeep device cache so the toggle takes effect
+    # for the next model load without restarting the application.
+    _APD_DEVICE_CACHE = None
     if GPU_ENABLED:
         logging.info(f"GPU acceleration enabled ({GPU_DEVICE_NAME})")
     else:
         logging.debug(f"GPU acceleration disabled")
 
-def get_array_module():
-    """Array module for numerical work. Peak matching stays on NumPy/CPU."""
-    return np
+# ── AlphaPeptDeep device selection (the ONE place GPU actually accelerates) ──
+# Fragment matching, EIC extraction, and PSM scoring are deliberately
+# CPU/NumPy (searchsorted beats GPU transfers for typical PRM spectra).
+# GPU acceleration applies to AlphaPeptDeep neural-network prediction and
+# calibration through PyTorch CUDA. PyTorch wheels bundle the CUDA runtime
+# and kernels for all supported NVIDIA architectures (plus PTX
+# forward-compatibility for newer cards), so a CUDA build of torch works
+# out of the box on any NVIDIA GPU with a recent driver — no CuPy, no
+# per-machine CUDA toolkit install.
 
-def to_gpu(array):
-    """Identity: fragment matching is CPU-only (searchsorted is faster for PRM)."""
-    return array
+_APD_DEVICE_CACHE = None
 
-def to_cpu(array):
-    """Identity companion of to_gpu()."""
-    return array
+def get_apd_device(force_refresh=False):
+    """Return 'gpu' or 'cpu' for AlphaPeptDeep's ModelManager.
 
-def gpu_accelerated_mass_matching(observed_mzs, observed_intensities, theoretical_mzs, tolerance, tolerance_unit='ppm'):
+    'gpu' is returned only when ALL of the following hold:
+      1. The user has not disabled GPU acceleration in Preferences,
+      2. torch reports CUDA available,
+      3. a real CUDA tensor operation succeeds (smoke test — catches
+         driver/architecture mismatches that is_available() misses).
+    Anything else falls back to 'cpu' with a logged reason, so the app
+    never crashes mid-prediction on a broken CUDA setup.
     """
-    GPU-accelerated mass matching between observed and theoretical m/z values.
-    Falls back to CPU if GPU unavailable.
-    
-    This is one of the most compute-intensive operations - matching millions of 
-    observed peaks against theoretical fragment ions.
-    """
-    xp = get_array_module()
-    
-    # Convert to GPU arrays if available
-    obs_mz = to_gpu(np.array(observed_mzs, dtype=np.float64))
-    obs_int = to_gpu(np.array(observed_intensities, dtype=np.float64))
-    theo_mz = to_gpu(np.array(theoretical_mzs, dtype=np.float64))
-    
-    matches = []
-    
-    if len(obs_mz) == 0 or len(theo_mz) == 0:
-        return matches
-    
-    # Vectorized matching on GPU/CPU
-    for i, t_mz in enumerate(to_cpu(theo_mz)):
-        if tolerance_unit == 'ppm':
-            tol = t_mz * tolerance / 1e6
-        else:
-            tol = tolerance
-        
-        # Find matches within tolerance
-        mask = xp.abs(obs_mz - t_mz) <= tol
-        matched_indices = xp.where(mask)[0]
-        
-        if len(matched_indices) > 0:
-            # Get best match (highest intensity)
-            matched_intensities = obs_int[matched_indices]
-            best_idx = matched_indices[xp.argmax(matched_intensities)]
-            
-            matches.append({
-                'theo_idx': i,
-                'obs_idx': int(to_cpu(best_idx)) if hasattr(best_idx, 'get') else int(best_idx),
-                'theo_mz': t_mz,
-                'obs_mz': float(to_cpu(obs_mz[best_idx])),
-                'intensity': float(to_cpu(obs_int[best_idx])),
-                'mass_error': float(to_cpu(obs_mz[best_idx])) - t_mz,
-                'mass_error_ppm': (float(to_cpu(obs_mz[best_idx])) - t_mz) / t_mz * 1e6
-            })
-    
-    return matches
+    global _APD_DEVICE_CACHE
+    if _APD_DEVICE_CACHE is not None and not force_refresh:
+        return _APD_DEVICE_CACHE
 
-def gpu_accelerated_batch_scoring(features_array, weights=None):
-    """
-    GPU-accelerated batch PSM scoring for large datasets.
-    Uses matrix operations that benefit greatly from GPU parallelism.
-    """
-    xp = get_array_module()
-    
-    features = to_gpu(features_array)
-    
-    if weights is None:
-        # Default weights for 6 scoring components:
-        # mass_accuracy, fragment_count, rt_accuracy, charge_consistency,
-        # continuity, complementarity
-        weights = to_gpu(np.array([0.25, 0.25, 0.10, 0.10, 0.10, 0.20], dtype=np.float64))
+    device = 'cpu'
+    if not GPU_ENABLED:
+        logging.info("AlphaPeptDeep: GPU disabled in Preferences — using CPU.")
     else:
-        weights = to_gpu(np.array(weights, dtype=np.float64))
-    
-    # Normalize features (GPU-accelerated)
-    feature_min = xp.min(features, axis=0)
-    feature_max = xp.max(features, axis=0)
-    feature_range = feature_max - feature_min
-    feature_range = xp.where(feature_range == 0, 1, feature_range)  # Avoid division by zero
-    
-    normalized = (features - feature_min) / feature_range
-    
-    # Weighted sum scoring (GPU matrix multiplication)
-    scores = xp.dot(normalized, weights[:len(normalized[0])] if len(weights) > normalized.shape[1] else weights)
-    
-    return to_cpu(scores)
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                if getattr(getattr(torch, 'version', None), 'cuda', None) is None:
+                    logging.info(
+                        "AlphaPeptDeep: this PyTorch build is CPU-only — using CPU. "
+                        "(Install a CUDA build of torch to enable GPU prediction; "
+                        "see requirements.txt or run setup_venv.py on a GPU machine.)"
+                    )
+                else:
+                    logging.info(
+                        "AlphaPeptDeep: CUDA-capable PyTorch installed but no usable "
+                        "NVIDIA GPU/driver found — using CPU."
+                    )
+            else:
+                # Smoke-test an actual CUDA op: is_available() can be True while
+                # kernels fail (too-old driver, unsupported architecture).
+                t = torch.zeros(16, device='cuda')
+                _ = float((t + 1).sum().item())
+                gpu_name = torch.cuda.get_device_name(0)
+                logging.info(f"AlphaPeptDeep: CUDA verified — using GPU ({gpu_name}).")
+                device = 'gpu'
+        except ImportError:
+            logging.info("AlphaPeptDeep: PyTorch not installed — using CPU.")
+        except Exception as e:
+            logging.warning(
+                f"AlphaPeptDeep: CUDA smoke test failed ({e}) — falling back to CPU. "
+                f"Update the NVIDIA driver to fix GPU prediction."
+            )
+
+    _APD_DEVICE_CACHE = device
+    return device
 
 # GPU detection is deferred until first use (processing start or GPU prefs)
 _gpu_info = None   # populated lazily by _ensure_gpu_detected()
@@ -5298,19 +5122,7 @@ def _get_apd_model_manager(
             model_dir = _alphapeptdeep_model_dir()
             logging.info(f"AlphaPeptDeep: loading pretrained models from {model_dir}")
 
-            # Auto-detect device: GPU when CUDA available, CPU otherwise
-            use_gpu = False
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    use_gpu = True
-                    logging.info(f"AlphaPeptDeep: using GPU ({torch.cuda.get_device_name(0)})")
-                else:
-                    logging.info("AlphaPeptDeep: CUDA not available, using CPU")
-            except ImportError:
-                logging.info("AlphaPeptDeep: PyTorch not available, using CPU")
-
-            mgr = _APD_ModelManager(device='gpu' if use_gpu else 'cpu')
+            mgr = _APD_ModelManager(device=get_apd_device())
 
             # Override with bundled models if present (load_external_models
             # takes individual .pth file paths, unlike load_installed_models
@@ -7674,7 +7486,8 @@ def calculate_psm_scores_batch(mass_accuracies, fragment_counts, rt_accuracies, 
     numpy.ndarray
         Array of PSM scores in [0, 1].
     """
-    use_gpu = False
+    # CPU/NumPy by design — see get_apd_device() note: GPU is reserved for
+    # AlphaPeptDeep neural-network prediction, where it actually pays off.
     xp = np
 
     # Convert inputs to arrays
@@ -7729,9 +7542,6 @@ def calculate_psm_scores_batch(mass_accuracies, fragment_counts, rt_accuracies, 
         w_comp   * comp_sc
     )
 
-    # Transfer back to CPU if needed
-    if use_gpu:
-        return cp.asnumpy(psm_scores)
     return psm_scores
 
 def get_modification_mass_shift(mod_name):
@@ -15249,8 +15059,10 @@ def open_preferences_dialog():
                         row=0, column=0, columnspan=2, sticky='w', pady=(0, 4))
     ttk.Label(
         gpu_frame,
-        text="Fragment matching uses the CPU. AlphaPeptDeep uses PyTorch CUDA when available.",
+        text=("GPU (NVIDIA CUDA via PyTorch) accelerates AlphaPeptDeep spectrum/RT prediction\n"
+              "and model calibration. Fragment matching runs on the CPU by design (faster for PRM)."),
         font=('Segoe UI', 9),
+        justify='left',
     ).grid(row=1, column=0, columnspan=2, sticky='w', pady=(0, 8))
 
     ttk.Separator(gpu_frame, orient='horizontal').grid(row=2, column=0, columnspan=2, sticky='ew', pady=4)
@@ -15277,51 +15089,6 @@ def open_preferences_dialog():
     btn_row_frame = ttk.Frame(gpu_frame)
     btn_row_frame.grid(row=info_row, column=0, columnspan=2, sticky='w')
 
-    def _quick_install():
-        if getattr(sys, 'frozen', False):
-            messagebox.showinfo(
-                "Install CuPy from a venv",
-                "The packaged application cannot install Python packages.\n\n"
-                "Fragment matching already uses the CPU (faster for PRM).\n"
-                "AlphaPeptDeep uses PyTorch CUDA automatically when\n"
-                "torch.cuda.is_available() is True.\n\n"
-                "For CuPy in a source install:\n"
-                "  pip install cupy-cuda12x   # CUDA 12 drivers\n"
-                "  pip install cupy-cuda11x   # CUDA 11 drivers"
-            )
-            return
-        ans = messagebox.askyesno("Install CuPy",
-            f"Install CuPy for GPU acceleration?\n\n"
-            f"GPU: {GPU_DEVICE_NAME}\nCUDA: {GPU_CUDA_VERSION}\n"
-            f"Package: {get_cupy_package_name(GPU_CUDA_VERSION)}\n\n"
-            f"This may take a few minutes.")
-        if not ans:
-            return
-        prog = tk.Toplevel(pref_win)
-        prog.title("Installing...")
-        prog.geometry("350x100")
-        prog.transient(pref_win)
-        ttk.Label(prog, text="Installing CuPy, please wait...",
-                  font=('Segoe UI', 10)).pack(pady=20)
-        pb = ttk.Progressbar(prog, mode='indeterminate', length=250)
-        pb.pack(pady=10); pb.start(10)
-        root.update()
-
-        def _do():
-            success, msg = auto_install_cupy_if_needed(GPU_CUDA_VERSION, force=True)
-
-            def _show():
-                prog.destroy()
-                if success:
-                    messagebox.showinfo("Success",
-                        "CuPy installed!\nRestart the application to enable GPU acceleration.")
-                else:
-                    messagebox.showerror("Failed", f"Installation failed:\n{msg}")
-
-            root.after(0, _show)
-
-        threading.Thread(target=_do, daemon=True).start()
-
     def _render_gpu_details():
         for w in details_frame.winfo_children():
             w.destroy()
@@ -15334,17 +15101,13 @@ def open_preferences_dialog():
             ttk.Label(details_frame, text=f"Driver: {GPU_DRIVER_VERSION}   CUDA: {GPU_CUDA_VERSION}").grid(
                 row=1, column=0, columnspan=2, sticky='w', padx=15, pady=1)
 
-            accel_parts = []
-            if CUPY_AVAILABLE:
-                accel_parts.append("CuPy")
-            if CUML_AVAILABLE:
-                accel_parts.append("cuML")
-            accel_str = ", ".join(accel_parts) if accel_parts else "None installed"
-            ttk.Label(details_frame, text=f"Accelerators: {accel_str}").grid(
+            _apd_dev = get_apd_device()
+            _accel_str = (
+                "PyTorch CUDA verified — predictions use the GPU" if _apd_dev == 'gpu'
+                else "PyTorch CUDA not usable — predictions use the CPU (see Diagnostics)"
+            )
+            ttk.Label(details_frame, text=f"AlphaPeptDeep: {_accel_str}").grid(
                 row=2, column=0, columnspan=2, sticky='w', padx=15, pady=1)
-
-        if GPU_AVAILABLE and not CUPY_AVAILABLE and not getattr(sys, 'frozen', False):
-            ttk.Button(btn_row_frame, text="Install CuPy Now...", command=_quick_install).pack(side='left', padx=5)
 
         ttk.Button(btn_row_frame, text="GPU Diagnostics...", command=show_gpu_diagnostics).pack(side='left', padx=5)
 
@@ -15399,45 +15162,54 @@ def show_gpu_diagnostics():
     diag_content += "\n\n" + "=" * 50 + "\nINSTALLATION GUIDE\n" + "=" * 50
 
     if GPU_AVAILABLE and GPU_CUDA_VERSION:
-        cuda_major = GPU_CUDA_VERSION.split('.')[0] if GPU_CUDA_VERSION else "?"
+        try:
+            _cuda_major = int(float(GPU_CUDA_VERSION))
+        except (ValueError, TypeError):
+            _cuda_major = 12  # unknown → assume a modern driver
+        _torch_idx = (
+            "https://download.pytorch.org/whl/cu124" if _cuda_major >= 12
+            else "https://download.pytorch.org/whl/cu118"
+        )
         diag_content += f"""
 
-Your system has CUDA {GPU_CUDA_VERSION} support.
+Your NVIDIA driver reports CUDA {GPU_CUDA_VERSION}.
 
-To install GPU acceleration libraries:
+GPU acceleration in ProteoPRM = AlphaPeptDeep prediction/calibration
+running on PyTorch CUDA. Nothing else is needed — PyTorch CUDA wheels
+bundle the CUDA runtime and kernels for all supported NVIDIA GPU
+generations, so no CUDA Toolkit install is required.
 
-1. CuPy (Required for GPU array operations):
-   pip install cupy-cuda{cuda_major}x
+If GPU prediction is not active (see status above), for a SOURCE install:
 
-2. cuML (Optional - for GPU machine learning):
+  pip install torch --index-url {_torch_idx}
 
-   OPTION A - Conda (Recommended):
-   conda create -n rapids-env python=3.11
-   conda activate rapids-env
-   conda install -c rapidsai -c conda-forge -c nvidia cuml cuda-version={cuda_major}
+then restart the application. Or simply re-run:
 
-   OPTION B - pip (CUDA 12):
-   pip install --extra-index-url https://pypi.nvidia.com cuml-cu12
+  python setup_venv.py
 
-   OPTION C - pip (CUDA 11):
-   pip install --extra-index-url https://pypi.nvidia.com cuml-cu11
+which auto-detects the GPU and installs the right PyTorch build.
 
-3. Verify installation:
-   python -c "import cupy; print(cupy.cuda.runtime.getDeviceCount())"
-   python -c "import cuml; print('cuML ready')"
+The packaged ProteoPRM.exe ships with the PyTorch build chosen at
+build time; a CUDA-enabled EXE uses the GPU automatically and still
+runs fine on machines without one.
+
+If CUDA is detected but the smoke test fails, update the NVIDIA driver
+(CUDA 12 wheels need driver 525+ / any CUDA 12-capable driver).
 """
     else:
         diag_content += """
 
 No NVIDIA GPU detected.
 
-To use GPU acceleration, you need:
-1. An NVIDIA GPU (GTX 1000 series or newer recommended)
-2. NVIDIA drivers installed
-3. Verify with: nvidia-smi (in command prompt)
+GPU acceleration uses NVIDIA CUDA through PyTorch (for AlphaPeptDeep
+prediction and calibration). AMD, Intel, and integrated GPUs are not
+supported by CUDA; on those systems ProteoPRM automatically uses the
+CPU for everything, which is fully supported.
 
-Once drivers are installed, restart the application
-and install CuPy matching your CUDA version.
+If you DO have an NVIDIA GPU:
+1. Install/update the NVIDIA driver
+2. Verify with: nvidia-smi (in command prompt)
+3. Restart the application and click 'Refresh Detection'
 """
 
     diag_content += f"""
@@ -15462,61 +15234,11 @@ Platform: {sys.platform}
     def refresh_detection():
         diag_window.destroy()
         detect_gpu(auto_install=False)
+        get_apd_device(force_refresh=True)
         show_gpu_diagnostics()
-
-    def install_cupy_now():
-        if getattr(sys, 'frozen', False):
-            messagebox.showinfo(
-                "Not available in the packaged app",
-                "Automatic CuPy install is disabled in ProteoPRM.exe.\n\n"
-                "Install CuPy in a Python 3.11 virtual environment instead:\n"
-                f"  pip install {get_cupy_package_name(GPU_CUDA_VERSION)}"
-            )
-            return
-        if not GPU_AVAILABLE:
-            messagebox.showwarning("No GPU", "No NVIDIA GPU detected.")
-            return
-        if CUPY_AVAILABLE:
-            messagebox.showinfo("Already Installed", "CuPy is already installed and working!")
-            return
-        progress_window = tk.Toplevel(diag_window)
-        progress_window.title("Installing CuPy...")
-        progress_window.geometry("400x150")
-        progress_window.transient(diag_window)
-        progress_window.grab_set()
-        ttk.Label(progress_window, text="Installing CuPy for GPU acceleration...",
-                  font=('Segoe UI', 10)).pack(pady=20)
-        pb = ttk.Progressbar(progress_window, mode='indeterminate', length=300)
-        pb.pack(pady=10); pb.start(10)
-        ttk.Label(progress_window, text="This may take a few minutes...").pack(pady=5)
-        def do_install():
-            pkg = get_cupy_package_name(GPU_CUDA_VERSION)
-            success, message = silent_install_package(pkg, timeout=600)
-            def update_ui():
-                pb.stop()
-                progress_window.destroy()
-                if success:
-                    try:
-                        if 'cupy' in sys.modules:
-                            del sys.modules['cupy']
-                        import cupy as test_cp
-                        test_cp.cuda.runtime.getDeviceCount()
-                        messagebox.showinfo("Success",
-                            "CuPy installed!\nClick 'Refresh Detection' to update the display.")
-                    except Exception as e:
-                        messagebox.showwarning("Partial Success",
-                            f"CuPy installed but may need driver updates.\n\nError: {e}")
-                else:
-                    messagebox.showerror("Failed",
-                        f"Could not install CuPy.\n\nError: {message}\n\n"
-                        f"Install manually: pip install {get_cupy_package_name(GPU_CUDA_VERSION)}")
-            diag_window.after(0, update_ui)
-        threading.Thread(target=do_install, daemon=True).start()
 
     ttk.Button(btn_frame, text="Copy to Clipboard", command=copy_to_clipboard).pack(side='left', padx=5)
     ttk.Button(btn_frame, text="Refresh Detection", command=refresh_detection).pack(side='left', padx=5)
-    if GPU_AVAILABLE and not CUPY_AVAILABLE and not getattr(sys, 'frozen', False):
-        ttk.Button(btn_frame, text="Install CuPy Now", command=install_cupy_now).pack(side='left', padx=5)
     ttk.Button(btn_frame, text="Close", command=diag_window.destroy).pack(side='right', padx=5)
 
 # ============================================================================
@@ -15721,15 +15443,7 @@ def open_apd_calibration_dialog():
 
                 # Create a fresh model manager (don't reuse cached one)
                 model_dir = _alphapeptdeep_model_dir()
-                use_gpu = False
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        use_gpu = True
-                except ImportError:
-                    pass
-
-                mgr = _APD_ModelManager(device='gpu' if use_gpu else 'cpu')
+                mgr = _APD_ModelManager(device=get_apd_device())
                 ms2_path = os.path.join(model_dir, 'generic', 'ms2.pth')
                 if os.path.exists(ms2_path):
                     rt_path = os.path.join(model_dir, 'generic', 'rt.pth')
@@ -20232,17 +19946,8 @@ def open_rt_predictor():
 
             try:
                 model_dir = _alphapeptdeep_model_dir()
-
-                # Detect device
-                _use_gpu = False
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        _use_gpu = True
-                except ImportError:
-                    pass
-
-                mgr = _APD_ModelManager(device='gpu' if _use_gpu else 'cpu')
+                _apd_device = get_apd_device()
+                mgr = _APD_ModelManager(device=_apd_device)
 
                 rt_model_path  = os.path.join(model_dir, 'generic', 'rt.pth')
                 ms2_model_path = os.path.join(model_dir, 'generic', 'ms2.pth')
@@ -20257,18 +19962,18 @@ def open_rt_predictor():
                             ccs_model_file=ccs_model_path if os.path.exists(ccs_model_path) else '',
                             charge_model_file=chg_model_path if os.path.exists(chg_model_path) else '',
                         )
-                        logging.info(f"AlphaPeptDeep RT model loaded from bundled models (device={'gpu' if _use_gpu else 'cpu'})")
+                        logging.info(f"AlphaPeptDeep RT model loaded from bundled models (device={_apd_device})")
                     except Exception as exc:
                         logging.warning(
                             f"AlphaPeptDeep RT: failed to load bundled external models ({exc}); "
                             f"falling back to installed/default models"
                         )
                         mgr.load_installed_models(model_type='generic')
-                        logging.info(f"AlphaPeptDeep RT model loaded from defaults after fallback (device={'gpu' if _use_gpu else 'cpu'})")
+                        logging.info(f"AlphaPeptDeep RT model loaded from defaults after fallback (device={_apd_device})")
                     _patch_apd_predict_bug(mgr)
                 else:
                     _patch_apd_predict_bug(mgr)
-                    logging.info(f"AlphaPeptDeep RT model loaded from defaults (device={'gpu' if _use_gpu else 'cpu'})")
+                    logging.info(f"AlphaPeptDeep RT model loaded from defaults (device={_apd_device})")
 
             except Exception as exc:
                 messagebox.showerror("AlphaPeptDeep Error",

@@ -183,9 +183,15 @@ hidden = [
     'importlib.util', 'importlib.metadata',
     'concurrent.futures', 'multiprocessing', 'threading',
     'json', 'pickle', 'csv', 'io', 'traceback', 'gc',
-    # pip (used for optional auto-install paths)
-    'pip', 'pip._internal', 'pip._internal.cli.main',
 ]
+
+# NOTE ON GPU SUPPORT IN THE PACKAGED EXE:
+# The EXE ships whatever PyTorch build is installed in the BUILD venv
+# (PyInstaller's torch hook collects its DLLs automatically, including the
+# CUDA runtime when present). Build with a CUDA torch to produce ONE suite
+# that uses NVIDIA GPUs automatically and still runs on CPU-only machines:
+#   pip install torch==2.10.0 --force-reinstall --index-url https://download.pytorch.org/whl/cu124
+# build.py prints which torch build it is packaging at the start of a build.
 
 from PyInstaller.utils.hooks import collect_all
 my_binaries = []
